@@ -1,0 +1,31 @@
+# Build outputs
+/build/
+*.o
+*.a
+*.so
+*.so.*
+/bin/
+/lib/
+/third_party/vnpu/build/
+/third_party/vnpu/bin/
+/third_party/vnpu/lib/
+/third_party/vnpu/benchmarks/
+
+# Generated run data (regenerate and archive deliberately)
+/results/
+/traces/
+/tests/**/results/
+/tests/**/traces/
+
+# Python
+__pycache__/
+*.py[cod]
+
+# Sanitizer and editor files
+*.log
+# Phase 0 evidence logs are release artefacts and must remain tracked.
+!docs/evidence/*.log
+*.profraw
+*.dSYM/
+.vscode/
+.idea/

@@ -1,0 +1,55 @@
+fixture	category	expected_code	detail
+trunc_00.gguf	truncation	TYPED_ERROR	cut=0
+trunc_01.gguf	truncation	TYPED_ERROR	cut=2026
+trunc_02.gguf	truncation	TYPED_ERROR	cut=4053
+trunc_03.gguf	truncation	TYPED_ERROR	cut=6079
+trunc_04.gguf	truncation	TYPED_ERROR	cut=8106
+trunc_05.gguf	truncation	TYPED_ERROR	cut=10133
+trunc_06.gguf	truncation	TYPED_ERROR	cut=12159
+trunc_07.gguf	truncation	TYPED_ERROR	cut=14186
+trunc_08.gguf	truncation	TYPED_ERROR	cut=16213
+trunc_09.gguf	truncation	TYPED_ERROR	cut=18239
+trunc_10.gguf	truncation	TYPED_ERROR	cut=20266
+trunc_11.gguf	truncation	TYPED_ERROR	cut=22292
+trunc_12.gguf	truncation	TYPED_ERROR	cut=24319
+trunc_13.gguf	truncation	TYPED_ERROR	cut=26346
+trunc_14.gguf	truncation	TYPED_ERROR	cut=28372
+trunc_15.gguf	truncation	TYPED_ERROR	cut=30399
+trunc_16.gguf	truncation	TYPED_ERROR	cut=32426
+trunc_17.gguf	truncation	TYPED_ERROR	cut=34452
+trunc_18.gguf	truncation	TYPED_ERROR	cut=36479
+trunc_19.gguf	truncation	TYPED_ERROR	cut=38506
+trunc_20.gguf	truncation	TYPED_ERROR	cut=40532
+trunc_21.gguf	truncation	TYPED_ERROR	cut=42559
+trunc_22.gguf	truncation	TYPED_ERROR	cut=44585
+trunc_23.gguf	truncation	TYPED_ERROR	cut=46612
+trunc_24.gguf	truncation	TYPED_ERROR	cut=48639
+trunc_25.gguf	truncation	TYPED_ERROR	cut=50665
+trunc_26.gguf	truncation	TYPED_ERROR	cut=52692
+trunc_27.gguf	truncation	TYPED_ERROR	cut=54719
+trunc_28.gguf	truncation	TYPED_ERROR	cut=56745
+trunc_29.gguf	truncation	TYPED_ERROR	cut=58772
+bad_magic.gguf	header	TYPED_ERROR	bad magic
+bad_version.gguf	header	TYPED_ERROR	unsupported GGUF version
+tensor_count_overflow.gguf	header	TYPED_ERROR	unreasonable tensor count
+metadata_count_overflow.gguf	header	TYPED_ERROR	unreasonable metadata count
+key_length_overflow.gguf	metadata	TYPED_ERROR	oversized string
+invalid_value_type.gguf	metadata	TYPED_ERROR	invalid KV type
+array_count_overflow.gguf	metadata	TYPED_ERROR	oversized array
+bad_alignment.gguf	metadata	TYPED_ERROR	alignment not power of two
+dimension_count_overflow.gguf	tensor_directory	TYPED_ERROR	invalid dimension count
+dimension_overflow.gguf	tensor_directory	TYPED_ERROR	dimension product overflow
+unknown_quant_type.gguf	tensor_directory	TYPED_ERROR	unknown quantisation type
+offset_overflow.gguf	tensor_directory	TYPED_ERROR	offset overflow
+tensor_out_of_bounds.gguf	tensor_directory	TYPED_ERROR	tensor beyond file
+misaligned_offset.gguf	tensor_directory	TYPED_ERROR	misaligned tensor offset
+shape_mismatch.gguf	adapter	TYPED_ERROR	embedding hidden dimension mismatch
+bad_architecture.gguf	adapter	TYPED_ERROR	unknown architecture
+bad_tokenizer.gguf	tokenizer	TYPED_ERROR	unknown tokenizer model
+bad_chat_template.gguf	tokenizer	TYPED_ERROR	unknown chat template
+missing_required_tensor.gguf	adapter	TYPED_ERROR	missing required tensor
+unknown_tensor.gguf	adapter	TYPED_ERROR	unknown tensor
+duplicate_tensor_name.gguf	adapter	TYPED_ERROR	duplicate tensor name
+expert_checksum_count_mismatch.gguf	adapter	TYPED_ERROR	expert checksum count mismatch
+expert_count_mismatch.gguf	adapter	TYPED_ERROR	expert count mismatch
+quant_block_misaligned.gguf	quantisation	TYPED_ERROR	Q8_0 ne0 is not block aligned

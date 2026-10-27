@@ -1,0 +1,165 @@
+g++ -Iinclude -Ithird_party/vnpu/include -Ithird_party/vnpu/src -std=c++17 -O2 -pthread -ffp-contract=fast -Wall -Wextra -Werror -Wno-unused-parameter -Wno-missing-field-initializers -MMD -MP -c tests/unit/tests.cpp -o build/obj/tests.o
+g++ -std=c++17 -O2 -pthread -ffp-contract=fast -Wall -Wextra -Werror -Wno-unused-parameter -Wno-missing-field-initializers -MMD -MP build/obj/freemoe/common.o build/obj/freemoe/gguf.o build/obj/freemoe/io.o build/obj/freemoe/backend.o build/obj/freemoe/residency.o build/obj/freemoe/engine.o build/obj/tests.o build/obj/vnpu/cluster/cluster.o build/obj/vnpu/cluster/net.o build/obj/vnpu/cluster/node.o build/obj/vnpu/compat/compat.o build/obj/vnpu/core/autotune.o build/obj/vnpu/core/backend.o build/obj/vnpu/core/runtime.o build/obj/vnpu/core/scheduler.o build/obj/vnpu/kernels/kernels.o build/obj/vnpu/kernels/llm.o -o build/tests -pthread
+g++ -Iinclude -Ithird_party/vnpu/include -Ithird_party/vnpu/src -std=c++17 -O2 -pthread -ffp-contract=fast -Wall -Wextra -Werror -Wno-unused-parameter -Wno-missing-field-initializers -MMD -MP -c third_party/vnpu/tools/selftest_main.cpp -o build/obj/vnpu-selftest-main.o
+g++ -Iinclude -Ithird_party/vnpu/include -Ithird_party/vnpu/src -std=c++17 -O2 -pthread -ffp-contract=fast -Wall -Wextra -Werror -Wno-unused-parameter -Wno-missing-field-initializers -MMD -MP -c third_party/vnpu/tools/selftest.cpp -o build/obj/vnpu-selftest.o
+g++ -std=c++17 -O2 -pthread -ffp-contract=fast -Wall -Wextra -Werror -Wno-unused-parameter -Wno-missing-field-initializers -MMD -MP build/obj/vnpu-selftest-main.o build/obj/vnpu-selftest.o build/obj/vnpu/cluster/cluster.o build/obj/vnpu/cluster/net.o build/obj/vnpu/cluster/node.o build/obj/vnpu/compat/compat.o build/obj/vnpu/core/autotune.o build/obj/vnpu/core/backend.o build/obj/vnpu/core/runtime.o build/obj/vnpu/core/scheduler.o build/obj/vnpu/kernels/kernels.o build/obj/vnpu/kernels/llm.o -o build/vnpu-selftest -pthread
+g++ -std=c++17 -O1 -g -pthread -fno-omit-frame-pointer -fsanitize=address,undefined -Wall -Wextra -Werror -Iinclude -Ithird_party/vnpu/include -Ithird_party/vnpu/src tests/fuzz_gguf.cpp src/common.cpp src/gguf.cpp -o build/fuzz_gguf -pthread
+./build/tests
+[fallback] explicit_fallback_test executed on scalar CPU (explicit --allow-cpu-fallback)
+[PASS] gguf_parser_and_golden
+[PASS] malformed_fixtures
+[PASS] slot_state_machine
+[PASS] budget_calculator
+[PASS] io_scheduler_and_readers
+[PASS] backends_and_gpu_placeholder
+[PASS] zen3_fallback
+[PASS] residency_manager
+[PASS] dense_cpu_reference_and_operation_log
+[PASS] moe_readers_and_cache_sizes
+[PASS] traces_and_replay_inputs
+[PASS] vnpu_reference_backend
+[PASS] soak_sessions
+587 checks, 0 failures
+VNPU_FORCE_ISA=avx2_dual ./build/vnpu-selftest
+Virtual NPU selftest (vnpu 1.0.0)
+==========================================
+[PASS] backend_vtable
+  backend=AVX2+FMA dual-pipe(forced) simd=256 bits threads=2 tiles=64x128x64
+[PASS] device_info_and_mmio
+[PASS] gemm_f32_unit_1
+[PASS] gemm_f32_unit_2
+[PASS] gemm_f32_unit_3
+[PASS] gemm_f32_unit_0
+[PASS] gemm_f32_transposed_b_and_epilogue
+  backend=AVX2+FMA dual-pipe(forced) simd=256 bits
+[PASS] avx2_dual_fma_path
+  zen3+avx2+avx512 -> AVX2+FMA dual-pipe (expected)
+[PASS] zen3_detection_fallback
+[PASS] forced_isa_validation
+[PASS] gemm_i8_vs_f32
+[PASS] rmsnorm_softmax_swiglu_gelu
+[PASS] attention_small
+[PASS] rope_inplace
+[PASS] mtp_head
+[PASS] async_events_and_trace
+  autotune: unit=VOODOO tiles=64x64x64 0.061 ms 8.65 GFLOP/s 4.96x scalar
+[PASS] autotune_small
+[PASS] local_cluster
+[PASS] speculative_step
+==========================================
+19 tests, 0 failures
+ASAN_OPTIONS=quarantine_size_mb=16:detect_leaks=1:allocator_may_return_null=1 UBSAN_OPTIONS=halt_on_error=1 ./build/fuzz_gguf 2 0xFEEE0E > build/test-tmp/fuzz-quick.json
+python3 tools/trace_replay.py --trace build/test-tmp/replay-trace.jsonl --metrics build/test-tmp/replay-metrics.json --check
+{
+  "status": "pass",
+  "slot_count": 4,
+  "demand_events": 100,
+  "simulated_hits": 26,
+  "simulated_misses": 74,
+  "runtime_hits": 26,
+  "runtime_misses": 74,
+  "counts_match": true
+}
+python3 tools/check_trace.py build/test-tmp/replay-trace.jsonl build/test-tmp/prefetch-trace.jsonl build/test-tmp/cachehit-trace.jsonl
+{
+  "status": "pass",
+  "trace_files": [
+    "build/test-tmp/replay-trace.jsonl",
+    "build/test-tmp/prefetch-trace.jsonl",
+    "build/test-tmp/cachehit-trace.jsonl"
+  ],
+  "required_event_types": [
+    "model_load",
+    "weights_uploaded",
+    "budget",
+    "token",
+    "expert_selected",
+    "expert_executed",
+    "cache_hit",
+    "cache_miss",
+    "evict",
+    "io_queued",
+    "host_ready",
+    "upload_queued",
+    "upload_complete",
+    "acquire",
+    "release",
+    "prefetch_issue",
+    "prefetch_useful",
+    "prefetch_wasted",
+    "source_verify",
+    "io_complete",
+    "runtime_released"
+  ],
+  "observed_event_types": [
+    "acquire",
+    "budget",
+    "cache_hit",
+    "cache_miss",
+    "evict",
+    "expert_executed",
+    "expert_selected",
+    "host_ready",
+    "io_complete",
+    "io_queued",
+    "model_load",
+    "prefetch_cancel",
+    "prefetch_host_ready",
+    "prefetch_issue",
+    "prefetch_useful",
+    "prefetch_wasted",
+    "release",
+    "runtime_released",
+    "shutdown",
+    "source_verify",
+    "token",
+    "upload_complete",
+    "upload_queued",
+    "weights_uploaded"
+  ],
+  "missing_event_types": []
+}
+python3 scripts/check_architecture.py
+{
+  "status": "pass",
+  "exists_rows": 18,
+  "src_files": [
+    "src/backend.cpp",
+    "src/common.cpp",
+    "src/engine.cpp",
+    "src/gguf.cpp",
+    "src/io.cpp",
+    "src/main.cpp",
+    "src/residency.cpp"
+  ],
+  "missing_paths": [],
+  "src_files_not_listed": []
+}
+python3 scripts/check_dependencies.py
+{
+  "status": "pass",
+  "dependencies": [
+    {
+      "name": "Virtual NPU",
+      "version": "1.0.0, upstream `4298c454aa56b90dac240e81f80ed4467221c1dd` plus local patches",
+      "licence": "MIT",
+      "build_reference": "`third_party/vnpu/src`",
+      "found_in_build": true
+    },
+    {
+      "name": "C++17 standard library",
+      "version": "GCC 12.2 libstdc++ on D1 sandbox",
+      "licence": "compiler runtime",
+      "build_reference": "implicit",
+      "found_in_build": true
+    },
+    {
+      "name": "POSIX threads",
+      "version": "OS-provided",
+      "licence": "OS licence",
+      "build_reference": "`Threads::Threads`",
+      "found_in_build": true
+    }
+  ],
+  "vnpu_license_present": true
+}

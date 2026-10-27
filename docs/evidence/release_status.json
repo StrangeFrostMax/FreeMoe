@@ -1,0 +1,16 @@
+{
+  "correctness_prototype": "pass",
+  "paged_moe_prototype": "pass",
+  "performance_qualified": "closed",
+  "physical_gpu_gate": "closed",
+  "checks": {
+    "all_final_comparisons_pass": true,
+    "selected_equals_executed": true,
+    "no_checksum_failures": true,
+    "no_live_allocations": true,
+    "unit_and_vendor_selftests": true,
+    "zen3_fallback": true,
+    "fuzz_72s_clean": true,
+    "soak_three_sessions": true
+  }
+}

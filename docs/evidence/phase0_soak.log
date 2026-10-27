@@ -1,0 +1,5 @@
+bash scripts/soak.sh
+{"status": "pass", "live_allocations": 0, "generated_tokens": 256}
+{"status": "pass", "live_allocations": 0, "generated_tokens": 256}
+{"status": "pass", "live_allocations": 0, "generated_tokens": 256}
+soak: three sessions passed

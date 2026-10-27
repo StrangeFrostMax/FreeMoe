@@ -1,0 +1,19 @@
+{
+  "unit_checks": 587,
+  "unit_failures": 0,
+  "vendor_selftest_tests": 19,
+  "vendor_selftest_failures": 0,
+  "make_test_exit_recorded": true,
+  "zen3_fallback": true,
+  "zen3_fallback_report": "docs/evidence/zen3_fallback.json",
+  "soak_passed": true,
+  "fuzz": {
+    "iterations": 72000,
+    "typed_errors": 35561,
+    "accepted": 36803,
+    "elapsed_ms": 72000,
+    "seed": 16707086,
+    "sanitizers": "address,undefined"
+  },
+  "sanitizer_findings": 0
+}
