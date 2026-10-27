@@ -1,0 +1,10 @@
+{
+  "status": "pass",
+  "slot_count": 4,
+  "demand_events": 100,
+  "simulated_hits": 26,
+  "simulated_misses": 74,
+  "runtime_hits": 26,
+  "runtime_misses": 74,
+  "counts_match": true
+}

@@ -1,0 +1,15 @@
+[fallback] explicit_fallback_test executed on scalar CPU (explicit --allow-cpu-fallback)
+[PASS] gguf_parser_and_golden
+[PASS] malformed_fixtures
+[PASS] slot_state_machine
+[PASS] budget_calculator
+[PASS] io_scheduler_and_readers
+[PASS] backends_and_gpu_placeholder
+[PASS] zen3_fallback
+[PASS] residency_manager
+[PASS] dense_cpu_reference_and_operation_log
+[PASS] moe_readers_and_cache_sizes
+[PASS] traces_and_replay_inputs
+[PASS] vnpu_reference_backend
+[PASS] soak_sessions
+587 checks, 0 failures

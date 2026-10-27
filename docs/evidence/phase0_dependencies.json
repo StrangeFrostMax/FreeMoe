@@ -1,0 +1,27 @@
+{
+  "status": "pass",
+  "dependencies": [
+    {
+      "name": "Virtual NPU",
+      "version": "1.0.0, upstream `4298c454aa56b90dac240e81f80ed4467221c1dd` plus local patches",
+      "licence": "MIT",
+      "build_reference": "`third_party/vnpu/src`",
+      "found_in_build": true
+    },
+    {
+      "name": "C++17 standard library",
+      "version": "GCC 12.2 libstdc++ on D1 sandbox",
+      "licence": "compiler runtime",
+      "build_reference": "implicit",
+      "found_in_build": true
+    },
+    {
+      "name": "POSIX threads",
+      "version": "OS-provided",
+      "licence": "OS licence",
+      "build_reference": "`Threads::Threads`",
+      "found_in_build": true
+    }
+  ],
+  "vnpu_license_present": true
+}

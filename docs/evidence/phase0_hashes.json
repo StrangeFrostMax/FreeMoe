@@ -1,0 +1,73 @@
+{
+  "note": "SHA-256 of the recorded stdout/stderr after redirecting output to the named file.",
+  "deterministic_commands": [
+    {
+      "command": "make clean && make -j1",
+      "output": "docs/evidence/phase0_build.log",
+      "source_output": "build/phase0/build.log",
+      "exists": true,
+      "sha256": "0fec9ae210b2b7bd530f55d81f8a5a59e033e929655cd32401a81c401f9d328f"
+    },
+    {
+      "command": "./build/tests",
+      "output": "docs/evidence/phase0_unit.log",
+      "source_output": "build/phase0/unit.log",
+      "exists": true,
+      "sha256": "3b52b198b3d3f0f5d9a8e7b277cd2d93186a6c571c50bb0e0f8281faee3d28af"
+    },
+    {
+      "command": "./build/freemoe inspect tests/fixtures/dense-fm.gguf --json",
+      "output": "docs/evidence/inspect_dense.json",
+      "source_output": "build/phase0/inspect_dense.json",
+      "exists": true,
+      "sha256": "3f4c9cd5d9602c616a0d67da81b9b82702712bb2116066985c300e171a710359"
+    },
+    {
+      "command": "./build/freemoe inspect tests/fixtures/moe-fm.gguf --json",
+      "output": "docs/evidence/inspect_moe.json",
+      "source_output": "build/phase0/inspect_moe.json",
+      "exists": true,
+      "sha256": "04813e7681bab5842efd851cdc058e0efad4553732f8abc8bc92f6f44c20781e"
+    },
+    {
+      "command": "python3 tools/trace_replay.py --trace build/test-tmp/replay-trace.jsonl --metrics build/test-tmp/replay-metrics.json --check",
+      "output": "docs/evidence/phase0_replay.json",
+      "source_output": "build/phase0/replay.json",
+      "exists": true,
+      "sha256": "02c8aed9a8de426328d25d923f4888ac40a1ff1c1bf4820557395aec60e2628b"
+    },
+    {
+      "command": "python3 tools/check_trace.py build/test-tmp/replay-trace.jsonl build/test-tmp/prefetch-trace.jsonl build/test-tmp/cachehit-trace.jsonl",
+      "output": "docs/evidence/phase0_trace_events.json",
+      "source_output": "build/phase0/trace_events.json",
+      "exists": true,
+      "sha256": "17ea47c013f0f7d4f41cd9988867efeaedb72bf6653c088314e7fd9acf10aecf"
+    },
+    {
+      "command": "python3 scripts/check_architecture.py",
+      "output": "docs/evidence/phase0_architecture.json",
+      "source_output": "build/phase0/architecture.json",
+      "exists": true,
+      "sha256": "3da9caa6758cdc240b5688a68489ee79b7669d6fd89b1f10ad4614414e9b2870"
+    },
+    {
+      "command": "python3 scripts/check_dependencies.py",
+      "output": "docs/evidence/phase0_dependencies.json",
+      "source_output": "build/phase0/dependencies.json",
+      "exists": true,
+      "sha256": "c21ba1262af523fd8c0173c53fa67b8d3750f55acf26fe6550b44918252e2a58"
+    },
+    {
+      "command": "python3 scripts/zen3_fallback_check.py",
+      "output": "docs/evidence/zen3_fallback.json",
+      "source_output": "build/phase0/zen3_fallback.json",
+      "exists": true,
+      "sha256": "69b967173f722eada794242e2c35b9fda96ec885457f861ce2f53dcf054c7790"
+    }
+  ],
+  "nondeterministic_evidence": {
+    "make_test": "docs/evidence/phase0_test.log",
+    "make_fuzz_72s": "docs/evidence/phase0_fuzz.log",
+    "make_soak": "docs/evidence/phase0_soak.log"
+  }
+}

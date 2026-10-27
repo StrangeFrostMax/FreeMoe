@@ -1,0 +1,2 @@
+ASAN_OPTIONS=quarantine_size_mb=16:detect_leaks=1:allocator_may_return_null=1 UBSAN_OPTIONS=halt_on_error=1 ./build/fuzz_gguf 72 0xFEEE0E | tee build/test-tmp/fuzz-soak.json
+{"iterations":72000,"typed_errors":35561,"accepted":36803,"elapsed_ms":72000,"seed":16707086,"sanitizers":"address,undefined"}
