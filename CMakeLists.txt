@@ -66,9 +66,9 @@ enable_testing()
 add_test(NAME freemoe_unit COMMAND freemoe-tests)
 add_test(NAME vnpu_selftest COMMAND vnpu-selftest)
 set_tests_properties(vnpu_selftest PROPERTIES ENVIRONMENT "VNPU_FORCE_ISA=avx2_dual")
+add_test(NAME fuzz_quick COMMAND freemoe-fuzz 2 0xFEEE0E)
 set_tests_properties(fuzz_quick PROPERTIES ENVIRONMENT
   "ASAN_OPTIONS=quarantine_size_mb=16:detect_leaks=1:allocator_may_return_null=1;UBSAN_OPTIONS=halt_on_error=1")
-add_test(NAME fuzz_quick COMMAND freemoe-fuzz 2 0xFEEE0E)
 set_tests_properties(freemoe_unit vnpu_selftest fuzz_quick PROPERTIES
   WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
 add_test(NAME trace_replay
