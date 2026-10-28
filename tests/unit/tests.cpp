@@ -1770,7 +1770,8 @@ ArchGolden read_arch_golden(const std::string &path) {
 void test_architecture_parity() {
     const std::vector<std::string> slugs = {"llama-gqa", "qwen2-bias", "qwen3-qknorm", "gemma",
                                            "gemma2", "phi3-fused", "minicpm", "qwen3moe",
-                                           "glm4", "qwen2moe", "phi2-layernorm"};
+                                           "glm4", "qwen2moe", "phi2-layernorm",
+                                           "deepseek2-mla"};
     for (const std::string &slug : slugs) {
         const std::string model = "tests/fixtures/" + slug + "-shape.gguf";
         ArchGolden golden = read_arch_golden("tests/golden/" + slug + "_reference.txt");
@@ -2028,6 +2029,69 @@ void test_phi2_block() {
           "the probe reports the gate-free FFN");
 }
 
+// deepseek2 is the one architecture here whose *attention* is not a variant of
+// the usual q/k/v projections, so the configuration it decodes and the branches
+// its op log shows are worth pinning separately from the numeric parity check.
+void test_deepseek2_mla() {
+    const std::string path = "tests/fixtures/deepseek2-mla-shape.gguf";
+    RunConfig config;
+    config.model_path = path;
+    config.budget.total_hot_bytes = 64ull * 1024 * 1024;
+    Engine engine(config);
+    engine.initialize();
+
+    const ModelConfig &cfg = engine.manifest().config;
+    CHECK(cfg.architecture == "deepseek2", "deepseek2 adapter is selected");
+    CHECK(cfg.mla, "the kv latent marks multi-head latent attention");
+    CHECK(cfg.q_lora_rank == 12, "the low-rank q bottleneck is read");
+    CHECK(cfg.kv_lora_rank == 16, "the kv latent width is read");
+    CHECK(cfg.head_v_dim() == 10, "the value width comes from value_length_mla");
+    CHECK(cfg.v_dim() == cfg.kv_heads * cfg.head_v_dim(),
+          "the cache's value width is one head_v per kv head");
+    CHECK(cfg.head_v_dim() != cfg.head_dim, "the value width differs from the key width here");
+    CHECK(cfg.dense_lead == 1, "the leading dense block count is read");
+    CHECK(cfg.expert_gating == "sigmoid", "the router's gating function is read");
+    CHECK(cfg.expert_selection_bias, "the selection bias is detected on a non-zero layer");
+    CHECK(cfg.shared_expert, "the shared expert is detected on a non-zero layer");
+    CHECK(!cfg.shared_expert_gate, "deepseek2's shared expert has no learned scalar gate");
+    CHECK(cfg.expert_groups == 2 && cfg.expert_groups_used == 1,
+          "group-limited routing is read");
+
+    ArchGolden golden = read_arch_golden("tests/golden/deepseek2-mla_reference.txt");
+    PromptResult result = engine.run_prompt(golden.prompt, 8);
+    CHECK(result.generated_ids == golden.greedy, "greedy decoding matches the reference");
+
+    bool mla_expand = false, kv_norm = false, rope_q = false, rope_k = false;
+    bool shexp_moe = false, shexp_dense = false, router_moe = false, router_dense = false;
+    for (const OpRecord &op : engine.backend().operations()) {
+        if (op.name == "mla_expand.L1") mla_expand = true;
+        if (op.name == "attn_kv_a_norm.L1") kv_norm = true;
+        if (op.name == "mla_rope_q.L1") rope_q = true;
+        if (op.name == "mla_rope_k.L1") rope_k = true;
+        if (op.name == "shexp_down.L1") shexp_moe = true;
+        if (op.name == "shexp_down.L0") shexp_dense = true;
+        if (op.name == "router.L1") router_moe = true;
+        if (op.name == "router.L0") router_dense = true;
+    }
+    CHECK(mla_expand, "the latent is expanded per head");
+    CHECK(kv_norm, "the latent is normalised before expansion");
+    CHECK(rope_q && rope_k, "rotary runs on the query heads and the shared k_pe");
+    CHECK(router_moe && !router_dense, "the lead block has no router: it is dense");
+    CHECK(shexp_moe && !shexp_dense, "the shared expert runs beside the routed experts only");
+    engine.release_runtime();
+
+    auto doc = parse_gguf_file(path);
+    const std::string dump = probe_model(doc, path).dump();
+    CHECK(dump.find("\"multi_head_latent_attention\":true") != std::string::npos,
+          "the probe reports multi-head latent attention");
+    CHECK(dump.find("\"leading_dense_blocks\":1") != std::string::npos,
+          "the probe reports the dense lead-in");
+    CHECK(dump.find("\"expert_gating_func\":2") != std::string::npos,
+          "the probe reports the router's gating function");
+    CHECK(dump.find("\"expert_selection_bias\":true") != std::string::npos,
+          "the probe reports the selection bias");
+}
+
 void test_soak_sessions() {
     const uint32_t N_SOAK = 256;
     std::string prompt = first_prompt();
@@ -2081,6 +2145,7 @@ int main(int argc, char **argv) {
     maybe_run("minicpm_scales", test_minicpm_scales);
     maybe_run("shared_expert", test_shared_expert);
     maybe_run("phi2_block", test_phi2_block);
+    maybe_run("deepseek2_mla", test_deepseek2_mla);
     maybe_run("soak_sessions", test_soak_sessions);
     std::cout << g_checks << " checks, " << g_failures << " failures\n";
     return g_failures == 0 ? 0 : 1;

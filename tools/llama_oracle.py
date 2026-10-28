@@ -68,6 +68,7 @@ def load_model(path: Path) -> dict[str, Any]:
         tensors[t["name"]] = (list(t["dims"]), _f32_values(t["data"]))
 
     hidden = int(key("embedding_length"))
+    n_layer = int(key("block_count"))
     heads = int(key("attention.head_count"))
     hd = int(key("attention.key_length", hidden // heads))
     cfg = {
@@ -89,6 +90,7 @@ def load_model(path: Path) -> dict[str, Any]:
         # The prompt is tokenized with the checkpoint's own BOS id, exactly as
         # the engine does; hard-coding 1 would hide a real disagreement.
         "bos": int(md.get("tokenizer.ggml.bos_token_id", 1)),
+        "eos": int(md.get("tokenizer.ggml.eos_token_id", 2)),
         # Presence of the per-head q/k scales is the evidence qwen3 uses them.
         "qk_norm": "blk.0.attn_q_norm.weight" in tensors,
         # phi3 fuses q/k/v into one projection (and one optional bias).
@@ -134,8 +136,29 @@ def load_model(path: Path) -> dict[str, Any]:
         "I_shexp": int(key("expert_shared_feed_forward_length",
                            key("feed_forward_length"))),
         # Evidence, not architecture name: the tensors are what the forward pass
-        # reads, so their presence is what decides whether the branch runs.
-        "shared_expert": "blk.0.ffn_gate_shexp.weight" in tensors,
+        # reads, so their presence is what decides whether the branch runs. Every
+        # one of these is scanned over *all* layers: a deepseek checkpoint's
+        # leading dense blocks carry none of the MoE tensors, so a blk.0 probe
+        # silently reports "no shared expert" for a model that has one.
+        "shared_expert": any(f"blk.{l}.ffn_gate_shexp.weight" in tensors
+                             for l in range(n_layer)),
+        "shared_expert_gate": any(f"blk.{l}.ffn_gate_inp_shexp.weight" in tensors
+                                  for l in range(n_layer)),
+        # Multi-head latent attention: the file carries the projection into the
+        # latent and the per-head expansions, and no keys or values.
+        "mla": "blk.0.attn_kv_a_mqa.weight" in tensors,
+        "q_lora_rank": int(key("attention.q_lora_rank", 0)),
+        "kv_lora_rank": int(key("attention.kv_lora_rank", 0)),
+        "head_v": int(key("attention.value_length_mla", hd)),
+        "dense_lead": int(key("leading_dense_block_count", 0)),
+        # Router semantics: the gating function, the selection bias and
+        # group-limited routing all change which experts run.
+        "gating": {1: "softmax", 2: "sigmoid", 3: "softmax-weight",
+                   4: "sqrt-softplus"}.get(int(key("expert_gating_func", 1)), "softmax"),
+        "selection_bias": any(f"blk.{l}.ffn_exp_probs_b.bias" in tensors
+                              for l in range(n_layer)),
+        "expert_groups": int(key("expert_group_count", 0)),
+        "groups_used": int(key("expert_group_used_count", 0)),
         "expert_norm": bool(key("expert_weights_norm", False)),
         "expert_scale": float(key("expert_weights_scale", 1.0)),
     }
@@ -228,6 +251,27 @@ def rope_half(vec: list[float], head_dim: int, heads: int, pos: int,
             vec[base + 2 * j + 1] = a * s + b * c
 
 
+def rope_mla(vec: list[float], heads: int, stride: int, offset: int, width: int,
+             pos: int, theta: float) -> list[float]:
+    """Rotary position applied to one slice per head.
+
+    MLA rotates only the rope part of each query head, and the shared k_pe
+    vector on its own, so the slice geometry has to be explicit.
+    """
+    out = list(vec)
+    for head in range(heads):
+        base = head * stride + offset
+        for i in range(width // 2):
+            inv = theta ** (-(2.0 * i) / width)
+            angle = pos * inv
+            cs, sn = math.cos(angle), math.sin(angle)
+            a0 = out[base + 2 * i]
+            a1 = out[base + 2 * i + 1]
+            out[base + 2 * i] = a0 * cs - a1 * sn
+            out[base + 2 * i + 1] = a0 * sn + a1 * cs
+    return out
+
+
 def expert_output(cfg: dict[str, Any], layer: int, expert: int,
                   x: list[float], prefix: str) -> list[float]:
     """One expert's SwiGLU/GeGLU output.
@@ -264,6 +308,10 @@ def softmax(values: list[float]) -> list[float]:
     exps = [math.exp(v - m) for v in values]
     total = sum(exps)
     return [v / total for v in exps]
+
+
+# Debug hook: set to a dict to record per-layer intermediate vectors.
+TRACE: dict[str, Any] | None = None
 
 
 class Session:
@@ -305,8 +353,53 @@ class Session:
         for layer in range(cfg["L"]):
             p = f"blk.{layer}."
             h = norm_of(x, p + "attn_norm")
+            if TRACE is not None:
+                TRACE[f"h.L{layer}"] = list(h)
             attn_normed = list(h) if cfg["parallel_residual"] else None
-            if cfg["fused_qkv"]:
+            if cfg["mla"]:
+                # Multi-head latent attention, expanded per head. See the engine's
+                # comment: k_b / v_b are linear, so expanding here is the same
+                # arithmetic as llama.cpp's absorbed form.
+                latent = cfg["kv_lora_rank"]
+                nope = hd - cfg["rope_dim"]
+                head_v = cfg["head_v"]
+                if cfg["q_lora_rank"]:
+                    qa = matvec(self.tensor(p + "attn_q_a.weight"), h, cfg["q_lora_rank"], H)
+                    qa = rmsnorm(qa, self.tensor(p + "attn_q_a_norm.weight"), cfg["eps"])
+                    q = matvec(self.tensor(p + "attn_q_b.weight"), qa, heads * hd,
+                               cfg["q_lora_rank"])
+                else:
+                    q = matvec(self.tensor(p + "attn_q.weight"), h, heads * hd, H)
+                kvpe = matvec(self.tensor(p + "attn_kv_a_mqa.weight"), h,
+                              latent + cfg["rope_dim"], H)
+                ckv = rmsnorm(kvpe[:latent], self.tensor(p + "attn_kv_a_norm.weight"), cfg["eps"])
+                kpe = kvpe[latent:]
+                # Rotary on the trailing rope slice of each query head, and on
+                # the shared k_pe.
+                q = rope_mla(q, heads, hd, hd - cfg["rope_dim"], cfg["rope_dim"], self.pos,
+                             cfg["theta"])
+                kpe = rope_mla(kpe, 1, cfg["rope_dim"], 0, cfg["rope_dim"], self.pos,
+                               cfg["theta"])
+                kb = self.tensor(p + "attn_k_b.weight")
+                vb = self.tensor(p + "attn_v_b.weight")
+                k_vec: list[float] = []
+                v_vec: list[float] = []
+                for head in range(heads):
+                    k_head = list(kpe)
+                    kb_head = head * nope * latent
+                    for o in range(nope):
+                        # ggml stores k_b as [nope, kv_lora_rank, heads] with the
+                        # first axis fastest, so (o, i, head) is at
+                        # o + nope*(i + latent*head).
+                        k_head.insert(o, sum(kb[kb_head + i * nope + o] * ckv[i]
+                                             for i in range(latent)))
+                    k_vec.extend(k_head)
+                    for o in range(head_v):
+                        base_o = (head * head_v + o) * latent
+                        v_vec.append(sum(vb[base_o + i] * ckv[i] for i in range(latent)))
+                k = k_vec
+                v = v_vec
+            elif cfg["fused_qkv"]:
                 fused = matvec(self.tensor(p + "attn_qkv.weight"), h, H + 2 * kv_dim, H)
                 if cfg["qkv_bias"]:
                     bias = self.tensor(p + "attn_qkv.bias")
@@ -325,18 +418,26 @@ class Session:
                     q = [q[i] + bq[i] for i in range(H)]
                     k = [k[i] + bk[i] for i in range(kv_dim)]
                     v = [v[i] + bv[i] for i in range(kv_dim)]
-            if cfg["qk_norm"]:
-                q = head_rmsnorm(q, heads, self.tensor(p + "attn_q_norm.weight"), cfg["eps"])
-                k = head_rmsnorm(k, kv_heads, self.tensor(p + "attn_k_norm.weight"), cfg["eps"])
-            rope_half(q, hd, heads, self.pos, cfg["rope_dim"], cfg["theta"])
-            rope_half(k, hd, kv_heads, self.pos, cfg["rope_dim"], cfg["theta"])
+            if not cfg["mla"]:
+                if cfg["qk_norm"]:
+                    q = head_rmsnorm(q, heads, self.tensor(p + "attn_q_norm.weight"), cfg["eps"])
+                    k = head_rmsnorm(k, kv_heads, self.tensor(p + "attn_k_norm.weight"), cfg["eps"])
+                rope_half(q, hd, heads, self.pos, cfg["rope_dim"], cfg["theta"])
+                rope_half(k, hd, kv_heads, self.pos, cfg["rope_dim"], cfg["theta"])
+            if TRACE is not None:
+                TRACE["pos"] = self.pos
+                TRACE[f"q.L{layer}"] = list(q)
+                TRACE[f"k.L{layer}"] = list(k)
+                TRACE[f"v.L{layer}"] = list(v)
             self.cache[layer].append((k, v))
 
-            attention = [0.0] * H
+            head_v = cfg["head_v"] if cfg["mla"] else hd
+            attention = [0.0] * (heads * head_v)
             scale = 1.0 / math.sqrt(hd)
             for head in range(heads):
                 qb = head * hd
                 kvb = (head // group) * hd
+                vb = (head // group) * head_v
                 cache = self.cache[layer]
                 window = cfg["window"]
                 first = 0 if (window == 0 or self.pos < window) else self.pos + 1 - window
@@ -348,14 +449,18 @@ class Session:
                         dot = cfg["attn_softcap"] * math.tanh(dot / cfg["attn_softcap"])
                     scores.append(dot)
                 probs = softmax(scores)
-                acc = [0.0] * hd
+                acc = [0.0] * head_v
                 for offset, t_index in enumerate(range(first, len(cache))):
                     vt = cache[t_index][1]
                     p_i = probs[offset]
-                    for j in range(hd):
-                        acc[j] += p_i * vt[kvb + j]
-                attention[qb:qb + hd] = acc
-            attn_out = matvec(self.tensor(p + "attn_output.weight"), attention, H, H)
+                    for j in range(head_v):
+                        acc[j] += p_i * vt[vb + j]
+                ab = head * head_v
+                attention[ab:ab + head_v] = acc
+            if TRACE is not None:
+                TRACE[f"attn.L{layer}"] = list(attention)
+            attn_out = matvec(self.tensor(p + "attn_output.weight"), attention, H,
+                              heads * head_v)
             if cfg["attn_output_bias"]:
                 bias = self.tensor(p + "attn_output.bias")
                 attn_out = [attn_out[i] + bias[i] for i in range(H)]
@@ -364,6 +469,9 @@ class Session:
                                    cfg["eps"], cfg["norm_add_one"])
             x = [x[i] + attn_out[i] for i in range(H)]
 
+            if TRACE is not None:
+                TRACE[f"attn_out.L{layer}"] = list(attn_out)
+                TRACE[f"xpost.L{layer}"] = list(x)
             h = attn_normed if cfg["parallel_residual"] else norm_of(x, p + "ffn_norm")
             if cfg["ffn_no_gate"]:
                 # phi2: up -> gelu -> down, with a bias on both projections.
@@ -376,15 +484,40 @@ class Session:
                 if cfg["ffn_bias"]:
                     bias = self.tensor(p + "ffn_down.bias")
                     down = [down[i] + bias[i] for i in range(H)]
-            elif cfg["experts"]:
-                # Router -> full softmax -> top-k -> combine. The selected experts
-                # are renormalised only when the checkpoint asks for it.
+            elif cfg["experts"] and layer >= cfg["dense_lead"]:
+                # Router -> gating function -> optional selection bias -> optional
+                # group mask -> top-k -> combine. Which function turns logits into
+                # probabilities is a per-family fact, so the checkpoint says.
                 logits = matvec(self.tensor(p + "ffn_gate_inp.weight"), h,
                                 cfg["experts"], H)
-                probs = softmax(logits)
-                order = sorted(range(cfg["experts"]), key=lambda e: (-probs[e], e))
+                gating = cfg["gating"]
+                if gating == "sigmoid":
+                    probs = [1.0 / (1.0 + math.exp(-v)) for v in logits]
+                elif gating == "sqrt-softplus":
+                    probs = [math.sqrt(math.log1p(math.exp(v))) for v in logits]
+                elif gating == "softmax-weight":
+                    probs = list(logits)
+                else:
+                    probs = softmax(logits)
+                selection = list(probs)
+                if cfg["selection_bias"]:
+                    bias = self.tensor(p + "ffn_exp_probs_b.bias")
+                    selection = [selection[i] + bias[i] for i in range(cfg["experts"])]
+                if cfg["expert_groups"] > 1:
+                    per_group = cfg["experts"] // cfg["expert_groups"]
+                    group_scores = []
+                    for g in range(cfg["expert_groups"]):
+                        vals = sorted(selection[g * per_group:(g + 1) * per_group], reverse=True)
+                        group_scores.append((sum(vals[:2]), g))
+                    group_scores.sort(key=lambda x: (-x[0], x[1]))
+                    keep = {g for _, g in group_scores[:cfg["groups_used"]]}
+                    selection = [selection[i] if (i // per_group) in keep else -math.inf
+                                 for i in range(cfg["experts"])]
+                order = sorted(range(cfg["experts"]), key=lambda e: (-selection[e], e))
                 chosen = order[:cfg["top_k"]]
                 weights = [probs[e] for e in chosen]
+                if gating == "softmax-weight":
+                    weights = softmax(weights)
                 if cfg["expert_norm"]:
                     total = sum(weights)
                     if total > 0.0:
@@ -408,13 +541,16 @@ class Session:
                     act = [gate[i] / (1.0 + math.exp(-gate[i])) * up[i]
                            for i in range(cfg["I"])]
                 down = matvec(self.tensor(p + "ffn_down.weight"), act, H, cfg["I"])
-            if cfg["shared_expert"]:
+            if cfg["shared_expert"] and layer >= cfg["dense_lead"]:
                 # qwen2moe's shared expert: a dense FFN beside the routed ones,
                 # scaled by sigmoid(dot(gate_inp, h)). The reference writes that
                 # gate as silu(s)/s, which is the same number except at s == 0
                 # (0/0); the limit 0.5 is used there.
-                s = matvec(self.tensor(p + "ffn_gate_inp_shexp.weight"), h, 1, H)[0]
-                gate_scalar = (s / (1.0 + math.exp(-s)) / s) if s != 0.0 else 0.5
+                if cfg["shared_expert_gate"]:
+                    s = matvec(self.tensor(p + "ffn_gate_inp_shexp.weight"), h, 1, H)[0]
+                    gate_scalar = (s / (1.0 + math.exp(-s)) / s) if s != 0.0 else 0.5
+                else:
+                    gate_scalar = 1.0
                 W = cfg["I_shexp"]
                 s_gate = matvec(self.tensor(p + "ffn_gate_shexp.weight"), h, W, H)
                 s_up = matvec(self.tensor(p + "ffn_up_shexp.weight"), h, W, H)
@@ -428,6 +564,8 @@ class Session:
             if cfg["post_norms"]:
                 down = rmsnorm(down, self.tensor(p + "ffn_post_norm.weight"),
                                cfg["eps"], cfg["norm_add_one"])
+            if TRACE is not None:
+                TRACE[f"ffn.L{layer}"] = list(down)
             x = [x[i] + down[i] for i in range(H)]
 
         final = norm_of(x, "output_norm")
@@ -467,7 +605,10 @@ def greedy(cfg: dict[str, Any], prompt: str, n: int) -> dict[str, Any]:
     for _ in range(n):
         token = max(range(len(logits)), key=lambda i: (logits[i], -i))
         generated.append(token)
-        if token == 2:  # EOS
+        # The checkpoint's own end-of-sequence id. Hard-coding 2 here made the
+        # reference stop on an ordinary token whenever a fixture numbered its
+        # vocabulary differently, which is exactly what happened to deepseek2.
+        if token == cfg["eos"]:
             break
         logits = session.step(token)
     return {"input_ids": ids, "generated_ids": generated, "prefill_logits": logits}

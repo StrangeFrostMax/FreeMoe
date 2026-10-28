@@ -68,8 +68,11 @@ const std::map<std::string, ArchFacts> &known_architectures() {
         // phi2: LayerNorm instead of RMSNorm, a gate-free GELU FFN, and one
         // shared residual for the attention and FFN branches.
         {"phi2", {true, false}},
+        // deepseek2: multi-head latent attention, dense-lead blocks, and a
+        // router whose gating function, selection bias and group masking all
+        // change which experts run.
+        {"deepseek2", {true, false}},
         {"glm4moe", {false, true}},
-        {"deepseek2", {false, true}},
         {"multimodal", {false, true}},
     };
     return table;
@@ -382,6 +385,24 @@ Json probe_model(const GGUFDocument &doc, const std::string &source_path) {
             if (per_layer && tensor.name.find("attn_k_norm") != std::string::npos) k_norm = true;
         }
         out.set("per_head_qk_norm", q_norm || k_norm);
+        // Multi-head latent attention, the dense lead-in blocks and the router's
+        // gating function are all decided by the checkpoint, so the probe says
+        // which of them it found rather than leaving the reader to guess.
+        bool mla = false, dense_lead = false, selection_bias = false;
+        for (const auto &tensor : doc.tensors) {
+            if (tensor.name.find("attn_kv_a_mqa") != std::string::npos) mla = true;
+            if (tensor.name.find("ffn_exp_probs_b.bias") != std::string::npos) selection_bias = true;
+            if (tensor.name.find("ffn_gate_shexp") != std::string::npos) dense_lead = true;
+        }
+        out.set("multi_head_latent_attention", mla);
+        out.set("expert_selection_bias", selection_bias);
+        out.set("shared_expert", dense_lead);
+        uint64_t lead = 0;
+        if (read_u64(doc, arch, "leading_dense_block_count", &lead) && lead != 0)
+            out.set("leading_dense_blocks", lead);
+        uint64_t gating = 0;
+        if (read_u64(doc, arch, "expert_gating_func", &gating) && gating != 0)
+            out.set("expert_gating_func", gating);
         if (q_norm != k_norm)
             block("QK_NORM_INCOMPLETE", "q/k normalisation is present on only one of q and k");
     }

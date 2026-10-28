@@ -90,7 +90,26 @@ def arch_tensors(spec: dict[str, Any]) -> list[TensorSpec]:
         if spec.get("parallel_residual"):
             # No ffn_norm at all: the FFN consumes the attention norm.
             pass
-        if spec.get("fused_qkv"):
+        if spec.get("mla"):
+            # No keys or values: q through its low-rank bottleneck, and the kv
+            # latent that each head expands.
+            latent = spec["kv_lora_rank"]
+            nope = hd - spec["rope_dim"]
+            if spec.get("q_lora_rank", 0):
+                out += [
+                    tensor(p + "attn_q_a.weight", [h, spec["q_lora_rank"]], 0.16),
+                    tensor(p + "attn_q_a_norm.weight", [spec["q_lora_rank"]], 0.0, norm=True),
+                    tensor(p + "attn_q_b.weight", [spec["q_lora_rank"], heads * hd], 0.16),
+                ]
+            else:
+                out += [tensor(p + "attn_q.weight", [h, heads * hd], 0.16)]
+            out += [
+                tensor(p + "attn_kv_a_mqa.weight", [h, latent + spec["rope_dim"]], 0.16),
+                tensor(p + "attn_kv_a_norm.weight", [latent], 0.0, norm=True),
+                tensor(p + "attn_k_b.weight", [nope, latent, heads], 0.20),
+                tensor(p + "attn_v_b.weight", [latent, spec["head_v"], heads], 0.20),
+            ]
+        elif spec.get("fused_qkv"):
             # q, then k, then v along the output axis of one projection.
             out += [tensor(p + "attn_qkv.weight", [h, h + 2 * kv_dim], 0.16)]
             if spec.get("qkv_bias"):
@@ -115,7 +134,8 @@ def arch_tensors(spec: dict[str, Any]) -> list[TensorSpec]:
                 tensor(p + "attn_k.bias", [kv_dim], 0.05),
                 tensor(p + "attn_v.bias", [kv_dim], 0.05),
             ]
-        out += [tensor(p + "attn_output.weight", [h, h], 0.16)]
+        attn_out_width = heads * spec["head_v"] if spec.get("mla") else h
+        out += [tensor(p + "attn_output.weight", [attn_out_width, h], 0.16)]
         if spec.get("attn_output_bias"):
             out += [tensor(p + "attn_output.bias", [h], 0.05)]
         if spec.get("post_norms"):
@@ -124,6 +144,13 @@ def arch_tensors(spec: dict[str, Any]) -> list[TensorSpec]:
             out += [tensor(p + "ffn_norm.weight", [h], 0.0, norm=True)]
             if spec.get("layernorm"):
                 out += [tensor(p + "ffn_norm.bias", [h], 0.05)]
+        moe_here = spec.get("experts") and layer >= spec.get("dense_lead", 0)
+        if spec.get("experts") and not moe_here:
+            out += [
+                tensor(p + "ffn_gate.weight", [h, i], 0.16),
+                tensor(p + "ffn_up.weight", [h, i], 0.16),
+                tensor(p + "ffn_down.weight", [i, h], 0.16),
+            ]
         if spec.get("ffn_no_gate"):
             out += [
                 tensor(p + "ffn_up.weight", [h, i], 0.16),
@@ -134,7 +161,7 @@ def arch_tensors(spec: dict[str, Any]) -> list[TensorSpec]:
                     tensor(p + "ffn_up.bias", [i], 0.05),
                     tensor(p + "ffn_down.bias", [h], 0.05),
                 ]
-        elif spec.get("experts"):
+        elif moe_here:
             # Stacked experts: one tensor holds every expert's slice, and the
             # router projects hidden -> expert_count. Routed experts may be
             # narrower than the dense FFN, so the width is its own setting.
@@ -146,12 +173,15 @@ def arch_tensors(spec: dict[str, Any]) -> list[TensorSpec]:
                 tensor(p + "ffn_up_exps.weight", [h, ew, experts], 0.16),
                 tensor(p + "ffn_down_exps.weight", [ew, h, experts], 0.16),
             ]
+            if spec.get("expert_bias"):
+                out += [tensor(p + "ffn_exp_probs_b.bias", [experts], 0.10)]
             if spec.get("shared_expert"):
                 # A dense FFN beside the routed experts, plus the one-vector
                 # projection that produces its per-token scalar gate.
                 sw = spec.get("shared_width", i)
+                if spec.get("shared_gate", True):
+                    out += [tensor(p + "ffn_gate_inp_shexp.weight", [h], 0.30)]
                 out += [
-                    tensor(p + "ffn_gate_inp_shexp.weight", [h], 0.30),
                     tensor(p + "ffn_gate_shexp.weight", [h, sw], 0.16),
                     tensor(p + "ffn_up_shexp.weight", [h, sw], 0.16),
                     tensor(p + "ffn_down_shexp.weight", [sw, h], 0.16),
@@ -162,7 +192,9 @@ def arch_tensors(spec: dict[str, Any]) -> list[TensorSpec]:
                 tensor(p + "ffn_up.weight", [h, 2 * i], 0.16),
                 tensor(p + "ffn_down.weight", [i, h], 0.16),
             ]
-        else:
+        elif not spec.get("experts"):
+            # Plain dense model. A dense-lead layer of an MoE model was already
+            # written above, so it must not be written twice.
             out += [
                 tensor(p + "ffn_gate.weight", [h, i], 0.16),
                 tensor(p + "ffn_up.weight", [h, i], 0.16),
@@ -214,6 +246,17 @@ def arch_metadata(spec: dict[str, Any]) -> dict[str, tuple[Any, ...]]:
         md[f"{arch}.expert_used_count"] = ("u32", spec.get("expert_used", 2))
     if spec.get("qkv_bias"):
         md[f"{arch}.attention.qkv_bias"] = ("bool", True)
+    if spec.get("mla"):
+        md[f"{arch}.attention.q_lora_rank"] = ("u32", spec.get("q_lora_rank", 0))
+        md[f"{arch}.attention.kv_lora_rank"] = ("u32", spec["kv_lora_rank"])
+        md[f"{arch}.attention.value_length_mla"] = ("u32", spec["head_v"])
+    if spec.get("dense_lead"):
+        md[f"{arch}.leading_dense_block_count"] = ("u32", spec["dense_lead"])
+    if spec.get("gating"):
+        md[f"{arch}.expert_gating_func"] = ("u32", spec["gating"])
+    if spec.get("expert_groups"):
+        md[f"{arch}.expert_group_count"] = ("u32", spec["expert_groups"])
+        md[f"{arch}.expert_group_used_count"] = ("u32", spec["group_used"])
     if spec.get("expert_width"):
         md[f"{arch}.expert_feed_forward_length"] = ("u32", spec["expert_width"])
     if spec.get("shared_expert"):
@@ -272,6 +315,35 @@ SPECS: list[dict[str, Any]] = [
         "qk_norm": True,
         "experts": 4,
         "expert_used": 2,
+    },
+    {
+        # deepseek2: multi-head latent attention — q through a low-rank
+        # bottleneck, and a per-token kv latent that every head expands. One
+        # leading dense block, sigmoid gating with a selection bias, and
+        # group-limited routing, which together are the V3 layout. Every width
+        # is distinct (key 12 = 8 nope + 4 rope, value 10, latent 16) so a
+        # runtime that confuses them cannot match the golden.
+        "slug": "deepseek2-mla",
+        "arch": "deepseek2",
+        "name": "FreeMoe synthetic deepseek2 with MLA and group routing",
+        "kv_heads": SHAPE["heads"],
+        "rope_dim": 4,
+        "mla": True,
+        "q_lora_rank": 12,
+        "kv_lora_rank": 16,
+        "head_v": 10,
+        "layers": 3,
+        "dense_lead": 1,
+        "experts": 4,
+        "expert_used": 2,
+        "expert_width": 48,
+        "gating": 2,          # sigmoid
+        "expert_bias": True,
+        "expert_groups": 2,
+        "group_used": 1,
+        "shared_expert": True,
+        "shared_gate": False,
+        "shared_width": 40,
     },
     {
         # phi2: LayerNorm with a bias instead of RMSNorm, no ffn_norm at all (the

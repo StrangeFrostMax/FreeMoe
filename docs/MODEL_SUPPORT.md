@@ -49,7 +49,10 @@ each family, the tool records what a specific file contains.
 | `qwen3moe`: qwen3 q/k norm with stacked-expert FFN and router | WORKS |
 | `qwen2moe`: routed experts plus a dense shared expert, gated per token | WORKS |
 | `phi2`: LayerNorm with biases, gate-free GELU FFN, one shared residual | WORKS |
-| `glm4-moe`, `minicpm3`, MLA attention (`deepseek2`), and the remaining 158 architectures in llama.cpp's `src/models/` | **MISSING** |
+| `deepseek2`: MLA (low-rank q, kv latent, per-head `k_b`/`v_b` expansion), dense-lead blocks, sigmoid/softmax/sqrt-softplus gating, selection bias, group-limited routing, shared expert without a scalar gate | WORKS |
+| Generation stops at the checkpoint's own `eos_token_id` | WORKS |
+| Chat templates (`tokenizer.chat_template`, Jinja) | **MISSING**, the prompt is sent verbatim |
+| `glm4-moe`, `minicpm3`, and the remaining 157 architectures in llama.cpp's `src/models/` | **MISSING** |
 | PrismML rotated weight basis (`prism.hadamard.*`) and Hadamard activation transform | **MISSING**, hard blocker |
 | Hybrid linear attention (`ssm_*`, `conv1d` state) | **MISSING**, hard blocker |
 | Shared-expert MoE (`expert_shared_count`) | **MISSING**, refused rather than dropped |
@@ -187,7 +190,7 @@ produce logits identical to the plain fixture and the test would catch it.
 
 Current parity fixtures: `llama-gqa`, `qwen2-bias`, `qwen3-qknorm`, `gemma`,
 `gemma2`, `phi3-fused`, `glm4`, `minicpm`, `qwen3moe`, `qwen2moe`,
-`phi2-layernorm`.
+`phi2-layernorm`, `deepseek2-mla`.
 
 ### What each architecture actually needed
 
@@ -200,9 +203,65 @@ Read from llama.cpp's `src/models/`, not guessed from the model names:
 | `qwen3moe` | qwen3's per-head q/k norm combined with a stacked-expert FFN and router |
 | `qwen2moe` | routed experts plus a *dense* shared expert, whose whole branch is scaled by one scalar per token; three separate feed-forward widths |
 | `phi2` | LayerNorm with a bias instead of RMSNorm; no `ffn_norm` at all, because the FFN runs on the attention's normalised input and both branches add to one residual; gate-free GELU FFN with biases; biases on the attention output and the logits |
+| `deepseek2` | multi-head latent attention (see below), `leading_dense_block_count` plain-FFN lead-in blocks, a router whose gating function is `expert_gating_func`, a selection-only `ffn_exp_probs_b.bias`, group-limited routing, and a shared expert that has no scalar gate |
 
 `glm4` also parses `rope.dimension_sections` for multimodal RoPE; a text-only
 checkpoint omits it and uses standard RoPE, which is what is implemented.
+
+### Multi-head latent attention (`deepseek2`)
+
+MLA has no `attn_k`/`attn_v` tensors at all, so the four things a reader has to
+get right cannot be inferred from the plain attention path:
+
+* **Query.** `wq_a [hidden, q_lora_rank]` → RMSNorm of width `q_lora_rank` →
+  `wq_b [q_lora_rank, heads * key_length_mla]`. `q_lora_rank == 0` is the "lite"
+  layout with a single `attn_q`.
+* **Keys and values.** `attn_kv_a_mqa [hidden, kv_lora_rank + rope_dim]` splits
+  into the latent and the shared rotary key `k_pe`. The latent is RMSNorm'd at
+  width `kv_lora_rank`, then each head expands it: `attn_k_b` has ggml dims
+  `{nope, kv_lora_rank, heads}` with **ne0 = nope**, so element `(o, i, head)`
+  sits at `o + nope * (i + kv_lora_rank * head)` — the latent index is the slow
+  axis of each row, not the fast one. `attn_v_b` is
+  `{kv_lora_rank, head_v, heads}` and *does* have the latent as ne0. Rotating
+  both the same way is a plausible-looking mistake that produces numeric
+  nonsense on a real checkpoint.
+* **Rotary.** Applied to the trailing `rope_dim` of every query head and to the
+  shared `k_pe` only; the nope part of the key is never rotated.
+* **Value width.** `attention.value_length_mla` makes the value wider than the
+  key, so the KV cache stride is `kv_dim + v_dim` and the attention output is
+  `heads * head_v` wide. Under plain multi-head attention those coincide, which
+  is why this only breaks on MLA or grouped-query models.
+
+Two further traps cost real debugging time here, and both are pinned by tests:
+
+* A norm must divide by the **vector's** length, not by `hidden`. MLA normalises
+  latents of width `q_lora_rank` and `kv_lora_rank`; dividing by `hidden` scales
+  them by `sqrt(hidden / width)` and every logit moves.
+* Presence checks must scan **all** layers. A deepseek checkpoint's leading
+  dense blocks carry none of the MoE tensors, so `blk.0.ffn_gate_shexp` and
+  `blk.0.ffn_exp_probs_b.bias` both report "absent" on a model that has them.
+  `has_any_layer()` in the loader and the oracle's `any(...)` scan are the fix.
+
+Routing also differs by family and is read from `expert_gating_func`:
+`1` softmax, `2` sigmoid (V2/V3), `3` softmax over the selected weights only,
+`4` sqrt-softplus. The `ffn_exp_probs_b.bias` is added for **selection only** —
+the weights that multiply the expert outputs stay unbiased — and group-limited
+routing masks whole groups by setting their selection score to −inf.
+
+### Chat templates
+
+`tokenizer.chat_template` is Jinja. FreeMoe does not interpret it: `run` takes a
+prompt string and feeds its bytes to the tokenizer exactly as given, so a chat
+model needs the prompt already wrapped in its turn markers. The probe reports
+`chat_template_present` so this is visible per file rather than silent.
+
+The decision recorded here is to implement a *restricted* interpreter for the
+subset GGUF templates actually use (`{% for %}`, `{% if %}`, `{{ }}` with
+`.strip()`, `messages`, `add_generation_prompt`, `bos_token`, `eos_token`), with
+a per-family built-in template as the fallback when a file carries none, and to
+fail at *chat* time — not at load time — when a template uses anything outside
+the subset, so plain completion keeps working on the same checkpoint. Until that
+lands, the honest state is: no Jinja, no per-family templates, verbatim prompts.
 
 ### The one thing GGUF does not say
 
@@ -245,10 +304,11 @@ from silence, and `minicpm_scales` pins the decision in a test.
    the scalar path; this is the throughput step.
 6. ~~Architecture variants: `gemma`, `phi3`, `qwen2`, `qwen3`, `glm4`,
    `minicpm`, `qwen3moe`, `qwen2moe`, `phi2`.~~ **DONE**
-   Still open: `glm4-moe`, `minicpm3`, MLA (`deepseek2`), and the rest of
-   llama.cpp's `src/models/` tree. MLA is the largest remaining capability:
-   it needs low-rank q/kv compression plus per-layer dense-lead blocks, so it
-   is its own milestone rather than a variant of the attention already here.
+   ~~MLA (`deepseek2`)~~ **DONE** — see the section above.
+   Still open: `glm4-moe`, `minicpm3`, the MTP/`nextn` heads (parsed and
+   reported as ignored), and the rest of llama.cpp's `src/models/` tree.
+6b. **Chat templates.** Jinja is not implemented; a restricted interpreter for
+   the GGUF subset plus per-family fallbacks is the planned step (see above).
 7. **Ternary formats** (`PTQ1_0`/`TQ1_0`/`TQ2_0`) for #20 and #21.
 8. **Multimodal** (#8) is out of scope for this engine: the text decoder can be
    supported, the vision tower cannot, and pretending otherwise would be the
