@@ -1066,7 +1066,7 @@ void test_quant_reference_decode() {
     CHECK(std::memcmp(bytes.data(), "FMQR1", 5) == 0, "quant reference magic");
     uint32_t records = 0;
     std::memcpy(&records, bytes.data() + 8, sizeof(records));
-    CHECK(records == 21, "quant reference covers every supported block type");
+    CHECK(records == 26, "quant reference covers every supported block type");
 
     size_t pos = 12;
     uint32_t decoded_types = 0;
@@ -1102,6 +1102,60 @@ void test_quant_reference_decode() {
 
         std::vector<float> got(n_float, 0.0f);
         dequantize_block(type_id, raw, got.data());
+
+        // Low-bit formats store one scale plus small integer codes, so a decoded
+        // block takes only a handful of distinct values, all of them exact
+        // multiples of that scale. A decoder that read the packing wrong would
+        // spread values across the range and fail this.
+        //
+        // The permitted codes differ by format and are not guessable: the 2-bit
+        // codecs use {0,1,2,3} meaning {-1,0,+1,+2}, which is deliberately
+        // asymmetric, while base-3 trits are {-1,0,+1} and Q1_0 is a bare sign.
+        struct LowBitFormat {
+            uint32_t type_id;
+            int lowest;   // smallest code
+            int highest;  // largest code
+        };
+        static const std::vector<LowBitFormat> low_bit = {
+            {34, -1, 1},   // TQ1_0: base-3 trits
+            {35, -1, 2},   // TQ2_0: 2-bit codes
+            {41, -1, 1},   // Q1_0: sign only
+            {42, -1, 2},   // Q2_0: 2-bit codes
+            {142, -1, 2},  // PQ2_0: 2-bit codes
+        };
+        for (const auto &format : low_bit) {
+            if (format.type_id != type_id) continue;
+            // Recover the scale from the extreme code, which is always present
+            // in a pseudo-random block of codes.
+            double extreme = 0.0;
+            for (float v : got) extreme = std::max(extreme, std::fabs(static_cast<double>(v)));
+            const bool has_negative = std::any_of(got.begin(), got.end(),
+                                                  [](float v) { return v < 0.0f; });
+            const int max_code = format.highest;
+            const double scale = extreme / max_code;
+            CHECK(scale > 0.0, "type " + std::to_string(type_id) + " has a usable scale");
+            if (!(scale > 0.0)) break;
+
+            std::set<int> seen;
+            bool exact_multiples = true;
+            for (float v : got) {
+                const double code = static_cast<double>(v) / scale;
+                const double nearest = std::round(code);
+                if (std::fabs(code - nearest) > 1e-5) exact_multiples = false;
+                if (nearest < format.lowest || nearest > format.highest) exact_multiples = false;
+                seen.insert(static_cast<int>(nearest));
+            }
+            CHECK(exact_multiples,
+                  "type " + std::to_string(type_id) +
+                      " decodes to exact multiples of one scale in the permitted code range");
+            CHECK(static_cast<int>(seen.size()) <= format.highest - format.lowest + 1,
+                  "type " + std::to_string(type_id) + " uses at most " +
+                      std::to_string(format.highest - format.lowest + 1) + " codes");
+            if (format.lowest < 0)
+                CHECK(has_negative || type_id == 41,
+                      "type " + std::to_string(type_id) + " produces negative weights");
+        }
+
         double worst = 0.0;
         for (uint32_t i = 0; i < n_float; ++i) {
             const double a = got[i], b = expected[i];
@@ -1764,6 +1818,46 @@ void test_architecture_parity() {
     }
 }
 
+
+// PrismML's Bonsai 2 stores ternary weights in a Hadamard-rotated basis and
+// mixes linear attention into the block. Neither is implemented, and the danger
+// is specific: the bytes decode to plausible numbers, so a loader that ignored
+// both would emit garbage while reporting success. The probe has to name both.
+void test_rotated_and_ternary_blockers() {
+    const std::string path = "tests/fixtures/ternary-bonsai-shape.gguf";
+    auto doc = parse_gguf_file(path);
+    const std::string dump = probe_model(doc, path).dump();
+
+    auto contains = [&dump](const std::string &needle) {
+        return dump.find(needle) != std::string::npos;
+    };
+    CHECK(contains("\"runnable\":false"), "a rotated-basis checkpoint is not reported runnable");
+    CHECK(contains("ROTATED_WEIGHT_BASIS"),
+          "the probe names the missing Hadamard activation transform");
+    CHECK(contains("LINEAR_ATTENTION"),
+          "the probe names the unimplemented linear-attention state");
+    CHECK(contains("\"rotated_weight_basis\":true"), "the rotation is reported as a fact");
+    CHECK(contains("\"ternary_weights\":true"), "ternary weights are reported as a fact");
+
+    // PTQ1_0 parses (so sizes and expert ranges are right) but must never claim
+    // to execute: its element layout cannot be confirmed from the published
+    // sources, and a guess here is silent corruption rather than a crash.
+    const TensorCapability ptq = tensor_capability(143);
+    CHECK(ptq.parse, "PTQ1_0 geometry is parsed");
+    CHECK(!ptq.dequantize, "PTQ1_0 is not decoded");
+    CHECK(!ptq.execute, "PTQ1_0 has no execution path");
+    const auto &table = quantisation_table();
+    CHECK(table.at(143).block_size == 128 && table.at(143).block_bytes == 28,
+          "PTQ1_0 geometry is 28 bytes per 128 weights");
+
+    // The upstream ternary ids are fully supported.
+    for (uint32_t id : {34u, 35u, 41u, 42u, 142u}) {
+        const TensorCapability cap = tensor_capability(id);
+        CHECK(cap.dequantize && cap.execute,
+              "ternary type " + std::to_string(id) + " decodes and executes");
+    }
+}
+
 void test_soak_sessions() {
     const uint32_t N_SOAK = 256;
     std::string prompt = first_prompt();
@@ -1813,6 +1907,7 @@ int main(int argc, char **argv) {
     maybe_run("tokenizer_real_vocabularies", test_tokenizer_real_vocabularies);
     maybe_run("model_map_and_tied_output", test_model_map_and_tied_output);
     maybe_run("architecture_parity", test_architecture_parity);
+    maybe_run("rotated_and_ternary_blockers", test_rotated_and_ternary_blockers);
     maybe_run("soak_sessions", test_soak_sessions);
     std::cout << g_checks << " checks, " << g_failures << " failures\n";
     return g_failures == 0 ? 0 : 1;

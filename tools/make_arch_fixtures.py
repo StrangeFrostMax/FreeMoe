@@ -230,6 +230,70 @@ SPECS: list[dict[str, Any]] = [
 ]
 
 
+
+
+def raw_tensor(name: str, dims: list[int], type_id: int) -> TensorSpec:
+    """A tensor whose payload is deliberately opaque.
+
+    The probe must judge these files from their metadata and type ids, not from
+    whether the bytes happen to decode to something, so deterministic filler is
+    the honest choice here.
+    """
+    from gguf_format import tensor_byte_size
+
+    size = tensor_byte_size(dims, type_id)
+    seed = int.from_bytes(hashlib.sha256(name.encode()).digest()[:8], "little")
+    rng = random.Random(seed)
+    return TensorSpec(name, list(dims), bytes(rng.getrandbits(8) for _ in range(size)), type_id)
+
+
+def build_ternary_fixture() -> dict[str, Any]:
+    """PrismML Bonsai 2 shape: PTQ1_0 weights in a rotated basis, hybrid attention."""
+    h, layers = 128, 1
+    tensors = [
+        raw_tensor("token_embd.weight", [h, h], 143),
+        raw_tensor("blk.0.attn_norm.weight", [h], 0),
+        raw_tensor("blk.0.attn_qkv.weight", [h, 3 * h], 143),
+        raw_tensor("blk.0.attn_gate.weight", [h, h], 143),
+        raw_tensor("blk.0.ssm_alpha.weight", [h, h], 0),
+        raw_tensor("blk.0.ssm_conv1d.weight", [h, 4], 0),
+        raw_tensor("blk.0.ffn_norm.weight", [h], 0),
+        raw_tensor("blk.0.ffn_gate.weight", [h, h], 143),
+        raw_tensor("blk.0.ffn_up.weight", [h, h], 143),
+        raw_tensor("blk.0.ffn_down.weight", [h, h], 143),
+        raw_tensor("output_norm.weight", [h], 0),
+    ]
+    md: dict[str, tuple[Any, ...]] = {
+        "general.architecture": ("string", "qwen35"),
+        "general.name": ("string", "FreeMoe synthetic Bonsai-2-shaped ternary checkpoint"),
+        "general.alignment": ("u32", ALIGN),
+        "general.file_type": ("u32", 143),
+        "qwen35.block_count": ("u32", layers),
+        "qwen35.embedding_length": ("u32", h),
+        "qwen35.feed_forward_length": ("u32", h),
+        "qwen35.attention.head_count": ("u32", 4),
+        "qwen35.attention.head_count_kv": ("u32", 4),
+        "qwen35.attention.key_length": ("u32", 32),
+        "qwen35.attention.layer_norm_rms_epsilon": ("f32", 1e-6),
+        "qwen35.rope.dimension_count": ("u32", 32),
+        "qwen35.context_length": ("u32", 64),
+        "qwen35.vocab_size": ("u32", V),
+        "tokenizer.ggml.model": ("string", "gpt2"),
+        "tokenizer.ggml.bos_token_id": ("u32", BOS),
+        "tokenizer.ggml.eos_token_id": ("u32", EOS),
+        "tokenizer.ggml.tokens": ("array_string", tokenizer_tokens()),
+        # The rotation is what makes the weights unreadable without the matching
+        # activation transform.
+        "prism.hadamard.version": ("u32", 1),
+        "prism.hadamard.block_size": ("u32", 1024),
+        "prism.hadamard.transform": ("string", "fwht"),
+        "prism.hadamard.sign_mode": ("string", "fixed"),
+    }
+    path = ROOT / "tests" / "fixtures" / "ternary-bonsai-shape.gguf"
+    write_gguf(path, md, tensors)
+    return {"slug": "ternary-bonsai", "model": str(path), "tensors": len(tensors)}
+
+
 def fixture_path(slug: str) -> Path:
     return ROOT / "tests" / "fixtures" / f"{slug}-shape.gguf"
 
@@ -315,6 +379,7 @@ def main() -> int:
     for spec in SPECS:
         report = build(spec)
         print(json.dumps(report))
+    print(json.dumps(build_ternary_fixture()))
     return 0
 
 
