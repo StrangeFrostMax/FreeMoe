@@ -68,6 +68,20 @@ const std::map<std::string, ArchFacts> &known_architectures() {
         // phi2: LayerNorm instead of RMSNorm, a gate-free GELU FFN, and one
         // shared residual for the attention and FFN branches.
         {"phi2", {true, false}},
+        // internlm2: the plain block. It exists here to prove the block is
+        // driven by the checkpoint rather than by one family's code path.
+        {"internlm2", {true, false}},
+        // orion: LayerNorm with biases on every norm, sequential residual.
+        {"orion", {true, false}},
+        // exaone: RMSNorm, SwiGLU, tied output, optional per-layer rope factors.
+        {"exaone", {true, false}},
+        // gptneox: fused q/k/v with a fused bias, LayerNorm with biases, and a
+        // gate-free GELU feed-forward.
+        {"gptneox", {true, false}},
+        // stablelm: LayerNorm with biases and a rotary width narrower than the
+        // head; the FFN norm is optional, and its absence means the FFN runs on
+        // the attention's normalised input.
+        {"stablelm", {true, false}},
         // deepseek2: multi-head latent attention, dense-lead blocks, and a
         // router whose gating function, selection bias and group masking all
         // change which experts run.

@@ -241,6 +241,8 @@ def arch_metadata(spec: dict[str, Any]) -> dict[str, tuple[Any, ...]]:
         "tokenizer.ggml.eos_token_id": ("u32", EOS),
         "tokenizer.ggml.tokens": ("array_string", tokenizer_tokens()),
     }
+    if spec.get("chat_template"):
+        md["tokenizer.chat_template"] = ("string", spec["chat_template"])
     if spec.get("experts"):
         md[f"{arch}.expert_count"] = ("u32", spec["experts"])
         md[f"{arch}.expert_used_count"] = ("u32", spec.get("expert_used", 2))
@@ -346,6 +348,63 @@ SPECS: list[dict[str, Any]] = [
         "shared_width": 40,
     },
     {
+        # internlm2: the plain block with nothing added. It exists to prove the
+        # block is driven by the checkpoint, not by one family's code path: the
+        # only difference from `llama-gqa` is the architecture string.
+        "slug": "internlm2",
+        "arch": "internlm2",
+        "name": "FreeMoe synthetic internlm2 (plain block, different arch string)",
+        "kv_heads": 2,
+        "rope_dim": SHAPE["head_dim"],
+    },
+    {
+        # exaone: RMSNorm and SwiGLU with a tied output projection, which is the
+        # same block again with a different vocabulary size.
+        "slug": "exaone",
+        "arch": "exaone",
+        "name": "FreeMoe synthetic exaone with a tied output",
+        "kv_heads": 2,
+        "rope_dim": SHAPE["head_dim"],
+        "tied_output": True,
+    },
+    {
+        # orion: LayerNorm *with biases on every norm*, sequential residual (the
+        # FFN has its own norm, unlike phi2).
+        "slug": "orion",
+        "arch": "orion",
+        "name": "FreeMoe synthetic orion with LayerNorm biases",
+        "kv_heads": 2,
+        "rope_dim": SHAPE["head_dim"],
+        "layernorm": True,
+    },
+    {
+        # gptneox: one fused q/k/v projection with a fused bias, a bias on the
+        # attention output, LayerNorm with biases, and a gate-free GELU FFN with
+        # biases on both projections. Four separate biases, so forgetting any of
+        # them changes the logits.
+        "slug": "gptneox",
+        "arch": "gptneox",
+        "name": "FreeMoe synthetic gpt-neox (fused qkv, gate-free GELU)",
+        "kv_heads": SHAPE["heads"],
+        "rope_dim": SHAPE["head_dim"],
+        "layernorm": True,
+        "fused_qkv": True,
+        "qkv_bias": True,
+        "attn_output_bias": True,
+        "ffn_no_gate": True,
+        "ffn_bias": True,
+    },
+    {
+        # stablelm: LayerNorm with biases and a rotary width narrower than the
+        # head, so the unrotated tail of every key and query must survive.
+        "slug": "stablelm",
+        "arch": "stablelm",
+        "name": "FreeMoe synthetic stablelm (partial rotary, LayerNorm)",
+        "kv_heads": 2,
+        "rope_dim": 4,
+        "layernorm": True,
+    },
+    {
         # phi2: LayerNorm with a bias instead of RMSNorm, no ffn_norm at all (the
         # FFN runs on the attention's normalised input and both branches are
         # added to one residual), a gate-free GELU FFN with biases, and biases on
@@ -421,6 +480,15 @@ SPECS: list[dict[str, Any]] = [
         "name": "FreeMoe synthetic llama with grouped-query attention",
         "kv_heads": 2,
         "rope_dim": SHAPE["head_dim"],
+        # A real ChatML template, so the chat path is exercised end to end
+        # against a checkpoint that carries one rather than only against the
+        # built-in table.
+        "chat_template": ("{% for message in messages %}"
+                          "{{ '<|im_start|>' + message['role'] + '\n' + message['content']"
+                          " + '<|im_end|>\n' }}"
+                          "{% endfor %}"
+                          "{% if add_generation_prompt %}"
+                          "{{ '<|im_start|>assistant\n' }}{% endif %}"),
     },
     {
         # qwen3: grouped-query attention plus per-head RMSNorm on q and k.

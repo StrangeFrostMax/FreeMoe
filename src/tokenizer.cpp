@@ -165,6 +165,15 @@ Tokenizer Tokenizer::from_gguf(const GGUFDocument &doc, uint32_t vocab) {
     return tokenizer;
 }
 
+bool Tokenizer::contains_piece(const std::string &piece) const {
+    return piece_to_id_.count(piece) != 0;
+}
+
+std::string Tokenizer::piece(uint32_t id) const {
+    if (id >= pieces_.size()) return std::string();
+    return pieces_[id];
+}
+
 std::vector<int32_t> Tokenizer::encode(const std::string &text, uint32_t bos_id) const {
     if (kind_ == Kind::Byte) {
         std::vector<int32_t> ids;

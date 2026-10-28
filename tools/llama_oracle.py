@@ -168,9 +168,13 @@ def load_model(path: Path) -> dict[str, Any]:
     cfg["ffn_no_gate"] = (cfg["experts"] == 0 and "blk.0.ffn_gate.weight" not in tensors
                           and "blk.0.ffn_up.weight" in tensors and not cfg["fused_gate_up"])
     if cfg["ffn_no_gate"]:
-        if arch != "phi2":
-            raise ReferenceError("gate-free feed-forward is only defined for phi2")
-        cfg["activation"] = "gelu"
+        # A gate-free FFN cannot say which activation it means, so the
+        # architecture has to. Read from llama.cpp's model files: both phi2 and
+        # gpt-neox use `LLM_FFN_GELU` with `LLM_FFN_SEQ`.
+        seq_activation = {"phi2": "gelu", "gptneox": "gelu"}
+        if arch not in seq_activation:
+            raise ReferenceError("gate-free feed-forward is only defined for phi2 and gptneox")
+        cfg["activation"] = seq_activation[arch]
     if cfg["heads"] * cfg["hd"] != cfg["H"]:
         raise ReferenceError("heads * head_dim != hidden")
     if cfg["kv_heads"] > cfg["heads"] or cfg["heads"] % cfg["kv_heads"]:

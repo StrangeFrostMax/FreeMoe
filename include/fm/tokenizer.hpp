@@ -33,6 +33,16 @@ public:
     // byte fallback, which is deterministic and matches the piece table.
     std::vector<int32_t> encode(const std::string &text, uint32_t bos_id) const;
 
+    // The literal piece text for an id, or an empty string when out of range.
+    // Chat templates splice `bos_token`/`eos_token` into the prompt as text, so
+    // the engine needs the piece itself rather than its id.
+    std::string piece(uint32_t id) const;
+
+    // True when the vocabulary contains this exact piece. Used to pick a chat
+    // template from evidence (does the vocab carry `<|im_start|>`?) instead of
+    // from the architecture name.
+    bool contains_piece(const std::string &piece) const;
+
     // Decodes ids back to text. Special tokens are skipped; byte-fallback
     // pieces are emitted as raw bytes.
     std::string decode(const std::vector<int32_t> &ids, uint32_t bos_id,

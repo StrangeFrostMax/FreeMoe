@@ -1,6 +1,7 @@
 #pragma once
 
 #include "fm/backend.hpp"
+#include "fm/chat_template.hpp"
 #include "fm/gguf.hpp"
 #include "fm/tokenizer.hpp"
 #include "fm/io.hpp"
@@ -153,6 +154,14 @@ public:
 
     // Public text helpers: token ids in, bytes out.
     std::string detokenize(const std::vector<int32_t> &ids) const;
+
+    // Renders a conversation into the exact prompt bytes the model was trained
+    // on, using the checkpoint's own `tokenizer.chat_template` when it has one.
+    // `template_override` accepts either a built-in name ("chatml", "llama3",
+    // ...) or literal template text. Fails rather than guessing when neither
+    // the checkpoint nor the built-in table provides a template.
+    ChatRender render_chat(const std::vector<ChatMessage> &messages, bool add_generation_prompt,
+                           const std::string &template_override) const;
     const ModelManifest &manifest() const { return manifest_; }
     const GGUFDocument &document() const { return doc_; }
     Backend &backend() { return *backend_; }

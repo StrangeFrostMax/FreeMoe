@@ -100,6 +100,7 @@ void print_usage() {
         "  freemoe WAKE_UP <model.gguf> [--json]     # alias for inspect\n"
         "  freemoe device-info --backend cpu|vnpu|gpu [--json]\n"
         "  freemoe run --model <model.gguf> [--backend cpu|vnpu|gpu] [options]\n"
+        "  freemoe chat --model <model.gguf> --prompt TEXT [--system TEXT] [--render-only]\n"
         "  freemoe compare --model <model.gguf> [--backend cpu|vnpu|gpu] [options]\n"
         "  freemoe bench [--iterations N] [--out path]      # CPU kernel benchmark\n"
         "\n"
@@ -118,6 +119,10 @@ void print_usage() {
         "  --trace path --metrics path --report path --run-id ID --results-dir path\n"
         "  --reference-root path --limit N --abs-tol X --rel-tol X\n"
         "  --prompt TEXT --prompt-file PATH --dump-logits PATH\n"
+        "  --chat --system TEXT --chat-file PATH      # render a conversation\n"
+        "  --chat-template NAME|TEXT --chat-template-file PATH\n"
+        "      NAME = chatml|llama2|llama3|gemma|phi3|deepseek2|zephyr|vicuna|raw\n"
+        "  --no-generation-prompt --render-only --dump-prompt PATH\n"
         "\n"
         "  freemoe probe --model FILE [FILE ...]  report what this build can do with a model\n";
 }
@@ -180,6 +185,49 @@ std::string load_prompt(const Args &args) {
     std::string line;
     if (in && std::getline(in, line)) return fm::strip_eol(line);
     return "the quick brown fox";
+}
+
+// Builds the conversation for `--chat`. Messages come either from a script
+// file (one `role: content` per line, `#` comments and blank lines skipped) or
+// from `--system` plus the prompt as a single user turn. Keeping this explicit
+// means the CLI never invents a conversation the user did not ask for.
+std::vector<fm::ChatMessage> build_messages(const Args &args, const std::string &prompt) {
+    std::vector<fm::ChatMessage> messages;
+    if (args.has("chat-file")) {
+        const std::string text = fm::read_text_file(args.get("chat-file"));
+        std::istringstream stream(text);
+        std::string line;
+        while (std::getline(stream, line)) {
+            line = fm::strip_eol(line);
+            if (line.empty() || line[0] == '#') continue;
+            const size_t colon = line.find(':');
+            if (colon == std::string::npos)
+                fm::fail(fm::ErrorCode::INVALID_ARGUMENT,
+                         "chat file line is not 'role: content': " + line);
+            fm::ChatMessage message;
+            message.role = fm::trim(line.substr(0, colon));
+            message.content = line.substr(colon + 1);
+            // One space after the colon is a separator, not content.
+            if (!message.content.empty() && message.content[0] == ' ') message.content.erase(0, 1);
+            if (message.role.empty())
+                fm::fail(fm::ErrorCode::INVALID_ARGUMENT, "chat file line has an empty role");
+            messages.push_back(std::move(message));
+        }
+        if (messages.empty())
+            fm::fail(fm::ErrorCode::INVALID_ARGUMENT, "chat file carries no messages");
+        return messages;
+    }
+    if (args.has("system")) messages.push_back({"system", args.get("system")});
+    messages.push_back({"user", prompt});
+    return messages;
+}
+
+// The template to use, if the user named one: a built-in name, a literal
+// template, or the contents of a file.
+std::string chat_template_override(const Args &args) {
+    if (args.has("chat-template-file")) return fm::read_text_file(args.get("chat-template-file"));
+    if (args.has("chat-template")) return args.get("chat-template");
+    return std::string();
 }
 
 // The synthetic tokenizer emits raw bytes, which are not always valid UTF-8.
@@ -289,7 +337,31 @@ int command_run(const Args &args) {
     fm::RunConfig cfg = build_run_config(args);
     fm::Engine engine(cfg);
     engine.initialize();
+
+    const bool chat = args.has("chat") || args.has("system") || args.has("chat-file");
     std::string prompt = load_prompt(args);
+    fm::ChatRender rendered;
+    bool rendered_chat = false;
+    // `--dump-prompt` and `--render-only` both report the exact bytes handed to
+    // the tokenizer, which is the whole point of a chat template: it is not
+    // observable from the output text alone.
+    if (chat) {
+        rendered = engine.render_chat(build_messages(args, prompt), !args.has("no-generation-prompt"),
+                                      chat_template_override(args));
+        prompt = rendered.prompt;
+        rendered_chat = true;
+    }
+    if (args.has("render-only")) {
+        Json out = json_result("ok");
+        out.set("model", cfg.model_path);
+        out.set("chat", rendered_chat);
+        out.set("rendered_prompt", prompt);
+        if (rendered_chat) out.set("chat_template_source", rendered.template_source);
+        if (args.has("dump-prompt")) fm::write_text_file(args.get("dump-prompt"), prompt);
+        std::cout << out.dump() << "\n";
+        engine.release_runtime();
+        return 0;
+    }
     auto result = engine.run_prompt(prompt, cfg.generated_tokens);
 
     Json out = json_result("ok");
@@ -298,6 +370,11 @@ int command_run(const Args &args) {
     out.set("backend", engine.backend().name());
     out.set("reader", fm::reader_mode_name(cfg.reader_mode));
     out.set("prompt_bytes", static_cast<uint64_t>(prompt.size()));
+    if (rendered_chat) {
+        out.set("chat", true);
+        out.set("rendered_prompt", prompt);
+        out.set("chat_template_source", rendered.template_source);
+    }
     out.set("input_tokens", static_cast<uint64_t>(result.input_ids.size()));
     out.set("first_token_ms", fm::fixed_double(result.first_token_ms, 6));
     out.set("prefill_ms", fm::fixed_double(result.prefill_ms, 6));
@@ -532,6 +609,11 @@ int main(int argc, char **argv) {
         if (command == "inspect" || command == "WAKE_UP") return command_inspect(args);
         if (command == "device-info") return command_device_info(args);
         if (command == "run") return command_run(args);
+        if (command == "chat") {
+            // `chat` is `run --chat`; the conversation is the unit of work.
+            args.options["chat"] = "1";
+            return command_run(args);
+        }
         if (command == "compare") return command_compare(args);
         if (command == "bench") return command_bench(args);
         if (command == "probe" || command == "support") return command_probe(args);
