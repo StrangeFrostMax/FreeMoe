@@ -4,12 +4,16 @@
 #include "fm/gguf.hpp"
 
 #include <cstdint>
+#include <string>
 
 namespace fm {
 
 // IEEE binary16 / bfloat16 to binary32. Exact, no approximation.
 float fp16_to_f32(uint16_t value);
 float bf16_to_f32(uint16_t value);
+
+// Display name for a tensor type, or "TYPE_<id>" when the geometry is unknown.
+std::string quant_geometry_or_name(uint32_t type_id);
 
 // Block geometry for a tensor type. Fails with a typed error for unknown types.
 const QuantGeometry &quant_geometry(uint32_t type_id);

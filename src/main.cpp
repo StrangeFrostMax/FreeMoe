@@ -2,6 +2,7 @@
 #include "fm/engine.hpp"
 #include "fm/gguf.hpp"
 #include "fm/quant.hpp"
+#include "fm/support.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -114,7 +115,9 @@ void print_usage() {
         "  --test-simulate-zen3 (device-info only)# force Zen 3 fallback diagnostics\n"
         "  --trace path --metrics path --report path --run-id ID --results-dir path\n"
         "  --reference-root path --limit N --abs-tol X --rel-tol X\n"
-        "  --prompt TEXT --prompt-file PATH --dump-logits PATH\n";
+        "  --prompt TEXT --prompt-file PATH --dump-logits PATH\n"
+        "\n"
+        "  freemoe probe --model FILE [FILE ...]  report what this build can do with a model\n";
 }
 
 std::string model_path(const Args &args) {
@@ -420,6 +423,53 @@ Json kernel_bench_json(uint32_t iterations) {
     return out;
 }
 
+int command_probe(const Args &args) {
+    std::vector<std::string> paths;
+    if (args.has("model")) paths.push_back(args.get("model"));
+    // positional[0] is the command name itself.
+    for (size_t i = 1; i < args.positional.size(); ++i) paths.push_back(args.positional[i]);
+    if (paths.empty()) fm::fail(fm::ErrorCode::INVALID_ARGUMENT, "missing model path");
+
+    Json out = Json::object();
+    if (paths.size() == 1) {
+        auto doc = fm::parse_gguf_file(paths.front());
+        out = fm::probe_model(doc, paths.front());
+    } else {
+        // Several files at once produce a support matrix, which is what you want
+        // when triaging a directory of downloaded checkpoints.
+        Json models = Json::array();
+        uint64_t runnable = 0;
+        for (const auto &path : paths) {
+            Json row;
+            try {
+                auto doc = fm::parse_gguf_file(path);
+                row = fm::probe_model(doc, path);
+            } catch (const fm::Error &error) {
+                row = Json::object();
+                row.set("schema", "freemoe.model-probe.v1");
+                row.set("source", path);
+                row.set("runnable", false);
+                row.set("verdict", "unreadable");
+                Json blocker = Json::object();
+                blocker.set("code", fm::error_name(error.code));
+                blocker.set("detail", error.what());
+                Json blockers = Json::array();
+                blockers.push(std::move(blocker));
+                row.set("blockers", std::move(blockers));
+            }
+            if (row.dump().find("\"runnable\":true") != std::string::npos) ++runnable;
+            models.push(std::move(row));
+        }
+        out.set("schema", "freemoe.support-matrix.v1");
+        out.set("models", std::move(models));
+        out.set("model_count", static_cast<int64_t>(paths.size()));
+        out.set("runnable_count", runnable);
+    }
+    if (args.has("out")) fm::write_text_file(args.get("out"), out.dump() + "\n");
+    std::cout << out.dump() << "\n";
+    return 0;
+}
+
 int command_bench(const Args &args) {
     uint32_t iterations = std::max(1u, args.get_u32("iterations", 5));
     Json out = kernel_bench_json(iterations);
@@ -481,6 +531,7 @@ int main(int argc, char **argv) {
         if (command == "run") return command_run(args);
         if (command == "compare") return command_compare(args);
         if (command == "bench") return command_bench(args);
+        if (command == "probe" || command == "support") return command_probe(args);
         if (command == "version") {
             std::cout << "FreeMoe 0.1.0 correctness prototype\n";
             return 0;

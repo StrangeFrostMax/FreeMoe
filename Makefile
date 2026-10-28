@@ -19,6 +19,7 @@ OUR_LIB_SRCS := \
   src/backend.cpp \
   src/kernels.cpp \
   src/quant.cpp \
+  src/support.cpp \
   src/residency.cpp \
   src/engine.cpp
 APP_MAIN := src/main.cpp

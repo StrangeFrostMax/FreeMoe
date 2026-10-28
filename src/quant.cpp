@@ -80,6 +80,13 @@ float bf16_to_f32(uint16_t value) {
     return out;
 }
 
+std::string quant_geometry_or_name(uint32_t type_id) {
+    const auto &table = quantisation_table();
+    auto it = table.find(type_id);
+    if (it != table.end()) return it->second.name;
+    return "TYPE_" + std::to_string(type_id);
+}
+
 const QuantGeometry &quant_geometry(uint32_t type_id) {
     const auto &table = quantisation_table();
     auto it = table.find(type_id);

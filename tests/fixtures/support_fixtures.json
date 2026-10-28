@@ -1,0 +1,18 @@
+{
+  "schema": "freemoe.support-fixtures.v1",
+  "generator": "tools/make_support_fixtures.py",
+  "synthetic": true,
+  "outputs": {
+    "llama-shape-q8_0.gguf": {
+      "sha256": "a4cfaf95f3ee785b3303d918704fd531e5e3c7963fb316e230bc63271af14e77",
+      "bytes": 50048,
+      "purpose": "GQA + BPE tokenizer + Q8_0 blockers"
+    },
+    "llama-shape-f32.gguf": {
+      "sha256": "62608b66c30eac1b8e2859278adf1065282780cf40ef7cf23209888473c9bebc",
+      "bytes": 176384,
+      "purpose": "architecture-only blocker set"
+    }
+  },
+  "note": "These files are shaped like published llama.cpp checkpoints (standard keys, standard tensor names, GQA, BPE tokenizer). They exist to test `freemoe probe` and are not runnable models."
+}

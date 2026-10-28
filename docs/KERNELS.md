@@ -150,6 +150,7 @@ unrounded f16 scale, and nibble kernels that dropped half of every block.
 
 ## Reproduction and gates
 
+- `freemoe bench` also reports the block-quantised shapes (`quant_results`).
 - `make test` runs the `cpu_kernels` unit test: vector paths vs scalar oracle,
   tail handling, threaded determinism, ISA policy, benchmark sanity.
 - `make bench` writes `docs/evidence/kernels_bench.json`.

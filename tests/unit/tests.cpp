@@ -4,6 +4,7 @@
 #include "fm/io.hpp"
 #include "fm/residency.hpp"
 #include "fm/quant.hpp"
+#include "fm/support.hpp"
 #include "vnpu.h"
 
 #include <algorithm>
@@ -1139,6 +1140,45 @@ void test_quant_reference_decode() {
 }
 
 
+void test_model_probe() {
+    // `freemoe probe` must answer, for any GGUF, what this build can and cannot
+    // do with it. A probe that only says "unsupported" is useless, so the tests
+    // check that it names the specific blockers.
+    {
+        auto doc = parse_gguf_file("tests/fixtures/moe-fm.gguf");
+        Json probe = probe_model(doc, "tests/fixtures/moe-fm.gguf");
+        CHECK(probe.dump().find("\"runnable\":true") != std::string::npos,
+              "own adapter fixture is reported runnable");
+        CHECK(probe.dump().find("\"blocker_count\":0") != std::string::npos,
+              "runnable model has no blockers");
+        CHECK(probe.dump().find("\"hidden_size\":16") != std::string::npos,
+              "probe reads hyperparameters through the freemoe. prefix");
+    }
+    {
+        // A llama-shaped checkpoint: standard keys, standard tensor names, GQA
+        // and a GPT-2 BPE tokenizer.
+        auto doc = parse_gguf_file("tests/fixtures/llama-shape-q8_0.gguf");
+        Json probe = probe_model(doc, "tests/fixtures/llama-shape-q8_0.gguf");
+        const std::string dump = probe.dump();
+        CHECK(dump.find("\"runnable\":false") != std::string::npos,
+              "llama-shaped checkpoint is not reported runnable");
+        CHECK(dump.find("MISSING_ADAPTER") != std::string::npos,
+              "probe names the missing architecture adapter");
+        CHECK(dump.find("GROUPED_QUERY_ATTENTION") != std::string::npos,
+              "probe detects grouped-query attention");
+        CHECK(dump.find("TOKENIZER_NOT_IMPLEMENTED") != std::string::npos,
+              "probe detects an unimplemented tokenizer");
+        CHECK(dump.find("\"num_key_value_heads\":2") != std::string::npos,
+              "probe reads grouped-query head counts from llama.* keys");
+        CHECK(dump.find("\"execute\":true") != std::string::npos,
+              "probe reports that Q8_0 tensors are executable");
+        CHECK(probe.dump().find("tensor_families") != std::string::npos,
+              "probe reports the tensor inventory");
+    }
+    CHECK(quant_geometry_or_name(8) == "Q8_0", "known type reports its format name");
+    CHECK(quant_geometry_or_name(199) == "TYPE_199", "unknown type reports its numeric id");
+}
+
 void test_quant_model_parity() {
     // End-to-end proof that block-quantised checkpoints execute correctly.
     // Each quant-moe-<type>.gguf stores every matrix in that block format, and
@@ -1493,6 +1533,7 @@ int main(int argc, char **argv) {
     maybe_run("quant_reference_decode", test_quant_reference_decode);
     maybe_run("quant_gemv", test_quant_gemv);
     maybe_run("quant_model_parity", test_quant_model_parity);
+    maybe_run("model_probe", test_model_probe);
     maybe_run("cpu_kernels", test_cpu_kernels);
     maybe_run("generic_inspect_and_roundtrip", test_generic_inspect_and_roundtrip);
     maybe_run("sampling_and_detokenize", test_sampling_and_detokenize);

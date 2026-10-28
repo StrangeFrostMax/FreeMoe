@@ -17,6 +17,7 @@ set(FREEMOE_LIB_SOURCES
   src/backend.cpp
   src/kernels.cpp
   src/quant.cpp
+  src/support.cpp
   src/residency.cpp
   src/engine.cpp)
 set(FREEMOE_INCLUDE_DIRS

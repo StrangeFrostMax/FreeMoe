@@ -49,6 +49,7 @@ CLI / run recorder
 | EXISTS | `src/backend.cpp` | Scalar CPU, patched Virtual NPU and explicit GPU placeholder backends. |
 | EXISTS | `src/residency.cpp` | Budget calculator, authoritative state table, safe eviction, checksums, fault handling. |
 | EXISTS | `src/kernels.cpp` | Vectorised GEMV (F32 and block-quantised), runtime ISA resolution with Zen 3 policy, thread pool, kernel benchmark harness. |
+| EXISTS | `src/support.cpp` | Architecture-agnostic support probe: reads any GGUF and reports architecture, hyperparameters, tensor types, tokenizer and every concrete blocker before claiming a model is runnable. |
 | EXISTS | `src/quant.cpp` | Scalar reference block decoders for every supported GGUF tensor type, plus block geometry. The oracle that the vectorised quantised kernels are checked against. |
 | EXISTS | `src/engine.cpp` | Llama-like forward pass, MoE routing/execution, reference comparison and reports. |
 | EXISTS | `src/main.cpp` | `inspect`/`WAKE_UP`, `device-info`, `run`, `compare` and `version` commands. |
