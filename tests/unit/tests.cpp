@@ -1581,30 +1581,47 @@ static MetadataValue make_string(const std::string &value) {
 }
 
 void test_tokenizer_real_vocabularies() {
-    auto sentencepiece_doc = [](bool with_byte_fallback) {
+    const std::string marker = "\xe2\x96\x81";  // U+2581
+    auto sentencepiece_doc = [&marker](bool with_byte_fallback) {
         GGUFDocument doc;
         doc.metadata["tokenizer.ggml.model"] = make_string("llama");
         MetadataValue tokens;
         tokens.type = GGUFValueType::ARRAY;
-        auto add = [&](const std::string &piece) {
+        MetadataValue scores;
+        scores.type = GGUFValueType::ARRAY;
+        // Score model: a piece is worth -(its length). Longer pieces therefore win
+        // where they exist, which is what makes the merge order observable.
+        auto add = [&](const std::string &piece, double score) {
             tokens.array.push_back(make_string(piece));
+            MetadataValue value;
+            value.type = GGUFValueType::FLOAT32;
+            value.f = score;
+            scores.array.push_back(value);
         };
-        add("<unk>");                        // 0
-        add("<s>");                          // 1
-        add("</s>");                         // 2
-        add(std::string("\xe2\x96\x81") + "the");   // 3  " the"
-        add(std::string("\xe2\x96\x81") + "cat");   // 4  " cat"
-        add("cat");                          // 5
-        add("s");                            // 6
-        add(std::string("\xe2\x96\x81") + "sat");   // 7
+        add("<unk>", 0.0);                   // 0
+        add("<s>", 0.0);                     // 1
+        add("</s>", 0.0);                    // 2
+        // Every piece the merge chain needs must exist: the algorithm only joins
+        // two symbols whose concatenation is already in the table, so a table
+        // without intermediate pieces cannot build a word (and would silently
+        // fall back to bytes).
+        for (const char *word : {"the", "cat", "sat"}) {
+            const std::string w = word;
+            add(marker, -1.0);                              // U+2581 alone
+            for (size_t n = 1; n <= w.size(); ++n) {
+                add(marker + w.substr(0, n), -static_cast<double>(n + 1));
+                if (n < w.size()) add(w.substr(0, n), -static_cast<double>(n + 10));
+            }
+        }
         // The byte-fallback pieces make arbitrary text representable.
         for (int i = 0; i < 256; ++i) {
             if (!with_byte_fallback) continue;
             char buf[8];
             std::snprintf(buf, sizeof(buf), "<0x%02X>", i);
-            add(buf);
+            add(buf, 0.0);
         }
         doc.metadata["tokenizer.ggml.tokens"] = tokens;
+        doc.metadata["tokenizer.ggml.scores"] = scores;
         return doc;
     };
 
@@ -1623,7 +1640,8 @@ void test_tokenizer_real_vocabularies() {
               "decode inverts encode including the leading space");
         // The leading word boundary is part of the piece, so dropping the BOS
         // must not disturb the text.
-        CHECK(tokenizer.decode({3, 4, 7}, 1, 2) == " the cat sat",
+        const std::vector<int32_t> body(ids.begin() + 1, ids.end());
+        CHECK(tokenizer.decode(body, 1, 2) == " the cat sat",
               "decoding bare pieces reproduces the sentence");
         // An unseen character must survive via byte fallback rather than being
         // dropped or replaced.
@@ -1852,6 +1870,113 @@ void test_tokenizer_bpe_families() {
 
 // The Unicode classes drive word boundaries, so they are checked directly. A
 // wrong class silently changes token ids, which no round-trip test can catch.
+// SentencePiece segmentation is score-based. The two behaviours that separate it
+// from longest-match are: a merge only happens when the *concatenation* is a
+// piece (so the best-scoring pair wins even if a longer piece exists across the
+// same text), and the dummy space prefix is added unconditionally, including for
+// input that already begins with a space.
+void test_tokenizer_sentencepiece() {
+    const std::string marker = "\xe2\x96\x81";
+    auto build = [&marker](const std::vector<std::pair<std::string, double>> &table) {
+        GGUFDocument doc;
+        doc.metadata["tokenizer.ggml.model"] = make_string("llama");
+        MetadataValue tokens;
+        tokens.type = GGUFValueType::ARRAY;
+        MetadataValue scores;
+        scores.type = GGUFValueType::ARRAY;
+        for (const auto &[piece, score] : table) {
+            tokens.array.push_back(make_string(piece));
+            MetadataValue value;
+            value.type = GGUFValueType::FLOAT32;
+            value.f = score;
+            scores.array.push_back(value);
+        }
+        for (int i = 0; i < 256; ++i) {
+            char buf[8];
+            std::snprintf(buf, sizeof(buf), "<0x%02X>", i);
+            tokens.array.push_back(make_string(buf));
+            MetadataValue value;
+            value.type = GGUFValueType::FLOAT32;
+            value.f = 0.0;
+            scores.array.push_back(value);
+        }
+        doc.metadata["tokenizer.ggml.tokens"] = tokens;
+        doc.metadata["tokenizer.ggml.scores"] = scores;
+        return doc;
+    };
+
+    {
+        // "abcd" with pieces a, b, c, d, ab, abc, cd, bcd. Longest-match takes
+        // "abc" + "d"; score-based merging takes "cd" first (high score), then
+        // "bcd", giving "a" + "bcd". The expected id sequence is what makes the
+        // difference visible -- both segmentations round-trip.
+        const std::vector<std::pair<std::string, double>> table = {
+            {"<unk>", 0.0}, {"<s>", 0.0}, {"</s>", 0.0},
+            {"a", -5.0}, {"b", -5.0}, {"c", -5.0}, {"d", -5.0},
+            {"ab", -4.0}, {"abc", -3.0}, {"cd", -1.0}, {"bcd", -2.0},
+        };
+        GGUFDocument doc = build(table);
+        const uint32_t vocab = static_cast<uint32_t>(doc.metadata["tokenizer.ggml.tokens"].array.size());
+        const Tokenizer tokenizer = Tokenizer::from_gguf(doc, vocab);
+        const std::vector<int32_t> ids = tokenizer.encode("abcd", 1, false);
+        // The table has no space piece, so the prefixed space falls back to bytes;
+        // drop those to inspect how the word itself was segmented.
+        std::vector<int32_t> word;
+        for (int32_t id : ids) {
+            if (tokenizer.piece(static_cast<uint32_t>(id)).rfind("<0x", 0) == 0) continue;
+            word.push_back(id);
+        }
+        CHECK(word.size() == 2, "score-based segmentation splits abcd into two pieces");
+        if (word.size() == 2) {
+            CHECK(tokenizer.piece(static_cast<uint32_t>(word[0])) == "a",
+                  "the split is a + bcd, not the longest-match abc + d");
+            CHECK(tokenizer.piece(static_cast<uint32_t>(word[1])) == "bcd",
+                  "the second half is the piece built by merging b with cd");
+        }
+    }
+    {
+        // The dummy prefix is unconditional: " a" is escaped as two markers plus
+        // "a", so the whole input is one piece. A tokenizer that skipped the
+        // prefix for leading whitespace would emit two pieces here.
+        const std::vector<std::pair<std::string, double>> table = {
+            {"<unk>", 0.0}, {"<s>", 0.0}, {"</s>", 0.0},
+            {marker, -3.0}, {marker + marker, -2.0}, {"a", -5.0},
+            {marker + "a", -4.0}, {marker + marker + "a", -1.0},
+        };
+        GGUFDocument doc = build(table);
+        const uint32_t vocab = static_cast<uint32_t>(doc.metadata["tokenizer.ggml.tokens"].array.size());
+        const Tokenizer tokenizer = Tokenizer::from_gguf(doc, vocab);
+        const std::vector<int32_t> ids = tokenizer.encode(" a", 1, false);
+        CHECK(ids.size() == 1, "a leading space yields exactly one piece");
+        if (!ids.empty())
+            CHECK(tokenizer.piece(static_cast<uint32_t>(ids[0])) == marker + marker + "a",
+                  "the dummy prefix is added even when the text starts with a space");
+        // No prefix without the flag.
+        GGUFDocument plain_doc = build(table);
+        MetadataValue no_prefix;
+        no_prefix.type = GGUFValueType::BOOL;
+        no_prefix.b = false;
+        plain_doc.metadata["tokenizer.ggml.add_space_prefix"] = no_prefix;
+        const Tokenizer plain = Tokenizer::from_gguf(plain_doc, vocab);
+        const std::vector<int32_t> plain_ids = plain.encode(" a", 1, false);
+        CHECK(plain_ids.size() == 1 && plain.piece(static_cast<uint32_t>(plain_ids[0])) == marker + "a",
+              "add_space_prefix=false leaves the text as written");
+    }
+    {
+        // An empty prompt encodes to nothing at all: no dummy prefix for empty
+        // input, matching the reference's documented behaviour.
+        const std::vector<std::pair<std::string, double>> table = {
+            {"<unk>", 0.0}, {"<s>", 0.0}, {"</s>", 0.0}, {marker, -1.0},
+        };
+        GGUFDocument doc = build(table);
+        const uint32_t vocab = static_cast<uint32_t>(doc.metadata["tokenizer.ggml.tokens"].array.size());
+        const Tokenizer tokenizer = Tokenizer::from_gguf(doc, vocab);
+        CHECK(tokenizer.encode("", 1, false).empty(), "empty text encodes to no ids");
+        CHECK(tokenizer.encode("", 1, true) == std::vector<int32_t>{1},
+              "empty text with BOS is just the BOS id");
+    }
+}
+
 void test_unicode_classes() {
     using namespace fm::unicode;
     const struct {
@@ -2733,6 +2858,7 @@ int main(int argc, char **argv) {
     maybe_run("tokenizer_real_vocabularies", test_tokenizer_real_vocabularies);
     maybe_run("tokenizer_bpe_merges", test_tokenizer_bpe_merges);
     maybe_run("tokenizer_bpe_families", test_tokenizer_bpe_families);
+    maybe_run("tokenizer_sentencepiece", test_tokenizer_sentencepiece);
     maybe_run("unicode_classes", test_unicode_classes);
     maybe_run("model_map_and_tied_output", test_model_map_and_tied_output);
     maybe_run("rope_scaling", test_rope_scaling);
