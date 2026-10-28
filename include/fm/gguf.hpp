@@ -86,6 +86,7 @@ enum class TensorRole : uint32_t {
     // Per-head RMSNorm on q/k, which qwen3 applies before RoPE.
     ATTN_Q_NORM,
     ATTN_SINKS,
+    ROPE_FREQS,
     ATTN_K_NORM,
     ATTN_POST_NORM,
     FFN_POST_NORM,
@@ -206,6 +207,10 @@ struct ModelConfig {
     // `soft_max_ext(..., sinks)`. Presence of `blk.N.attn_sinks.weight` decides,
     // because it is a per-tensor fact rather than an architecture rule.
     bool attn_sinks = false;
+    // Per-pair rotary frequency divisors (`blk.N.rope_freqs.weight`, n_rot/2
+    // entries). llama.cpp only stores real data on layer 0 and duplicates it, so
+    // one vector serves every layer.
+    bool rope_freqs = false;
     // Multiplier applied to the token embedding before the first block.
     // gemma uses sqrt(hidden); minicpm uses a fixed 12.0 unless the file says
     // otherwise. 1.0 means "no scaling", so this is off for llama-family.

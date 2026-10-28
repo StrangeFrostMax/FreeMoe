@@ -106,8 +106,11 @@ void RopePlan::rotation(uint32_t pair, double position, double &cos_theta,
     if (n_dims == 0 || n_dims % 2 != 0)
         fail(ErrorCode::SHAPE_MISMATCH, "rotary dimension must be even and non-zero");
     // Frequency of this pair, before any scaling: base^(-2i/n).
-    const double theta_extrap =
+    double theta_extrap =
         std::pow(freq_base, -(2.0 * static_cast<double>(pair)) / static_cast<double>(n_dims));
+    // ggml divides the frequency by the factor rather than multiplying the angle:
+    // with ff = 2 a pair advances half as fast, i.e. the position is stretched 2x.
+    if (freq_factors != nullptr) theta_extrap /= static_cast<double>(freq_factors[pair]);
     double theta = freq_scale * theta_extrap;
     if (ext_factor != 0.0) {
         const double ramp = yarn_ramp(corr_low, corr_high, pair) * ext_factor;

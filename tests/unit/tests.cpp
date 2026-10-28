@@ -2224,6 +2224,44 @@ void test_rope_scaling() {
     CHECK(std::fabs(lc - std::cos(5.0 * std::pow(10000.0, -2.0 * 2.0 / 8.0) / 2.0) * 1.25) < 1e-9,
           "linear scaling divides every angle by the factor");
 
+    // Per-pair frequency divisors: pair 0 is unchanged (factor 1), pair 1 is
+    // halved. The reference divides the frequency, so the angle for pair 1 must
+    // be the unscaled angle over the factor, not the angle times it.
+    {
+        ModelConfig plain_cfg;
+        plain_cfg.context = 64;
+        plain_cfg.rope_theta = 10000.0;
+        plain_cfg.rope_n_ctx_orig = 64.0;
+        resolve_rope_scaling(plain_cfg);
+        const float factors[4] = {1.0F, 3.0F, 1.5F, 2.0F};
+        RopePlan with_factors;
+        with_factors.init(plain_cfg, 8);
+        with_factors.freq_factors = factors;
+        RopePlan without;
+        without.init(plain_cfg, 8);
+        double c_scaled = 0.0, s_scaled = 0.0, c_plain = 0.0, s_plain = 0.0;
+        with_factors.rotation(1, 3.0, c_scaled, s_scaled);
+        without.rotation(1, 3.0, c_plain, s_plain);
+        const double freq1 = std::pow(10000.0, -2.0 * 1.0 / 8.0);
+        CHECK(std::fabs(c_scaled - std::cos(3.0 * freq1 / 3.0)) < 1e-9,
+              "a frequency factor divides that pair's frequency");
+        CHECK(std::fabs(c_scaled - c_plain) > 1e-3,
+              "the factor changes the angle rather than being ignored");
+        double c_zero = 0.0, s_zero = 0.0, c_zero_plain = 0.0, s_zero_plain = 0.0;
+        with_factors.rotation(0, 3.0, c_zero, s_zero);
+        without.rotation(0, 3.0, c_zero_plain, s_zero_plain);
+        CHECK(std::fabs(c_zero - c_zero_plain) < 1e-12,
+              "a factor of 1 leaves that pair untouched");
+    }
+    {
+        const std::string freq_path = "tests/fixtures/llama-ropfreqs-shape.gguf";
+        const ModelManifest manifest =
+            build_manifest(parse_gguf_file(freq_path), freq_path);
+        CHECK(manifest.config.rope_freqs, "rope_freqs tensors enable the divisors");
+        CHECK(manifest.tensor("blk.0.rope_freqs.weight") != nullptr &&
+                  manifest.tensor("blk.0.rope_freqs.weight")->role == TensorRole::ROPE_FREQS,
+              "the divisors get their own tensor role");
+    }
     // The fixture's raw keys have to reach the config, or the engine would run
     // exactly the unscaled arithmetic above and still look fine.
     const std::string path = "tests/fixtures/llama-yarn-shape.gguf";
@@ -2307,7 +2345,7 @@ void test_architecture_parity() {
                                            "glm4", "qwen2moe", "phi2-layernorm",
                                            "deepseek2-mla", "internlm2", "exaone", "orion",
                                            "gptneox", "stablelm", "llama-yarn", "qwen2-linear",
-                                           "llama-yarn-mscale", "llama-sinks"};
+                                           "llama-yarn-mscale", "llama-sinks", "llama-ropfreqs"};
     for (const std::string &slug : slugs) {
         const std::string model = "tests/fixtures/" + slug + "-shape.gguf";
         ArchGolden golden = read_arch_golden("tests/golden/" + slug + "_reference.txt");

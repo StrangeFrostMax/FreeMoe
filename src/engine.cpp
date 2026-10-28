@@ -361,6 +361,10 @@ void Engine::rope_half(std::vector<float> &q, uint32_t q_heads, std::vector<floa
     // derived once per call rather than once per pair.
     RopePlan plan;
     plan.init(c, rotate);
+    // Layer 0 carries the divisors and llama.cpp duplicates them, so one vector
+    // describes every layer. Dividing by them stretches those pairs' positions,
+    // which is how granite/llama4-style checkpoints extend context without YaRN.
+    if (c.rope_freqs) plan.freq_factors = weights("blk.0.rope_freqs.weight");
     // Query and key can have different head counts under grouped-query
     // attention, so each vector is walked independently.
     for (uint32_t h = 0; h < std::max(q_heads, k_heads); ++h) {
@@ -707,6 +711,7 @@ std::vector<float> Engine::forward_token(int32_t token, uint64_t position,
             // checkpoints carry YaRN.
             RopePlan plan;
             plan.init(c, c.rope_dim);
+            if (c.rope_freqs) plan.freq_factors = weights("blk.0.rope_freqs.weight");
             auto rope_part = [&](std::vector<float> &vec, uint32_t heads, uint32_t stride,
                                  uint32_t offset, const std::string &name) {
                 // Rotary positions, applied to the rope slice only: the trailing
