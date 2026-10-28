@@ -9,6 +9,7 @@
 [PASS] quant_reference_decode
 [PASS] quant_gemv
 [PASS] quant_model_parity
+[PASS] model_probe
 [PASS] cpu_kernels
 [PASS] generic_inspect_and_roundtrip
 [PASS] sampling_and_detokenize
@@ -18,4 +19,4 @@
 [PASS] traces_and_replay_inputs
 [PASS] vnpu_reference_backend
 [PASS] soak_sessions
-846 checks, 0 failures
+858 checks, 0 failures
