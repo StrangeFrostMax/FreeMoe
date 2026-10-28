@@ -61,7 +61,7 @@ each family, the tool records what a specific file contains.
 | Chat templates: a restricted Jinja interpreter over the checkpoint's own `tokenizer.chat_template` | WORKS (see below) |
 | Built-in templates for 11 marker families + evidence-based selection from the token table | WORKS |
 | `internlm2`, `exaone`, `orion`, `gptneox`, `stablelm` adapters | WORKS |
-| `glm4-moe`, `minicpm3`, and the remaining 157 architectures in llama.cpp's `src/models/` | **MISSING** |
+| `glm4-moe`, `minicpm3`, and the remaining architectures in llama.cpp's `src/models/` | **MISSING** — see `docs/MODEL_COVERAGE_STATUS.md` for the per-model reason |
 | PrismML rotated weight basis (`prism.hadamard.*`) and Hadamard activation transform | **MISSING**, hard blocker |
 | Hybrid linear attention (`ssm_*`, `conv1d` state) | **MISSING**, hard blocker |
 | Shared-expert MoE (`expert_shared_count`) | **MISSING**, refused rather than dropped |

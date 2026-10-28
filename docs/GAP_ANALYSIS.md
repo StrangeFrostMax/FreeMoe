@@ -1,5 +1,13 @@
 # Gap analysis: design vs code vs model codes
 
+> **Status of this document.** Section C's findings C1, C4 and C10 are fixed:
+> BPE and SentencePiece are real encoders now (8 vocabularies at 46/46,
+> `tools/tokenizer_parity.py`), linear/YaRN/`rope_freqs` context extension and
+> attention sinks are implemented, and `auto` no longer dispatches AVX-512 on a
+> Zen 3 target. The measurements below are the state at `f704e4b` and are kept
+> as the baseline this work is measured against; current numbers live in
+> `docs/MODEL_COVERAGE_STATUS.md` (1993 checks, 23 architecture fixtures).
+
 Measured on `f704e4b` (merged PR #10), 2026-10-28, against `ggml-org/llama.cpp`
 `master` fetched the same day (169 files under `src/models/`).
 
