@@ -56,11 +56,14 @@ const std::map<std::string, ArchFacts> &known_architectures() {
         // phi3: one fused q/k/v projection (with fused bias) and a rotary width
         // narrower than the head.
         {"phi3", {true, false}},
-        {"glm4", {false, true}},
+        // minicpm: the token embedding is scaled before the first block.
+        {"minicpm", {true, false}},
+        // qwen3moe: qwen3 semantics with a stacked-expert feed-forward.
+        {"qwen3moe", {true, false}},
+        // glm4: fused gate+up FFN with post-attention and post-FFN norms.
+        {"glm4", {true, false}},
         {"glm4moe", {false, true}},
         {"deepseek2", {false, true}},
-        {"qwen3moe", {false, true}},
-        {"minicpm", {false, true}},
         {"multimodal", {false, true}},
     };
     return table;
@@ -292,6 +295,36 @@ Json probe_model(const GGUFDocument &doc, const std::string &source_path) {
         has_expert_tensors = has_expert_tensors || tensor.name.find("_exps") != std::string::npos;
     if (has_expert_tensors && !has_adapter)
         block("EXPERT_TENSORS", "expert tensors are present but their layout is not mapped");
+    // minicpm declares three scales. Only the embedding scale is applied by the
+    // reference implementation; the other two are parsed and logged there and
+    // never used in the graph, so they are reported rather than silently
+    // dropped or silently applied.
+    {
+        const MetadataValue *emb = find(doc, arch + ".embedding_scale");
+        const MetadataValue *res = find(doc, arch + ".residual_scale");
+        const MetadataValue *logit = find(doc, arch + ".logit_scale");
+        if (emb || res || logit) {
+            Json scales = Json::object();
+            // Json has no double overload, so the values are rendered as strings
+            // with enough precision to be checkable.
+            auto fmt = [](double v) {
+                char buf[64];
+                std::snprintf(buf, sizeof(buf), "%.9g", v);
+                return std::string(buf);
+            };
+            scales.set("embedding_scale", fmt(emb ? emb->as_double() : 0.0));
+            scales.set("residual_scale", fmt(res ? res->as_double() : 0.0));
+            scales.set("logit_scale", fmt(logit ? logit->as_double() : 0.0));
+            scales.set("applied", Json::array());
+            out.set("declared_scales", std::move(scales));
+            if (res || logit)
+                out.set("scale_note",
+                        "residual_scale and logit_scale are parsed but not applied: "
+                        "llama.cpp reads and logs them without using them in the graph, "
+                        "so applying them here would disagree with the reference");
+        }
+    }
+
     // --- ternary family -----------------------------------------------------
     // PrismML's Bonsai 2 checkpoint stores its weights in a *rotated basis*: each
     // matrix is transformed by a blockwise Hadamard rotation before the ternary

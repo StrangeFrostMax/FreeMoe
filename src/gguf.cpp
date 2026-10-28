@@ -604,7 +604,7 @@ bool opt_string(const GGUFDocument &doc, const std::set<std::string> &keys, std:
 bool is_llama_family(const std::string &arch) {
     static const std::set<std::string> family = {
         "llama", "qwen2", "qwen3", "smollm", "smollm2", "tinyllama",
-        "gemma", "gemma2", "gemma3", "phi3",
+        "gemma", "gemma2", "gemma3", "phi3", "minicpm", "qwen3moe", "glm4",
     };
     return family.count(arch) != 0;
 }
@@ -731,11 +731,25 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
     if (arch == "gemma" || arch == "gemma2" || arch == "gemma3") {
         // gemma scales embeddings by sqrt(n_embd), stores norm scales
         // zero-centred, and uses GeGLU instead of SwiGLU.
-        cfg.embedding_scale = true;
+        cfg.embedding_scale = std::sqrt(static_cast<double>(cfg.hidden));
         cfg.norm_add_one = true;
         cfg.activation = "gelu";
     }
     double number = 0.0;
+    if (arch == "minicpm") {
+        // MiniCPM scales the token embedding before the first block. Older GGUF
+        // exports omit the key, in which case the original model used 12.0;
+        // newer exports write it explicitly.
+        cfg.embedding_scale = 12.0;
+        if (opt_double(doc, keys("embedding_scale"), &number) && number > 0.0)
+            cfg.embedding_scale = number;
+        // These two are recorded, not applied. llama.cpp reads and logs them and
+        // never uses them in the graph, so a runtime that applied them would
+        // disagree with the reference on every logit.
+        if (opt_double(doc, keys("residual_scale"), &number)) cfg.residual_scale = number;
+        if (opt_double(doc, keys("logit_scale"), &number)) cfg.logit_scale = number;
+    }
+
     if (arch == "gemma2" || arch == "gemma3") {
         cfg.post_norms = true;
         if (opt_double(doc, keys("attn_logit_softcapping"), &number)) {
@@ -797,6 +811,17 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
         if (opt_metadata(doc, arch + "." + metadata_key, &v) && v.as_bool())
             fail(ErrorCode::NOT_IMPLEMENTED, std::string(what) + " is not implemented");
     };
+    // Post-attention / post-FFN norms: present in gemma2/3 and glm4. The tensors
+    // are the evidence, so this is read rather than assumed per architecture.
+    {
+        const bool attn_post = doc.tensor_by_name.count(layer_name(0, "attn_post_norm.weight")) != 0;
+        const bool ffn_post = doc.tensor_by_name.count(layer_name(0, "ffn_post_norm.weight")) != 0;
+        if (attn_post != ffn_post)
+            fail(ErrorCode::MISSING_REQUIRED_TENSOR,
+                 "post-attention and post-FFN norms must both be present or both absent");
+        if (attn_post) cfg.post_norms = true;
+    }
+
     // phi3 stores one fused q/k/v projection instead of three. Detect it from
     // the tensors, because the metadata does not say either way.
     {
@@ -849,6 +874,23 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
         (cfg.expert_count && cfg.expert_top_k > cfg.expert_count))
         fail(ErrorCode::SHAPE_MISMATCH, "model dimension exceeds adapter safety bounds");
 
+    // glm4 keeps the FFN gate and up halves in a single tensor. Detected from
+    // the shapes rather than the architecture name, because the same adapter
+    // serves both layouts.
+    if (cfg.expert_count == 0) {
+        const TensorInfo *up = m.tensor(layer_name(0, "ffn_up.weight"));
+        const bool has_gate = doc.tensor_by_name.count(layer_name(0, "ffn_gate.weight")) != 0;
+        if (!up)
+            fail(ErrorCode::MISSING_REQUIRED_TENSOR, "missing required tensor blk.0.ffn_up.weight");
+        if (!has_gate) {
+            if (up->dims.size() != 2 || up->dims[1] != static_cast<uint64_t>(cfg.intermediate) * 2)
+                fail(ErrorCode::SHAPE_MISMATCH,
+                     "ffn_gate is absent, so ffn_up must be [hidden, 2*intermediate] holding "
+                     "both halves");
+            cfg.fused_gate_up = true;
+        }
+    }
+
     // --- canonical tensor map ------------------------------------------------
     // `name` keeps the bytes' real identity; `canonical` is what the engine
     // addresses. Only the router is renamed, because llama.cpp stores the
@@ -889,6 +931,9 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
         if (cfg.expert_count) {
             for (const char *suffix : {"ffn_gate_inp.weight", "ffn_gate_exps.weight",
                                        "ffn_up_exps.weight", "ffn_down_exps.weight"})
+                expect(layer_name(l, suffix));
+        } else if (cfg.fused_gate_up) {
+            for (const char *suffix : {"ffn_up.weight", "ffn_down.weight"})
                 expect(layer_name(l, suffix));
         } else {
             for (const char *suffix : {"ffn_gate.weight", "ffn_up.weight", "ffn_down.weight"})
@@ -984,6 +1029,9 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
                             {cfg.hidden, cfg.intermediate, cfg.expert_count});
             expect_dims(*m.tensor(layer_name(l, "ffn_down_exps.weight")),
                         {cfg.intermediate, cfg.hidden, cfg.expert_count});
+        } else if (cfg.fused_gate_up) {
+            expect_dims(*m.tensor(layer_name(l, "ffn_up.weight")),
+                        {cfg.hidden, static_cast<uint64_t>(cfg.intermediate) * 2});
         } else {
             for (const char *suffix : {"ffn_gate.weight", "ffn_up.weight"})
                 expect_dims(*m.tensor(layer_name(l, suffix)), {cfg.hidden, cfg.intermediate});

@@ -44,7 +44,10 @@ each family, the tool records what a specific file contains.
 | `gemma`: embedding scale, zero-centred norm scales, GeGLU, tied output | WORKS |
 | `gemma2`/`gemma3`: post-attention/post-FFN norms, tanh softcapping, sliding window | WORKS |
 | `phi3`: fused q/k/v projection with fused bias, partial rotary | WORKS |
-| `glm4`, `minicpm`, `qwen3moe`-specific variants | **MISSING** |
+| `glm4`: fused gate+up FFN, post-attention and post-FFN norms | WORKS |
+| `minicpm`: embedding scale (12.0 by default), tied output | WORKS |
+| `qwen3moe`: qwen3 q/k norm with stacked-expert FFN and router | WORKS |
+| `glm4-moe`, `minicpm3`, and the remaining 160 architectures in llama.cpp's `src/models/` | **MISSING** |
 | PrismML rotated weight basis (`prism.hadamard.*`) and Hadamard activation transform | **MISSING**, hard blocker |
 | Hybrid linear attention (`ssm_*`, `conv1d` state) | **MISSING**, hard blocker |
 | Shared-expert MoE (`expert_shared_count`) | **MISSING**, refused rather than dropped |
@@ -181,7 +184,32 @@ a feature (biases, q/k norm, embedding scale, softcapping, sliding window) would
 produce logits identical to the plain fixture and the test would catch it.
 
 Current parity fixtures: `llama-gqa`, `qwen2-bias`, `qwen3-qknorm`, `gemma`,
-`gemma2`, `phi3-fused`.
+`gemma2`, `phi3-fused`, `glm4`, `minicpm`, `qwen3moe`.
+
+### What each architecture actually needed
+
+Read from llama.cpp's `src/models/`, not guessed from the model names:
+
+| Architecture | The differences that matter |
+| --- | --- |
+| `glm4` | `ffn_up` is `[hidden, 2*intermediate]` holding gate then up (`ggml_swiglu` splits it); post-attention and post-FFN RMSNorm applied before each residual add |
+| `minicpm` | token embedding scaled (12.0 by default) before the first block; tied output |
+| `qwen3moe` | qwen3's per-head q/k norm combined with a stacked-expert FFN and router |
+
+`glm4` also parses `rope.dimension_sections` for multimodal RoPE; a text-only
+checkpoint omits it and uses standard RoPE, which is what is implemented.
+
+### A reference that does not do what it documents
+
+minicpm declares three scales: `embedding_scale`, `residual_scale` and
+`logit_scale`. llama.cpp reads and logs all three, but a repository-wide search
+across the graph code finds only `embedding_scale` actually applied. The other
+two are dead metadata in the reference.
+
+FreeMoe therefore applies the embedding scale and **records but does not apply**
+the other two, because applying them would disagree with the reference on every
+logit. The probe says so in `scale_note` rather than leaving it to be inferred
+from silence, and `minicpm_scales` pins the decision in a test.
 
 ## Ordered work that remains
 

@@ -1769,7 +1769,8 @@ ArchGolden read_arch_golden(const std::string &path) {
 // what "the adapter for this architecture works" means here.
 void test_architecture_parity() {
     const std::vector<std::string> slugs = {"llama-gqa", "qwen2-bias", "qwen3-qknorm", "gemma",
-                                           "gemma2", "phi3-fused"};
+                                           "gemma2", "phi3-fused", "minicpm", "qwen3moe",
+                                           "glm4"};
     for (const std::string &slug : slugs) {
         const std::string model = "tests/fixtures/" + slug + "-shape.gguf";
         ArchGolden golden = read_arch_golden("tests/golden/" + slug + "_reference.txt");
@@ -1858,6 +1859,50 @@ void test_rotated_and_ternary_blockers() {
     }
 }
 
+
+// llama.cpp parses minicpm's residual_scale and logit_scale, logs them, and
+// never uses them in the graph. Applying them here would quietly disagree with
+// the reference on every logit, so this test pins the decision: they are
+// recorded, and they do not change the output.
+void test_minicpm_scales() {
+    const std::string path = "tests/fixtures/minicpm-shape.gguf";
+    RunConfig config;
+    config.model_path = path;
+    config.budget.total_hot_bytes = 64ull * 1024 * 1024;
+    Engine engine(config);
+    engine.initialize();
+
+    const ModelConfig &cfg = engine.manifest().config;
+    CHECK(cfg.architecture == "minicpm", "minicpm adapter is selected");
+    CHECK(std::fabs(cfg.embedding_scale - 12.0) < 1e-9,
+          "the embedding scale is read from the checkpoint");
+    CHECK(cfg.residual_scale > 0.0, "residual_scale is parsed from the checkpoint");
+    CHECK(cfg.logit_scale > 0.0, "logit_scale is parsed from the checkpoint");
+
+    // The golden was produced by an implementation that also ignores them, so
+    // matching it is exactly the assertion that we did not apply them.
+    ArchGolden golden = read_arch_golden("tests/golden/minicpm_reference.txt");
+    PromptResult result = engine.run_prompt(golden.prompt, 8);
+    CHECK(!golden.logits.empty(), "minicpm golden carries logits");
+    if (!golden.logits.empty() && result.prefill_logits.size() == golden.logits.size()) {
+        double worst = 0.0;
+        for (size_t i = 0; i < golden.logits.size(); ++i)
+            worst = std::max(worst, std::fabs(static_cast<double>(result.prefill_logits[i]) -
+                                              golden.logits[i]));
+        CHECK(worst <= 1e-4, "minicpm logits match the reference (worst " +
+                                 std::to_string(worst) + ")");
+    }
+    engine.release_runtime();
+
+    // The probe must say the same thing, so a reader of the report is not left
+    // to infer it from silence.
+    auto doc = parse_gguf_file(path);
+    const std::string dump = probe_model(doc, path).dump();
+    CHECK(dump.find("residual_scale and logit_scale are parsed but not applied") !=
+              std::string::npos,
+          "the probe explains why the two scales are not applied");
+}
+
 void test_soak_sessions() {
     const uint32_t N_SOAK = 256;
     std::string prompt = first_prompt();
@@ -1908,6 +1953,7 @@ int main(int argc, char **argv) {
     maybe_run("model_map_and_tied_output", test_model_map_and_tied_output);
     maybe_run("architecture_parity", test_architecture_parity);
     maybe_run("rotated_and_ternary_blockers", test_rotated_and_ternary_blockers);
+    maybe_run("minicpm_scales", test_minicpm_scales);
     maybe_run("soak_sessions", test_soak_sessions);
     std::cout << g_checks << " checks, " << g_failures << " failures\n";
     return g_failures == 0 ? 0 : 1;

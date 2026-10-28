@@ -91,15 +91,31 @@ def load_model(path: Path) -> dict[str, Any]:
         "qk_norm": "blk.0.attn_q_norm.weight" in tensors,
         # phi3 fuses q/k/v into one projection (and one optional bias).
         "fused_qkv": "blk.0.attn_qkv.weight" in tensors,
+        # glm4 keeps gate and up in one tensor: gate first, then up.
+        "fused_gate_up": ("blk.0.ffn_gate.weight" not in tensors
+                          and "blk.0.ffn_up.weight" in tensors
+                          and "blk.0.ffn_gate_exps.weight" not in tensors),
         # gemma family: scaled embeddings, zero-centred norm scales, GeGLU.
-        "embedding_scale": arch in ("gemma", "gemma2", "gemma3"),
+        # A multiplier, not a flag: gemma uses sqrt(hidden), minicpm 12.0.
+        "embedding_scale": (math.sqrt(hidden) if arch in ("gemma", "gemma2", "gemma3")
+                            else float(key("embedding_scale", 12.0))
+                            if arch == "minicpm" else 1.0),
         "norm_add_one": arch in ("gemma", "gemma2", "gemma3"),
         "activation": "gelu" if arch in ("gemma", "gemma2", "gemma3") else "silu",
-        "post_norms": arch in ("gemma2", "gemma3"),
+        # Detected from the tensors, exactly as the engine's adapter does:
+        # keying this off the architecture name silently skipped glm4's norms.
+        "post_norms": "blk.0.attn_post_norm.weight" in tensors,
         "attn_softcap": float(key("attn_logit_softcapping", 0.0)),
         "final_softcap": float(key("final_logit_softcapping", 0.0)),
         "window": int(key("attention.sliding_window", 0)),
         "tensors": tensors,
+        # Routing semantics straight from the checkpoint. Renormalising over the
+        # selected experts is only equivalent to a full softmax when every expert
+        # is selected, so it cannot be assumed.
+        "experts": int(key("expert_count", 0)),
+        "top_k": int(key("expert_used_count", 0)),
+        "expert_norm": bool(key("expert_weights_norm", False)),
+        "expert_scale": float(key("expert_weights_scale", 1.0)),
     }
     if cfg["heads"] * cfg["hd"] != cfg["H"]:
         raise ReferenceError("heads * head_dim != hidden")
@@ -172,6 +188,37 @@ def rope_half(vec: list[float], head_dim: int, heads: int, pos: int,
             vec[base + 2 * j + 1] = a * s + b * c
 
 
+def expert_output(cfg: dict[str, Any], layer: int, expert: int,
+                  x: list[float], prefix: str) -> list[float]:
+    """One expert's SwiGLU/GeGLU output.
+
+    The stacked tensors hold every expert back to back, so expert `e` occupies a
+    contiguous slice. The slice geometry comes from the declared shapes, never
+    from an assumption about float sizes.
+    """
+    H, I = cfg["H"], cfg["I"]
+    count = cfg["experts"]
+    tensors = cfg["tensors"]
+    out = []
+    for name, out_dim, in_dim in (
+            (prefix + "ffn_gate_exps.weight", I, H),
+            (prefix + "ffn_up_exps.weight", I, H)):
+        dims, data = tensors[name]
+        per_expert = out_dim * in_dim
+        base = expert * per_expert
+        out.append(matvec(data[base:base + per_expert], x, out_dim, in_dim))
+    gate_vals, up_vals = out
+    if cfg["activation"] == "gelu":
+        act = [gelu(gate_vals[i]) * up_vals[i] for i in range(I)]
+    else:
+        act = [gate_vals[i] / (1.0 + math.exp(-gate_vals[i])) * up_vals[i]
+               for i in range(I)]
+    dims, data = tensors[prefix + "ffn_down_exps.weight"]
+    per_expert = H * I
+    base = expert * per_expert
+    return matvec(data[base:base + per_expert], act, H, I)
+
+
 def softmax(values: list[float]) -> list[float]:
     m = max(values)
     exps = [math.exp(v - m) for v in values]
@@ -204,8 +251,9 @@ class Session:
         group = heads // kv_heads
         embd = self.tensor("token_embd.weight")
         x = [embd[token * H + i] for i in range(H)]
-        if cfg["embedding_scale"]:
-            x = [v * math.sqrt(H) for v in x]
+        if cfg["embedding_scale"] != 1.0:
+            scale = cfg["embedding_scale"]
+            x = [v * scale for v in x]
 
         for layer in range(cfg["L"]):
             p = f"blk.{layer}."
@@ -268,13 +316,38 @@ class Session:
 
             h = rmsnorm(x, self.tensor(p + "ffn_norm.weight"), cfg["eps"],
                         cfg["norm_add_one"])
-            gate = matvec(self.tensor(p + "ffn_gate.weight"), h, cfg["I"], H)
-            up = matvec(self.tensor(p + "ffn_up.weight"), h, cfg["I"], H)
-            if cfg["activation"] == "gelu":
-                act = [gelu(gate[i]) * up[i] for i in range(cfg["I"])]
+            if cfg["experts"]:
+                # Router -> full softmax -> top-k -> combine. The selected experts
+                # are renormalised only when the checkpoint asks for it.
+                logits = matvec(self.tensor(p + "ffn_gate_inp.weight"), h,
+                                cfg["experts"], H)
+                probs = softmax(logits)
+                order = sorted(range(cfg["experts"]), key=lambda e: (-probs[e], e))
+                chosen = order[:cfg["top_k"]]
+                weights = [probs[e] for e in chosen]
+                if cfg["expert_norm"]:
+                    total = sum(weights)
+                    if total > 0.0:
+                        weights = [w / total for w in weights]
+                weights = [w * cfg["expert_scale"] for w in weights]
+                down = [0.0] * H
+                for weight, expert in zip(weights, chosen):
+                    down = [down[i] + weight * v for i, v in enumerate(
+                        expert_output(cfg, layer, expert, h, p))]
             else:
-                act = [gate[i] / (1.0 + math.exp(-gate[i])) * up[i] for i in range(cfg["I"])]
-            down = matvec(self.tensor(p + "ffn_down.weight"), act, H, cfg["I"])
+                if cfg["fused_gate_up"]:
+                    both = matvec(self.tensor(p + "ffn_up.weight"), h, 2 * cfg["I"], H)
+                    gate = both[:cfg["I"]]
+                    up = both[cfg["I"]:]
+                else:
+                    gate = matvec(self.tensor(p + "ffn_gate.weight"), h, cfg["I"], H)
+                    up = matvec(self.tensor(p + "ffn_up.weight"), h, cfg["I"], H)
+                if cfg["activation"] == "gelu":
+                    act = [gelu(gate[i]) * up[i] for i in range(cfg["I"])]
+                else:
+                    act = [gate[i] / (1.0 + math.exp(-gate[i])) * up[i]
+                           for i in range(cfg["I"])]
+                down = matvec(self.tensor(p + "ffn_down.weight"), act, H, cfg["I"])
             if cfg["post_norms"]:
                 down = rmsnorm(down, self.tensor(p + "ffn_post_norm.weight"),
                                cfg["eps"], cfg["norm_add_one"])

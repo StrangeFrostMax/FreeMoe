@@ -171,8 +171,16 @@ struct ModelConfig {
     bool attn_qkv_bias = false;
     // Q and K are normalised per head before RoPE (qwen3 family).
     bool qk_norm = false;
-    // gemma scales the token embeddings by sqrt(hidden) before the first block.
-    bool embedding_scale = false;
+    // Multiplier applied to the token embedding before the first block.
+    // gemma uses sqrt(hidden); minicpm uses a fixed 12.0 unless the file says
+    // otherwise. 1.0 means "no scaling", so this is off for llama-family.
+    double embedding_scale = 1.0;
+    // minicpm carries two further scales. llama.cpp parses and logs them but
+    // never applies them to the computation, so neither do we: applying them
+    // would disagree with the reference. They are recorded so the probe can
+    // report them rather than silently dropping information.
+    double residual_scale = 0.0;
+    double logit_scale = 0.0;
     // gemma stores RMSNorm scales zero-centred: the effective scale is 1 + w.
     bool norm_add_one = false;
     // "silu" (SwiGLU) or "gelu" (GeGLU). The two are not interchangeable.
@@ -186,6 +194,9 @@ struct ModelConfig {
     uint32_t sliding_window = 0;
     // phi3 fuses q, k and v into one projection (and one optional bias).
     bool fused_qkv = false;
+    // glm4 stores the FFN gate and up halves in one tensor of
+    // [hidden, 2*intermediate]: gate first, then up (ggml_swiglu's convention).
+    bool fused_gate_up = false;
     uint32_t bos_id = 0;
     uint32_t eos_id = 0;
     double rms_eps = 0.0;

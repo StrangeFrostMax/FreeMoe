@@ -522,10 +522,11 @@ std::vector<float> Engine::forward_token(int32_t token, uint64_t position,
                 dequantize_block(emb.type_id, row + block_index * geo.block_bytes, x.data() + k);
             }
         }
-        if (c.embedding_scale) {
-            // gemma normalises each embedding to unit RMS before the first
-            // block; skipping this changes every subsequent activation.
-            const float scale = static_cast<float>(std::sqrt(static_cast<double>(c.hidden)));
+        if (c.embedding_scale != 1.0) {
+            // gemma scales by sqrt(hidden), minicpm by a fixed constant. Both
+            // happen before the first block, so skipping it changes every
+            // subsequent activation.
+            const float scale = static_cast<float>(c.embedding_scale);
             for (float &v : x) v *= scale;
         }
     }
@@ -661,12 +662,21 @@ std::vector<float> Engine::forward_token(int32_t token, uint64_t position,
                     "rmsnorm.ffn.L" + std::to_string(layer));
         std::vector<float> ffn(c.hidden, 0.0f);
         if (c.model_kind == "dense") {
-            std::vector<float> gate = matvec_view(tensor_view(prefix + "ffn_gate.weight"), h,
-                                                  c.intermediate, c.hidden,
-                                                  "ffn_gate.L" + std::to_string(layer));
-            std::vector<float> up = matvec_view(tensor_view(prefix + "ffn_up.weight"), h,
-                                                c.intermediate, c.hidden,
-                                                "ffn_up.L" + std::to_string(layer));
+            std::vector<float> gate, up;
+            if (c.fused_gate_up) {
+                // glm4: one projection emits both halves, gate first then up
+                // (the convention ggml_swiglu splits on).
+                std::vector<float> both =
+                    matvec_view(tensor_view(prefix + "ffn_up.weight"), h, 2 * c.intermediate,
+                                c.hidden, "ffn_gate_up.L" + std::to_string(layer));
+                gate.assign(both.begin(), both.begin() + c.intermediate);
+                up.assign(both.begin() + c.intermediate, both.end());
+            } else {
+                gate = matvec_view(tensor_view(prefix + "ffn_gate.weight"), h, c.intermediate,
+                                   c.hidden, "ffn_gate.L" + std::to_string(layer));
+                up = matvec_view(tensor_view(prefix + "ffn_up.weight"), h, c.intermediate,
+                                 c.hidden, "ffn_up.L" + std::to_string(layer));
+            }
             std::vector<float> act(c.intermediate);
             for (uint32_t i = 0; i < c.intermediate; ++i) act[i] = activate(gate[i]) * up[i];
             backend_->record_control("swiglu.L" + std::to_string(layer),

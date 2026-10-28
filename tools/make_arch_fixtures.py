@@ -113,12 +113,29 @@ def arch_tensors(spec: dict[str, Any]) -> list[TensorSpec]:
         out += [tensor(p + "attn_output.weight", [h, h], 0.16)]
         if spec.get("post_norms"):
             out += [tensor(p + "attn_post_norm.weight", [h], 0.0, norm=True)]
-        out += [
-            tensor(p + "ffn_norm.weight", [h], 0.0, norm=True),
-            tensor(p + "ffn_gate.weight", [h, i], 0.16),
-            tensor(p + "ffn_up.weight", [h, i], 0.16),
-            tensor(p + "ffn_down.weight", [i, h], 0.16),
-        ]
+        out += [tensor(p + "ffn_norm.weight", [h], 0.0, norm=True)]
+        if spec.get("experts"):
+            # Stacked experts: one tensor holds every expert's slice, and the
+            # router projects hidden -> expert_count.
+            experts = spec["experts"]
+            out += [
+                tensor(p + "ffn_gate_inp.weight", [h, experts], 0.12),
+                tensor(p + "ffn_gate_exps.weight", [h, i, experts], 0.16),
+                tensor(p + "ffn_up_exps.weight", [h, i, experts], 0.16),
+                tensor(p + "ffn_down_exps.weight", [i, h, experts], 0.16),
+            ]
+        elif spec.get("fused_gate_up"):
+            # One tensor holds both halves: gate first, then up.
+            out += [
+                tensor(p + "ffn_up.weight", [h, 2 * i], 0.16),
+                tensor(p + "ffn_down.weight", [i, h], 0.16),
+            ]
+        else:
+            out += [
+                tensor(p + "ffn_gate.weight", [h, i], 0.16),
+                tensor(p + "ffn_up.weight", [h, i], 0.16),
+                tensor(p + "ffn_down.weight", [i, h], 0.16),
+            ]
         if spec.get("post_norms"):
             out += [tensor(p + "ffn_post_norm.weight", [h], 0.0, norm=True)]
     out += [tensor("output_norm.weight", [h], 0.0, norm=True)]
@@ -153,8 +170,17 @@ def arch_metadata(spec: dict[str, Any]) -> dict[str, tuple[Any, ...]]:
         "tokenizer.ggml.eos_token_id": ("u32", EOS),
         "tokenizer.ggml.tokens": ("array_string", tokenizer_tokens()),
     }
+    if spec.get("experts"):
+        md[f"{arch}.expert_count"] = ("u32", spec["experts"])
+        md[f"{arch}.expert_used_count"] = ("u32", spec.get("expert_used", 2))
     if spec.get("qkv_bias"):
         md[f"{arch}.attention.qkv_bias"] = ("bool", True)
+    if spec.get("embedding_scale") is not None:
+        md[f"{arch}.embedding_scale"] = ("f32", spec["embedding_scale"])
+    if spec.get("residual_scale") is not None:
+        md[f"{arch}.residual_scale"] = ("f32", spec["residual_scale"])
+    if spec.get("logit_scale") is not None:
+        md[f"{arch}.logit_scale"] = ("f32", spec["logit_scale"])
     if spec.get("attn_softcap"):
         md[f"{arch}.attn_logit_softcapping"] = ("f32", spec["attn_softcap"])
     if spec.get("final_softcap"):
@@ -165,6 +191,44 @@ def arch_metadata(spec: dict[str, Any]) -> dict[str, tuple[Any, ...]]:
 
 
 SPECS: list[dict[str, Any]] = [
+    {
+        # glm4: fused gate+up FFN (gate first, then up), and post-attention /
+        # post-FFN norms applied before each residual add. No separate gate.
+        "slug": "glm4",
+        "arch": "glm4",
+        "name": "FreeMoe synthetic glm4 with fused gate-up and post norms",
+        "kv_heads": SHAPE["heads"],
+        "rope_dim": SHAPE["head_dim"],
+        "fused_gate_up": True,
+        "post_norms": True,
+    },
+    {
+        # minicpm: the token embedding is scaled before the first block. The file
+        # also declares residual_scale and logit_scale, which llama.cpp parses
+        # and never applies -- so the fixture below is the check that we do not
+        # apply them either.
+        "slug": "minicpm",
+        "arch": "minicpm",
+        "name": "FreeMoe synthetic minicpm",
+        "kv_heads": SHAPE["heads"],
+        "rope_dim": SHAPE["head_dim"],
+        "tied_output": True,
+        "embedding_scale": 12.0,
+        "residual_scale": 0.0989,
+        "logit_scale": 8.0,
+    },
+    {
+        # qwen3moe: qwen3 semantics (per-head q/k norm) with stacked-expert FFN
+        # and a router. Tests the combination rather than either half alone.
+        "slug": "qwen3moe",
+        "arch": "qwen3moe",
+        "name": "FreeMoe synthetic qwen3moe",
+        "kv_heads": 2,
+        "rope_dim": SHAPE["head_dim"],
+        "qk_norm": True,
+        "experts": 4,
+        "expert_used": 2,
+    },
     {
         # phi3: one fused q/k/v projection with a fused bias, and a rotary width
         # narrower than the head (half the head rotates, the rest passes through).
