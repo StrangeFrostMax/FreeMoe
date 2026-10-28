@@ -103,6 +103,7 @@ struct ResidencyMetrics {
     uint64_t stale_completions = 0;
     uint64_t checksum_checks = 0;
     uint64_t checksum_failures = 0;
+    uint64_t checksum_unavailable = 0;
     uint64_t transfer_failures = 0;
     uint64_t fence_timeouts = 0;
     uint64_t device_loss_events = 0;

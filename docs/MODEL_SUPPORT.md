@@ -31,13 +31,19 @@ each family, the tool records what a specific file contains.
 | --- | --- |
 | GGUF v3 container parse, any architecture | WORKS |
 | Generic inspect / tensor inventory / type census | WORKS |
-| Block decoders: F32, F16, BF16, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q8_1, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_K | WORKS |
+| Block decoders: F32, F16, BF16, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q8_1, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_K, IQ4_NL, I8, I16, I32, I64, F64 | WORKS |
 | Quantised GEMV (fused AVX2 + scalar), typed errors for unknown types | WORKS |
-| `freemoe-tiny-v1` adapter: MHA, RoPE (half), SwiGLU, top-2 MoE, byte tokenizer | WORKS |
-| Standard llama-family adapter (llama.cpp keys and tensor names) | **MISSING** |
-| Grouped-query attention (`head_count_kv < head_count`) | **MISSING** |
-| BPE / sentencepiece tokenizer (`tokenizer.ggml.model = gpt2` / `llama` / `spm`) | **MISSING** |
-| Per-architecture variants: gemma, phi3, glm4, qwen3(moe), minicpm | **MISSING** |
+| `freemoe-tiny-v1` adapter: MHA, RoPE, SwiGLU, top-2 MoE, byte tokenizer | WORKS |
+| Standard llama-family adapter (llama.cpp keys and tensor names) | WORKS |
+| Grouped-query attention (`head_count_kv < head_count`), KV cache sized per kv head | WORKS |
+| SentencePiece and BPE tokenizers, byte fallback, honest coverage report | WORKS |
+| `qwen2`: q/k/v projection biases (split and fused) | WORKS |
+| `qwen3`: per-head RMSNorm on q and k before RoPE | WORKS |
+| `gemma`: embedding scale, zero-centred norm scales, GeGLU, tied output | WORKS |
+| `gemma2`/`gemma3`: post-attention/post-FFN norms, tanh softcapping, sliding window | WORKS |
+| `phi3`: fused q/k/v projection with fused bias, partial rotary | WORKS |
+| `glm4`, `minicpm`, `qwen3moe`-specific variants | **MISSING** |
+| Shared-expert MoE (`expert_shared_count`) | **MISSING**, refused rather than dropped |
 | Ternary block formats (`PTQ1_0`, `TQ1_0`, `TQ2_0`) | **MISSING** |
 | Vision towers (MiniCPM-V) | **MISSING**, and out of scope for a text engine |
 
@@ -91,37 +97,63 @@ file. "Format" is the storage format the probe will confirm.
 | 29 | tinystories-gpt-0.1-3m.Q2_K | llama/gpt2 | Q2_K | adapter, tokenizer |
 | 30 | Uraion-Agent-Steer-Q4_K_M | llama-derived | Q4_K | adapter, tokenizer |
 
-**Runnable today: 0 of 30.** Every one needs the standard adapter and a real
-tokenizer. Sixteen also need MoE or per-architecture semantics, and two need a
-ternary decoder.
+**Verified runnable on the real checkpoints available here: 2 of 30.**
 
-Being precise about that is the point of this page: the previous state of the
-project could not even read these files' weights, and claimed nothing about it.
+| # | File | Result |
+| --- | --- | --- |
+| 24 | Tiny-Moe.Q4_K_M.gguf | runs; MoE routing, Q4_K/Q6_K experts, 4096-token SentencePiece table |
+| 27 | tinyllama-15M-stories-Q3_K_M.gguf | runs; IQ4_NL/Q5_0/Q5_1/Q8_0/Q4_K tensors, 32000-token SentencePiece table |
 
-## Ordered work to close the gap
+`freemoe probe` reports `"runnable": true` for both, and greedy generation
+produces fluent continuations (for example tinyllama answers *"Once upon a
+time"* with *", there was a little girl named Lily. She loved to play outside
+in"*).
 
-Each step is independently testable, and each is gated by a fixture pair the
-way the quantisation work was (a synthetic checkpoint plus an independent
-reference).
+The other 28 files were **not obtainable in this environment**: the Drive
+connector caps a single download at 100 MiB and every remaining file is larger
+(145 MB, 429 MB, 1.18 GB, …). So no claim is made about them. What can be
+claimed is narrower and checkable: the adapters those families need now exist
+and are verified against an independent implementation — see the parity harness
+below.
 
-1. **Standard metadata + tensor-name mapping (`llama` family).** Read
-   `<arch>.*` keys, map llama.cpp tensor names (`blk.N.attn_q`, `ffn_gate`,
-   `ffn_up`, `ffn_down`, `token_embd`, `output`, `*_norm`) onto the existing
-   role enum. Covers #6, #19, #22, #23, #25, #26, #27, #28, #29, #30 and the
-   text path of #1.
-2. **BPE tokenizer** (`tokenizer.ggml.model = gpt2|llama|spm`): merges, scores,
-   byte fallback, add-space prefix. Needed by all 30.
-3. **Grouped-query attention** in the attention kernel: `head_count_kv <
-   head_count`, with the corresponding KV cache layout. Needed by #6, #13, #16
-   and most modern models.
-4. **Standard MoE FFN**: `ffn_gate_inp`, `ffn_gate_exps`, `ffn_up_exps`,
-   `ffn_down_exps` (and the newer per-expert splat naming), top-k routing with
-   optional shared expert. Needed by #4, #5, #7, #14, #15, #24.
+The "Blockers" column below is the **pre-adapter expectation** recorded when the
+list was written. It is stale for every family the capability table now lists as
+WORKS. `freemoe probe` on the actual file is the only authoritative answer.
+
+## How a new architecture is added
+
+Every architecture lands the same way, and none of it is "it produced plausible
+words":
+
+1. `tools/make_arch_fixtures.py` writes a checkpoint shaped like the real thing —
+   standard `<arch>.*` metadata, llama.cpp tensor names, and that family's layout
+   quirks (fused qkv for phi3, zero-centred norm scales for gemma, …).
+2. `tools/llama_oracle.py` — a **second implementation** of the forward pass that
+   shares no code with `src/engine.cpp` — computes reference logits for a fixed
+   prompt.
+3. The `architecture_parity` unit test runs the engine on the fixture and
+   requires its logits to match the oracle within tolerance and its greedy token
+   sequence to match exactly.
+
+Fixtures are keyed by shape and architecture, so a fixture that silently ignored
+a feature (biases, q/k norm, embedding scale, softcapping, sliding window) would
+produce logits identical to the plain fixture and the test would catch it.
+
+Current parity fixtures: `llama-gqa`, `qwen2-bias`, `qwen3-qknorm`, `gemma`,
+`gemma2`, `phi3-fused`.
+
+## Ordered work that remains
+
+1. ~~Standard metadata + tensor-name mapping (`llama` family).~~ **DONE**
+2. ~~BPE / SentencePiece tokenizer.~~ **DONE**
+3. ~~Grouped-query attention.~~ **DONE**
+4. **Standard MoE FFN** — stacked `ffn_*_exps` with `ffn_gate_inp` routing works
+   and runs a real checkpoint (#24). Still missing: `expert_shared_count`
+   (refused, not dropped) and the newer per-expert splat naming.
 5. **Q6_K / Q3_K / Q2_K / Q5_K AVX2 kernels** — correctness is already there via
-   the scalar path; this is the throughput step for #10, #12, #15, #22, #25-27.
-6. **Architecture variants**: `gemma` (embedding scale, `1 + w` norms, GeGLU),
-   `phi3` (fused qkv, partial rotary), `qwen2` (`qkv_bias`), `qwen3`
-   (`attn_q_norm`/`attn_k_norm`), `glm4`, `minicpm`.
+   the scalar path; this is the throughput step.
+6. ~~Architecture variants: `gemma`, `phi3`, `qwen2`, `qwen3`.~~ **DONE**
+   Still open: `glm4`, `minicpm`, `qwen3moe`-specific structure.
 7. **Ternary formats** (`PTQ1_0`/`TQ1_0`/`TQ2_0`) for #20 and #21.
 8. **Multimodal** (#8) is out of scope for this engine: the text decoder can be
    supported, the vision tower cannot, and pretending otherwise would be the

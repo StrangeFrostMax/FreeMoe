@@ -5,6 +5,7 @@
 #include "fm/residency.hpp"
 #include "fm/quant.hpp"
 #include "fm/support.hpp"
+#include "fm/tokenizer.hpp"
 #include "vnpu.h"
 
 #include <algorithm>
@@ -1065,7 +1066,7 @@ void test_quant_reference_decode() {
     CHECK(std::memcmp(bytes.data(), "FMQR1", 5) == 0, "quant reference magic");
     uint32_t records = 0;
     std::memcpy(&records, bytes.data() + 8, sizeof(records));
-    CHECK(records == 15, "quant reference covers every supported block type");
+    CHECK(records == 21, "quant reference covers every supported block type");
 
     size_t pos = 12;
     uint32_t decoded_types = 0;
@@ -1160,14 +1161,14 @@ void test_model_probe() {
         auto doc = parse_gguf_file("tests/fixtures/llama-shape-q8_0.gguf");
         Json probe = probe_model(doc, "tests/fixtures/llama-shape-q8_0.gguf");
         const std::string dump = probe.dump();
-        CHECK(dump.find("\"runnable\":false") != std::string::npos,
-              "llama-shaped checkpoint is not reported runnable");
-        CHECK(dump.find("MISSING_ADAPTER") != std::string::npos,
-              "probe names the missing architecture adapter");
-        CHECK(dump.find("GROUPED_QUERY_ATTENTION") != std::string::npos,
-              "probe detects grouped-query attention");
-        CHECK(dump.find("TOKENIZER_NOT_IMPLEMENTED") != std::string::npos,
-              "probe detects an unimplemented tokenizer");
+        CHECK(dump.find("\"runnable\":true") != std::string::npos,
+              "llama-shaped checkpoint is reported runnable");
+        CHECK(dump.find("MISSING_ADAPTER") == std::string::npos,
+              "the llama adapter is present, so no adapter blocker is reported");
+        CHECK(dump.find("\"grouped_query_attention\":true") != std::string::npos,
+              "probe reports grouped-query attention as a capability");
+        CHECK(dump.find("TOKENIZER_NOT_IMPLEMENTED") == std::string::npos,
+              "the sentencepiece/gpt2 tokenizers are implemented");
         CHECK(dump.find("\"num_key_value_heads\":2") != std::string::npos,
               "probe reads grouped-query head counts from llama.* keys");
         CHECK(dump.find("\"execute\":true") != std::string::npos,
@@ -1496,6 +1497,273 @@ void test_sampling_and_detokenize() {
     engine.release_runtime();
 }
 
+
+// A checkpoint's token table is real data, so the tokenizer is exercised
+// against a table shaped exactly like a published SentencePiece vocabulary:
+// U+2581 space markers, control tokens, and <0xNN> byte fallbacks.
+static MetadataValue make_string(const std::string &value) {
+    MetadataValue v;
+    v.type = GGUFValueType::STRING;
+    v.s = value;
+    return v;
+}
+
+void test_tokenizer_real_vocabularies() {
+    auto sentencepiece_doc = [](bool with_byte_fallback) {
+        GGUFDocument doc;
+        doc.metadata["tokenizer.ggml.model"] = make_string("llama");
+        MetadataValue tokens;
+        tokens.type = GGUFValueType::ARRAY;
+        auto add = [&](const std::string &piece) {
+            tokens.array.push_back(make_string(piece));
+        };
+        add("<unk>");                        // 0
+        add("<s>");                          // 1
+        add("</s>");                         // 2
+        add(std::string("\xe2\x96\x81") + "the");   // 3  " the"
+        add(std::string("\xe2\x96\x81") + "cat");   // 4  " cat"
+        add("cat");                          // 5
+        add("s");                            // 6
+        add(std::string("\xe2\x96\x81") + "sat");   // 7
+        // The byte-fallback pieces make arbitrary text representable.
+        for (int i = 0; i < 256; ++i) {
+            if (!with_byte_fallback) continue;
+            char buf[8];
+            std::snprintf(buf, sizeof(buf), "<0x%02X>", i);
+            add(buf);
+        }
+        doc.metadata["tokenizer.ggml.tokens"] = tokens;
+        return doc;
+    };
+
+    {
+        GGUFDocument doc = sentencepiece_doc(true);
+        const uint32_t vocab = static_cast<uint32_t>(
+            doc.metadata["tokenizer.ggml.tokens"].array.size());
+        Tokenizer tokenizer = Tokenizer::from_gguf(doc, vocab);
+        CHECK(tokenizer.kind_name() == "sentencepiece", "llama tokenizer is sentencepiece");
+        CHECK(tokenizer.complete(), "a tokenizer with byte fallback is complete");
+
+        const std::vector<int32_t> ids = tokenizer.encode("the cat sat", 1);
+        CHECK(ids.front() == 1, "encoding starts with the BOS id");
+        CHECK(ids.size() == 4, "space-marker pieces cover whole words: BOS plus three pieces");
+        CHECK(tokenizer.decode(ids, 1, 2) == " the cat sat",
+              "decode inverts encode including the leading space");
+        // The leading word boundary is part of the piece, so dropping the BOS
+        // must not disturb the text.
+        CHECK(tokenizer.decode({3, 4, 7}, 1, 2) == " the cat sat",
+              "decoding bare pieces reproduces the sentence");
+        // An unseen character must survive via byte fallback rather than being
+        // dropped or replaced.
+        // SentencePiece prepends a word boundary, so "z" is space + "z": the
+        // space has no piece and becomes a fallback token of its own.
+        const std::vector<int32_t> odd = tokenizer.encode("z", 1);
+        CHECK(odd.size() == 3, "uncovered bytes each become a fallback token");
+        CHECK(tokenizer.decode(odd, 1, 2) == " z", "byte fallback round-trips");
+        // Control tokens never reach the text.
+        CHECK(tokenizer.decode({0, 1, 2}, 1, 2).empty(),
+              "special tokens are not emitted as text");
+    }
+    {
+        // Without byte fallback the tokenizer must refuse rather than silently
+        // corrupt the prompt.
+        GGUFDocument doc = sentencepiece_doc(false);
+        const uint32_t vocab = static_cast<uint32_t>(
+            doc.metadata["tokenizer.ggml.tokens"].array.size());
+        Tokenizer tokenizer = Tokenizer::from_gguf(doc, vocab);
+        CHECK(!tokenizer.complete(), "no fallback pieces means incomplete coverage");
+        CHECK(throws_code(ErrorCode::INVALID_TOKENIZER,
+                          [&]() { (void)tokenizer.encode("z", 1); }),
+              "an unrepresentable byte is a typed error, not silent loss");
+    }
+    {
+        // A GPT-2 style file that lost its merge list cannot segment text; say
+        // so instead of pretending.
+        GGUFDocument doc;
+        doc.metadata["tokenizer.ggml.model"] = make_string("gpt2");
+        MetadataValue tokens;
+        tokens.type = GGUFValueType::ARRAY;
+        tokens.array.push_back(make_string("a"));
+        tokens.array.push_back(make_string("b"));
+        doc.metadata["tokenizer.ggml.tokens"] = tokens;
+        Tokenizer tokenizer = Tokenizer::from_gguf(doc, 2);
+        CHECK(!tokenizer.complete(), "BPE without merges is reported as incomplete");
+        CHECK(throws_code(ErrorCode::NOT_IMPLEMENTED,
+                          [&]() { (void)tokenizer.encode("ab", 0); }),
+              "BPE without a merge list refuses to encode");
+    }
+    {
+        // A token table that disagrees with the declared vocabulary is a broken
+        // file, not something to paper over.
+        GGUFDocument doc = sentencepiece_doc(true);
+        CHECK(throws_code(ErrorCode::INVALID_TOKENIZER,
+                          [&]() { (void)Tokenizer::from_gguf(doc, 7); }),
+              "declared vocabulary must match the token table");
+    }
+}
+
+// The canonical model map is what makes paging decisions auditable: every
+// tensor must report a source byte range that lies inside the data section and
+// a pageability answer consistent with its quantisation geometry.
+void test_model_map_and_tied_output() {
+    const std::string path = "tests/fixtures/moe-fm.gguf";
+    auto doc = parse_path(path);
+    auto manifest = build_manifest(doc, path);
+    Json report = inspect_json(manifest, path);
+
+    auto find_member = [](const Json &object, const std::string &key) -> const Json * {
+        for (const auto &member : object.members())
+            if (member.first == key) return &member.second;
+        return nullptr;
+    };
+
+    const Json *map = find_member(report, "model_map");
+    CHECK(map != nullptr && map->type() == Json::Type::Array,
+          "inspect reports a canonical model map");
+    if (!map) return;
+    CHECK(map->items().size() == doc.tensors.size(), "the map has one entry per source tensor");
+
+    bool saw_stacked = false;
+    for (const Json &entry : map->items()) {
+        auto num = [&](const char *key) -> uint64_t {
+            const Json *value = find_member(entry, key);
+            return value ? static_cast<uint64_t>(value->integer_value()) : 0;
+        };
+        auto str = [&](const char *key) -> std::string {
+            const Json *value = find_member(entry, key);
+            return value ? value->str() : std::string();
+        };
+        const uint64_t offset = num("source_offset");
+        const uint64_t bytes = num("bytes");
+        const std::string name = str("source_name");
+        CHECK(offset >= doc.data_offset, "tensor range starts inside the data section: " + name);
+        CHECK(offset + bytes <= doc.file_size, "tensor range ends inside the file: " + name);
+        CHECK(num("source_end") == offset + bytes,
+              "source_end is the exclusive end of the range: " + name);
+        CHECK(!str("canonical_name").empty(), "every tensor has a canonical address: " + name);
+        CHECK(num("adapter_version") == 1, "adapter version is recorded: " + name);
+        if (num("expert_count") > 0) {
+            saw_stacked = true;
+            // A stacked expert slice is only independently readable when the
+            // stride is a whole number of quantisation blocks.
+            const uint64_t stride = num("expert_stride_bytes");
+            const Json *geometry = find_member(entry, "quant_geometry");
+            const Json *block = geometry ? find_member(*geometry, "block_bytes") : nullptr;
+            const uint64_t block_bytes = block ? static_cast<uint64_t>(block->integer_value()) : 0;
+            const Json *pageable = find_member(entry, "independently_pageable");
+            CHECK(pageable &&
+                      pageable->bool_value() == (block_bytes != 0 && stride % block_bytes == 0),
+                  "pageability follows the quantisation block alignment: " + name);
+        }
+    }
+    CHECK(saw_stacked, "the MoE fixture exposes stacked expert tensors in the map");
+}
+
+
+// Reads the line-oriented golden produced by tools/make_arch_fixtures.py.
+struct ArchGolden {
+    std::string adapter;
+    std::string prompt;
+    std::vector<int32_t> input_ids;
+    std::vector<float> logits;
+    std::vector<int32_t> greedy;
+};
+
+ArchGolden read_arch_golden(const std::string &path) {
+    std::ifstream in(path);
+    if (!in) fail(ErrorCode::INTERNAL_ERROR, "missing architecture golden " + path);
+    ArchGolden golden;
+    std::string line;
+    while (std::getline(in, line)) {
+        if (line.empty() || line[0] == '#') continue;
+        std::istringstream stream(line);
+        std::string tag;
+        stream >> tag;
+        if (tag == "adapter") {
+            stream >> golden.adapter;
+        } else if (tag == "bos") {
+            int32_t value = 0;
+            stream >> value;
+            (void)value;
+        } else if (tag == "prompt") {
+            std::string rest;
+            std::getline(stream, rest);
+            if (!rest.empty() && rest[0] == ' ') rest.erase(0, 1);
+            golden.prompt = rest;
+        } else if (tag == "input_ids" || tag == "greedy") {
+            size_t count = 0;
+            stream >> count;
+            std::vector<int32_t> &target = tag == "input_ids" ? golden.input_ids : golden.greedy;
+            for (size_t i = 0; i < count; ++i) {
+                int32_t value = 0;
+                stream >> value;
+                target.push_back(value);
+            }
+        } else if (tag == "logits") {
+            size_t count = 0;
+            stream >> count;
+            golden.logits.resize(count);
+            for (size_t i = 0; i < count; ++i) stream >> golden.logits[i];
+        }
+    }
+    return golden;
+}
+
+// Architecture parity. Each entry is a checkpoint shaped like a real llama.cpp
+// file for a named architecture, plus logits from an independent implementation
+// (tools/llama_oracle.py). The engine has to reproduce those logits: that is
+// what "the adapter for this architecture works" means here.
+void test_architecture_parity() {
+    const std::vector<std::string> slugs = {"llama-gqa", "qwen2-bias", "qwen3-qknorm", "gemma",
+                                           "gemma2", "phi3-fused"};
+    for (const std::string &slug : slugs) {
+        const std::string model = "tests/fixtures/" + slug + "-shape.gguf";
+        ArchGolden golden = read_arch_golden("tests/golden/" + slug + "_reference.txt");
+        CHECK(!golden.input_ids.empty(), "golden records the prompt ids: " + slug);
+        CHECK(!golden.logits.empty(), "golden records prefill logits: " + slug);
+
+        RunConfig config;
+        config.model_path = model;
+        config.trace_path = "";
+        config.budget.total_hot_bytes = 64ull * 1024 * 1024;
+        Engine engine(config);
+        engine.initialize();
+
+        CHECK(engine.manifest().config.architecture == golden.adapter,
+              "the adapter reports the checkpoint's architecture: " + slug);
+
+        PromptResult result = engine.run_prompt(golden.prompt, 8);
+        CHECK(result.input_ids == golden.input_ids, "prompt tokenization matches: " + slug);
+        CHECK(result.prefill_logits.size() == golden.logits.size(),
+              "prefill produced one logit per vocabulary entry: " + slug);
+        if (result.prefill_logits.size() != golden.logits.size()) {
+            engine.release_runtime();
+            continue;
+        }
+
+        // Same arithmetic in both implementations, but one accumulates in
+        // float and the other in double, so the tolerance is relative to the
+        // logit magnitude rather than absolute.
+        double worst_abs = 0.0;
+        double worst_rel = 0.0;
+        double magnitude = 0.0;
+        for (float v : golden.logits) magnitude = std::max(magnitude, std::fabs(static_cast<double>(v)));
+        for (size_t i = 0; i < golden.logits.size(); ++i) {
+            const double got = result.prefill_logits[i];
+            const double want = golden.logits[i];
+            const double abs_err = std::fabs(got - want);
+            worst_abs = std::max(worst_abs, abs_err);
+            worst_rel = std::max(worst_rel, abs_err / std::max(1e-9, std::fabs(want)));
+        }
+        CHECK(worst_abs <= 1e-4 + 1e-4 * magnitude,
+              "prefill logits match the independent reference: " + slug + " (worst abs " +
+                  std::to_string(worst_abs) + ", rel " + std::to_string(worst_rel) + ")");
+        CHECK(result.generated_ids == golden.greedy,
+              "greedy decoding matches the independent reference: " + slug);
+        engine.release_runtime();
+    }
+}
+
 void test_soak_sessions() {
     const uint32_t N_SOAK = 256;
     std::string prompt = first_prompt();
@@ -1542,6 +1810,9 @@ int main(int argc, char **argv) {
     maybe_run("moe_readers_and_cache_sizes", test_moe_readers_and_cache_sizes);
     maybe_run("traces_and_replay_inputs", test_traces_and_replay_inputs);
     maybe_run("vnpu_reference_backend", test_vnpu_reference_backend);
+    maybe_run("tokenizer_real_vocabularies", test_tokenizer_real_vocabularies);
+    maybe_run("model_map_and_tied_output", test_model_map_and_tied_output);
+    maybe_run("architecture_parity", test_architecture_parity);
     maybe_run("soak_sessions", test_soak_sessions);
     std::cout << g_checks << " checks, " << g_failures << " failures\n";
     return g_failures == 0 ? 0 : 1;

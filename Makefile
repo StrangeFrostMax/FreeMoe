@@ -20,6 +20,7 @@ OUR_LIB_SRCS := \
   src/kernels.cpp \
   src/quant.cpp \
   src/support.cpp \
+  src/tokenizer.cpp \
   src/residency.cpp \
   src/engine.cpp
 APP_MAIN := src/main.cpp

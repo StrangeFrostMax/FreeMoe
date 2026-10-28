@@ -34,17 +34,28 @@ struct ArchFacts {
     bool needs_adapter = true;
 };
 
+// Single source of truth for "which architectures have a forward pass".
+// `needs_adapter` is false when this build can actually run the architecture;
+// everything else is inspected and reported, never silently attempted.
 const std::map<std::string, ArchFacts> &known_architectures() {
     static const std::map<std::string, ArchFacts> table = {
+        // Implemented: pre-norm RMSNorm + RoPE + SwiGLU + optional top-k MoE,
+        // with grouped-query attention and tied output embeddings.
         {"freemoe-tiny", {true, false}},
-        {"llama", {true, true}},
-        {"qwen2", {true, true}},
-        {"qwen3", {true, true}},
-        {"smollm", {true, true}},
-        {"gemma", {false, true}},
-        {"gemma2", {false, true}},
-        {"gemma3", {false, true}},
-        {"phi3", {false, true}},
+        {"llama", {true, false}},
+        {"qwen2", {true, false}},
+        {"qwen3", {true, false}},
+        {"smollm", {true, false}},
+        {"smollm2", {true, false}},
+        {"tinyllama", {true, false}},
+        // gemma: scaled embeddings, zero-centred norm scales, GeGLU, tied
+        // output. gemma2 adds post-norms, tanh softcapping and a sliding window.
+        {"gemma", {true, false}},
+        {"gemma2", {true, false}},
+        {"gemma3", {true, false}},
+        // phi3: one fused q/k/v projection (with fused bias) and a rotary width
+        // narrower than the head.
+        {"phi3", {true, false}},
         {"glm4", {false, true}},
         {"glm4moe", {false, true}},
         {"deepseek2", {false, true}},
@@ -53,6 +64,12 @@ const std::map<std::string, ArchFacts> &known_architectures() {
         {"multimodal", {false, true}},
     };
     return table;
+}
+
+// Tokenizers this build can decode and encode with.
+bool tokenizer_implemented(const std::string &model) {
+    return model == "freemoe.byte-v1" || model == "llama" || model == "spm" || model == "gpt2" ||
+           model == "bpe";
 }
 
 const MetadataValue *find(const GGUFDocument &doc, const std::string &key) {
@@ -242,54 +259,83 @@ Json probe_model(const GGUFDocument &doc, const std::string &source_path) {
     }
     if (tokenizer_model.empty()) {
         block("NO_TOKENIZER", "the file carries no tokenizer metadata");
-    } else if (tokenizer_model != "freemoe.byte-v1") {
+    } else if (!tokenizer_implemented(tokenizer_model)) {
         block("TOKENIZER_NOT_IMPLEMENTED",
-              "tokenizer '" + tokenizer_model +
-                  "' needs a real BPE/sentencepiece implementation; only the raw byte "
-                  "tokenizer is implemented");
+              "tokenizer '" + tokenizer_model + "' is not implemented");
+    } else if ((tokenizer_model == "gpt2" || tokenizer_model == "bpe") && merges == nullptr) {
+        block("TOKENIZER_NO_MERGES",
+              "a BPE tokenizer without its merge list cannot segment text");
     }
-    if (find(doc, arch + ".attention.head_count_kv") != nullptr) {
+    // Grouped-query attention is implemented, so it is reported as a capability
+    // rather than as a blocker.
+    {
         uint64_t heads = 0, kv = 0;
         if (read_u64(doc, arch, "attention.head_count", &heads) &&
-            read_u64(doc, arch, "attention.head_count_kv", &kv) && kv != 0 && kv != heads) {
-            block("GROUPED_QUERY_ATTENTION",
-              "key/value head count (" + std::to_string(kv) + ") differs from query head "
-              "count (" + std::to_string(heads) + "); the engine only implements "
-              "multi-head attention with kv == heads");
+            read_u64(doc, arch, "attention.head_count_kv", &kv) && kv != 0) {
+            out.set("grouped_query_attention", kv != heads);
+            if (heads % kv != 0)
+                block("INCONSISTENT_GQA",
+                      "key/value head count (" + std::to_string(kv) +
+                          ") does not divide the query head count (" + std::to_string(heads) + ")");
         }
     }
-    if (find(doc, arch + ".expert_count") != nullptr || find(doc, "expert_count") != nullptr) {
-        block("MOE_LAYER_LAYOUT", "the file declares experts; the engine's MoE path expects "
-                                  "the freemoe stacked-expert tensor layout");
+    // The standard stacked-expert layout (ffn_gate_exps/ffn_up_exps/ffn_down_exps
+    // with ffn_gate_inp routing) is implemented, so it is only a blocker for
+    // architectures that have no adapter at all.
+    const bool declares_experts =
+        find(doc, arch + ".expert_count") != nullptr || find(doc, "expert_count") != nullptr;
+    if (declares_experts && known_architectures().count(arch) && !has_adapter) {
+        block("MOE_LAYER_LAYOUT", "this architecture's MoE layout is not mapped");
     }
     bool has_expert_tensors = false;
     for (const auto &tensor : doc.tensors)
         has_expert_tensors = has_expert_tensors || tensor.name.find("_exps") != std::string::npos;
     if (has_expert_tensors && !has_adapter)
         block("EXPERT_TENSORS", "expert tensors are present but their layout is not mapped");
-    for (const auto &tensor : doc.tensors) {
-        if (tensor.name.find("attn_q_norm") != std::string::npos ||
-            tensor.name.find("attn_k_norm") != std::string::npos) {
-            block("QK_NORM", "per-head Q/K normalisation is present and not implemented");
-            break;
+    // Per-head q/k normalisation (qwen3) is implemented; report it as a
+    // capability, and only complain when the pair is incomplete.
+    {
+        bool q_norm = false, k_norm = false;
+        for (const auto &tensor : doc.tensors) {
+            const bool per_layer = tensor.name.rfind("blk.", 0) == 0;
+            if (per_layer && tensor.name.find("attn_q_norm") != std::string::npos) q_norm = true;
+            if (per_layer && tensor.name.find("attn_k_norm") != std::string::npos) k_norm = true;
         }
+        out.set("per_head_qk_norm", q_norm || k_norm);
+        if (q_norm != k_norm)
+            block("QK_NORM_INCOMPLETE", "q/k normalisation is present on only one of q and k");
     }
-    const MetadataValue *tied = find(doc, arch + ".tie_word_embeddings");
-    if (tied && tied->b && doc.tensor_by_name.count("output.weight") == 0) {
-        block("TIED_OUTPUT_WEIGHT",
-              "output weight is tied to the embedding table; the engine requires a "
-              "separate output tensor");
+    // Tied output embeddings are supported (the output projection reads the
+    // token table), so only a *missing* both-ways case is a blocker.
+    if (doc.tensor_by_name.count("output.weight") == 0 &&
+        doc.tensor_by_name.count("token_embd.weight") == 0) {
+        block("NO_OUTPUT_WEIGHT", "neither output.weight nor a token table is present");
     }
+    // qwen2-style projection biases are implemented; only an inconsistent file
+    // (declared bias with no bias tensor, or vice versa) is a blocker.
     const MetadataValue *bias = find(doc, arch + ".attention.qkv_bias");
-    if (bias && bias->b) block("QKV_BIAS", "attention carries qkv biases; the engine's matvec "
-                                          "has no bias add");
+    const bool declares_bias = bias && bias->b;
+    const bool has_bias_tensor = doc.tensor_by_name.count("blk.0.attn_q.bias") != 0 ||
+                                 doc.tensor_by_name.count("blk.0.attn_qkv.bias") != 0;
+    if (bias && declares_bias && !has_bias_tensor)
+        block("QKV_BIAS_MISSING_TENSOR",
+              "attention.qkv_bias is set but no attention bias tensor is present");
+    if (bias && !declares_bias && has_bias_tensor)
+        block("QKV_BIAS_INCONSISTENT",
+              "attention bias tensors are present but attention.qkv_bias is false");
+    out.set("attention_qkv_bias", declares_bias || has_bias_tensor);
+    const MetadataValue *tied_flag = find(doc, arch + ".tie_word_embeddings");
+    if (tied_flag && tied_flag->b && doc.tensor_by_name.count("output.weight") != 0) {
+        block("AMBIGUOUS_TIED_OUTPUT",
+              "the file declares tied embeddings but also ships a separate output tensor");
+    }
 
     const int64_t blocker_count = static_cast<int64_t>(blockers_count);
     out.set("blockers", std::move(blockers));
     out.set("blocker_count", blocker_count);
 
     const bool runnable = has_adapter && unsupported_types.empty() &&
-                          tokenizer_model == "freemoe.byte-v1" && blocker_count == 0;
+                          tokenizer_implemented(tokenizer_model) && blocker_count == 0;
     out.set("runnable", runnable);
     out.set("verdict", runnable ? "runnable"
                                 : (all_dequantizable ? "inspectable-and-decodable"

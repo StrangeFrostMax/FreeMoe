@@ -309,6 +309,47 @@ void dequantize_block(uint32_t type_id, const uint8_t *src, float *dst) {
         }
         return;
     }
+    case 20: { // IQ4_NL: half d, 16 bytes of nibbles indexing a non-linear table
+        // Table from the format definition. The four-bit codes are not a linear
+        // scale: they are indices into these signed values, so a linear
+        // (q - 8) * d approximation would be wrong, not just imprecise.
+        static const int8_t kvalues[16] = {-127, -104, -83, -65, -49, -35, -22, -10,
+                                           1,    13,   25,  38,  53,  69,  89,  113};
+        const float d = fp16_to_fp32(read_u16(src));
+        const uint8_t *qs = src + 2;
+        for (int j = 0; j < 16; ++j) {
+            dst[j] = d * static_cast<float>(kvalues[qs[j] & 0x0F]);
+            dst[j + 16] = d * static_cast<float>(kvalues[qs[j] >> 4]);
+        }
+        return;
+    }
+    case 24: // I8
+        dst[0] = static_cast<float>(static_cast<int8_t>(src[0]));
+        return;
+    case 25: { // I16
+        int16_t v;
+        std::memcpy(&v, src, sizeof(v));
+        dst[0] = static_cast<float>(v);
+        return;
+    }
+    case 26: { // I32
+        int32_t v;
+        std::memcpy(&v, src, sizeof(v));
+        dst[0] = static_cast<float>(v);
+        return;
+    }
+    case 27: { // I64
+        int64_t v;
+        std::memcpy(&v, src, sizeof(v));
+        dst[0] = static_cast<float>(v);
+        return;
+    }
+    case 28: { // F64
+        double v;
+        std::memcpy(&v, src, sizeof(v));
+        dst[0] = static_cast<float>(v);
+        return;
+    }
     case 15: { // Q8_K
         const float d = read_f32(src);
         const int8_t *qs = reinterpret_cast<const int8_t *>(src + 4);

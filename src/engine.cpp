@@ -120,6 +120,10 @@ void Engine::initialize() {
     file_ = std::make_unique<MappedFile>(config_.model_path);
     doc_ = parse_gguf(file_->data(), file_->size());
     manifest_ = build_manifest(doc_, config_.model_path);
+    // A smaller KV context is a memory decision, not a correctness one: the
+    // model still runs with its real weights and its real arithmetic.
+    if (config_.context_limit != 0 && config_.context_limit < manifest_.config.context)
+        manifest_.config.context = config_.context_limit;
     trace_ = std::make_unique<TraceWriter>(config_.trace_path);
 
     config_.budget.requested_slots = config_.cache_slots;
@@ -146,6 +150,7 @@ void Engine::initialize() {
     residency_ = std::make_unique<ResidencyManager>(manifest_, *backend_, *scheduler_, *trace_,
                                                     budget_, config_.residency);
     load_fixed_weights();
+    initialize_tokenizer();
     residency_->initialize();
     residency_->preload_resident_experts();
 
@@ -162,6 +167,15 @@ void Engine::initialize() {
     trace_->event("model_load", std::move(fields));
 }
 
+void Engine::initialize_tokenizer() {
+    tokenizer_ = std::make_unique<Tokenizer>(
+        Tokenizer::from_gguf(manifest_.doc, manifest_.config.vocab));
+    Json fields = Json::object();
+    fields.set("model", tokenizer_->kind_name());
+    fields.set("vocab", static_cast<uint64_t>(manifest_.config.vocab));
+    trace_->event("tokenizer_ready", std::move(fields));
+}
+
 void Engine::load_fixed_weights() {
     if (manifest_.fixed_weight_bytes == 0)
         fail(ErrorCode::INVALID_ARGUMENT, "model has no fixed weights");
@@ -175,19 +189,29 @@ void Engine::load_fixed_weights() {
     uint64_t offset = 0;
     for (const auto &tensor : manifest_.doc.tensors) {
         if (tensor.expert_tensor) continue;
-        weight_offsets_[tensor.name] = offset;
+        const std::string &key = tensor.canonical.empty() ? tensor.name : tensor.canonical;
+        weight_offsets_[key] = offset;
         std::memcpy(host_weights.data() + offset, file_->data() + tensor.absolute_offset,
                     static_cast<size_t>(tensor.byte_size));
         offset += tensor.byte_size;
     }
-    // Decode any 1-D normalisation vector that is stored in a block format.
+    // Decode the 1-D vectors that are not weight matrices: RMSNorm scales and
+    // the optional attention biases. Both may be stored in a block format.
     for (const auto &tensor : manifest_.doc.tensors) {
-        if (tensor.expert_tensor || tensor.type_id == 0) continue;
+        if (tensor.expert_tensor) continue;
         if (tensor.dims.size() != 1) continue;
+        const bool is_bias = tensor.role == TensorRole::ATTN_Q_BIAS ||
+                             tensor.role == TensorRole::ATTN_K_BIAS ||
+                             tensor.role == TensorRole::ATTN_V_BIAS ||
+                             tensor.role == TensorRole::ATTN_OUTPUT_BIAS ||
+                             tensor.role == TensorRole::ATTN_QKV_BIAS;
+        if (tensor.type_id == 0 && !is_bias) continue; // already plain floats
         std::vector<float> values(tensor.dims[0]);
         dequantize_row(tensor.type_id, file_->data() + tensor.absolute_offset,
                        values.data(), tensor.dims[0]);
-        decoded_norms_.emplace(tensor.name, std::move(values));
+        const std::string key = tensor.canonical.empty() ? tensor.name : tensor.canonical;
+        if (is_bias) decoded_biases_.emplace(key, std::move(values));
+        else decoded_norms_.emplace(key, std::move(values));
     }
     if (offset != manifest_.fixed_weight_bytes)
         fail(ErrorCode::INTERNAL_ERROR, "fixed weight size accounting mismatch");
@@ -198,6 +222,17 @@ void Engine::load_fixed_weights() {
     fields.set("bytes", host_weights.size());
     fields.set("tensors", static_cast<uint64_t>(weight_offsets_.size()));
     trace_->event("weights_uploaded", std::move(fields));
+}
+
+const float *Engine::bias_weights(const std::string &name) const {
+    auto it = decoded_biases_.find(name);
+    if (it == decoded_biases_.end())
+        fail(ErrorCode::MISSING_REQUIRED_TENSOR, "attention bias is not resident: " + name);
+    return it->second.data();
+}
+
+bool Engine::has_bias(const std::string &name) const {
+    return decoded_biases_.find(name) != decoded_biases_.end();
 }
 
 const float *Engine::norm_weights(const std::string &name) const {
@@ -214,11 +249,16 @@ const float *Engine::weights(const std::string &name) const {
 }
 
 Engine::TensorView Engine::tensor_view(const std::string &name) const {
-    auto it = weight_offsets_.find(name);
+    // Shared tensors (tied embeddings) are addressed through an alias so the
+    // forward pass keeps one name per logical weight.
+    std::string resolved = name;
+    auto alias = manifest_.alias.find(name);
+    if (alias != manifest_.alias.end()) resolved = alias->second;
+    auto it = weight_offsets_.find(resolved);
     if (it == weight_offsets_.end())
         fail(ErrorCode::MISSING_REQUIRED_TENSOR,
              "tensor is not resident in fixed weight buffer: " + name);
-    const TensorInfo *info = manifest_.tensor(name);
+    const TensorInfo *info = manifest_.tensor(resolved);
     if (!info) fail(ErrorCode::MISSING_REQUIRED_TENSOR, "tensor is not in the manifest: " + name);
     TensorView view;
     view.data = static_cast<const uint8_t *>(weights_buffer_->data) + it->second;
@@ -294,17 +334,27 @@ uint32_t Engine::greedy(const std::vector<float> &logits) const {
     return best;
 }
 
-void Engine::rope_half(std::vector<float> &q, std::vector<float> &k, uint64_t position) const {
+void Engine::rope_half(std::vector<float> &q, uint32_t q_heads, std::vector<float> &k,
+                       uint32_t k_heads, uint64_t position) const {
     const ModelConfig &c = manifest_.config;
-    uint32_t half = c.head_dim / 2;
-    for (uint32_t h = 0; h < c.heads; ++h) {
+    // Rotary dimensions come from the file when present, otherwise the whole
+    // head. Rotating more than rope_dim would be wrong, not merely slower.
+    const uint32_t rotate = std::min(c.rope_dim ? c.rope_dim : c.head_dim, c.head_dim);
+    const uint32_t pairs = rotate / 2;
+    // Query and key can have different head counts under grouped-query
+    // attention, so each vector is walked independently.
+    for (uint32_t h = 0; h < std::max(q_heads, k_heads); ++h) {
+        const bool in_q = h < q_heads;
+        const bool in_k = h < k_heads;
+        if (!in_q && !in_k) break;
         size_t base = static_cast<size_t>(h) * c.head_dim;
-        for (uint32_t i = 0; i < half; ++i) {
-            double inv = std::pow(c.rope_theta, -(2.0 * static_cast<double>(i)) / c.head_dim);
+        for (uint32_t i = 0; i < pairs; ++i) {
+            double inv = std::pow(c.rope_theta, -(2.0 * static_cast<double>(i)) / rotate);
             double angle = static_cast<double>(position) * inv;
             double cs = std::cos(angle);
             double sn = std::sin(angle);
-            for (std::vector<float> *vec : {&q, &k}) {
+            for (std::vector<float> *vec : {in_q ? &q : nullptr, in_k ? &k : nullptr}) {
+                if (!vec) continue;
                 float a0 = (*vec)[base + 2 * i];
                 float a1 = (*vec)[base + 2 * i + 1];
                 (*vec)[base + 2 * i] = static_cast<float>(a0 * cs - a1 * sn);
@@ -393,33 +443,14 @@ uint32_t sample_from_logits(const std::vector<float> &logits, const SamplingConf
 
 std::string Engine::detokenize(const std::vector<int32_t> &ids) const {
     const ModelConfig &c = manifest_.config;
-    std::string out;
-    out.reserve(ids.size());
-    for (int32_t id : ids) {
-        if (id < 0) fail(ErrorCode::INVALID_ARGUMENT, "negative token id in detokenize");
-        if (static_cast<uint32_t>(id) == c.bos_id || static_cast<uint32_t>(id) == c.eos_id)
-            continue;
-        if (static_cast<uint32_t>(id) < 256) {
-            out.push_back(static_cast<char>(id));
-            continue;
-        }
-        // Token ids above the byte range have no text mapping in this
-        // tokenizer; fail rather than emitting a guessed character.
-        fail(ErrorCode::INVALID_TOKENIZER,
-             "token id " + std::to_string(id) + " has no byte mapping");
-    }
-    return out;
+    return tokenizer_->decode(ids, c.bos_id, c.eos_id);
 }
 
 std::vector<int32_t> Engine::tokenize(const std::string &prompt) const {
     const ModelConfig &c = manifest_.config;
     if (prompt.empty() || prompt.size() + 2 > c.context)
         fail(ErrorCode::INVALID_ARGUMENT, "prompt is empty or exceeds context");
-    std::vector<int32_t> ids;
-    ids.reserve(prompt.size() + 1);
-    ids.push_back(static_cast<int32_t>(c.bos_id));
-    for (unsigned char byte : prompt) ids.push_back(static_cast<int32_t>(byte));
-    return ids;
+    return tokenizer_->encode(prompt, c.bos_id);
 }
 
 std::vector<float> Engine::forward_token(int32_t token, uint64_t position,
@@ -441,19 +472,30 @@ std::vector<float> Engine::forward_token(int32_t token, uint64_t position,
         trace_->event("token", std::move(fields));
     }
 
+    // gemma stores its norm scales zero-centred, so the effective scale is
+    // 1 + w. Reading them as w would leave the model roughly un-normalised.
+    const double norm_bias = c.norm_add_one ? 1.0 : 0.0;
     auto rmsnorm = [&](const std::vector<float> &x, const float *w, const std::string &name) {
         double ss = 0.0;
         for (float v : x) ss += static_cast<double>(v) * v;
         double scale = 1.0 / std::sqrt(ss / c.hidden + c.rms_eps);
         std::vector<float> y(x.size());
         for (uint32_t i = 0; i < x.size(); ++i)
-            y[i] = static_cast<float>(x[i] * scale * w[i]);
+            y[i] = static_cast<float>(x[i] * scale * (norm_bias + w[i]));
         backend_->record_control(name, x.size() * sizeof(float) * 2, y.size() * sizeof(float));
         return y;
     };
     auto silu = [](float x) {
         return static_cast<float>(static_cast<double>(x) / (1.0 + std::exp(-static_cast<double>(x))));
     };
+    // ggml's GELU is the tanh approximation, not the erf form.
+    auto gelu = [](float x) {
+        const double v = static_cast<double>(x);
+        const double inner = 0.7978845608028654 * (v + 0.044715 * v * v * v);
+        return static_cast<float>(0.5 * v * (1.0 + std::tanh(inner)));
+    };
+    const bool use_gelu = c.activation == "gelu";
+    auto activate = [&](float x) { return use_gelu ? gelu(x) : silu(x); };
     auto residual_add = [&](std::vector<float> &x, const std::vector<float> &delta, const std::string &name) {
         for (size_t i = 0; i < x.size(); ++i) x[i] += delta[i];
         backend_->record_control(name, (x.size() + delta.size()) * sizeof(float), x.size() * sizeof(float));
@@ -480,56 +522,139 @@ std::vector<float> Engine::forward_token(int32_t token, uint64_t position,
                 dequantize_block(emb.type_id, row + block_index * geo.block_bytes, x.data() + k);
             }
         }
+        if (c.embedding_scale) {
+            // gemma normalises each embedding to unit RMS before the first
+            // block; skipping this changes every subsequent activation.
+            const float scale = static_cast<float>(std::sqrt(static_cast<double>(c.hidden)));
+            for (float &v : x) v *= scale;
+        }
     }
 
     for (uint32_t layer = 0; layer < c.layers; ++layer) {
         const std::string prefix = "blk." + std::to_string(layer) + ".";
         std::vector<float> h = rmsnorm(x, norm_weights(prefix + "attn_norm.weight"),
                                        "rmsnorm.attn.L" + std::to_string(layer));
-        std::vector<float> q = matvec_view(tensor_view(prefix + "attn_q.weight"), h, c.hidden,
-                                           c.hidden, "attn_q.L" + std::to_string(layer));
-        std::vector<float> k = matvec_view(tensor_view(prefix + "attn_k.weight"), h, c.hidden,
-                                           c.hidden, "attn_k.L" + std::to_string(layer));
-        std::vector<float> v = matvec_view(tensor_view(prefix + "attn_v.weight"), h, c.hidden,
-                                           c.hidden, "attn_v.L" + std::to_string(layer));
-        rope_half(q, k, position);
+        // Grouped-query attention: `kv_heads` key/value heads feed `heads`
+        // query heads, each query head repeating a contiguous group.
+        const uint32_t kv_dim = c.kv_heads * c.head_dim;
+        const uint32_t group = c.heads / c.kv_heads;
+        std::vector<float> q, k, v;
+        if (c.fused_qkv) {
+            // phi3: one projection produces q, k and v back to back.
+            std::vector<float> qkv =
+                matvec_view(tensor_view(prefix + "attn_qkv.weight"), h, c.hidden + 2 * kv_dim,
+                            c.hidden, "attn_qkv.L" + std::to_string(layer));
+            if (c.attn_qkv_bias) {
+                const float *b = bias_weights(prefix + "attn_qkv.bias");
+                for (uint32_t i = 0; i < c.hidden + 2 * kv_dim; ++i) qkv[i] += b[i];
+                backend_->record_control("attn_qkv_bias.L" + std::to_string(layer),
+                                         qkv.size() * sizeof(float), 0);
+            }
+            q.assign(qkv.begin(), qkv.begin() + c.hidden);
+            k.assign(qkv.begin() + c.hidden, qkv.begin() + c.hidden + kv_dim);
+            v.assign(qkv.begin() + c.hidden + kv_dim, qkv.end());
+        } else {
+            q = matvec_view(tensor_view(prefix + "attn_q.weight"), h, c.hidden, c.hidden,
+                            "attn_q.L" + std::to_string(layer));
+            k = matvec_view(tensor_view(prefix + "attn_k.weight"), h, kv_dim, c.hidden,
+                            "attn_k.L" + std::to_string(layer));
+            v = matvec_view(tensor_view(prefix + "attn_v.weight"), h, kv_dim, c.hidden,
+                            "attn_v.L" + std::to_string(layer));
+        }
+        if (c.attn_qkv_bias && !c.fused_qkv) {
+            // qwen2-style: bias is added to the projection output, before RoPE.
+            const std::string lp = "blk." + std::to_string(layer) + ".";
+            const float *bq = bias_weights(lp + "attn_q.bias");
+            const float *bk = bias_weights(lp + "attn_k.bias");
+            const float *bv = bias_weights(lp + "attn_v.bias");
+            for (uint32_t i = 0; i < c.hidden; ++i) q[i] += bq[i];
+            for (uint32_t i = 0; i < kv_dim; ++i) {
+                k[i] += bk[i];
+                v[i] += bv[i];
+            }
+            backend_->record_control("attn_bias.L" + std::to_string(layer),
+                                     (c.hidden + 2 * kv_dim) * sizeof(float), 0);
+        }
+        if (c.qk_norm) {
+            // qwen3: RMSNorm each head's q and k independently, using one shared
+            // scale vector of head_dim entries, before the rotary step.
+            const std::string lp = "blk." + std::to_string(layer) + ".";
+            const float *q_scale = norm_weights(lp + "attn_q_norm.weight");
+            const float *k_scale = norm_weights(lp + "attn_k_norm.weight");
+            auto head_norm = [&](std::vector<float> &vec, uint32_t heads, const float *scale,
+                                 const std::string &name) {
+                for (uint32_t h = 0; h < heads; ++h) {
+                    const size_t base = static_cast<size_t>(h) * c.head_dim;
+                    double ss = 0.0;
+                    for (uint32_t j = 0; j < c.head_dim; ++j)
+                        ss += static_cast<double>(vec[base + j]) * vec[base + j];
+                    const double s = 1.0 / std::sqrt(ss / c.head_dim + c.rms_eps);
+                    for (uint32_t j = 0; j < c.head_dim; ++j)
+                        vec[base + j] = static_cast<float>(vec[base + j] * s * scale[j]);
+                }
+                backend_->record_control(name, vec.size() * sizeof(float) * 2,
+                                         vec.size() * sizeof(float));
+            };
+            head_norm(q, c.heads, q_scale, "qk_norm.q.L" + std::to_string(layer));
+            head_norm(k, c.kv_heads, k_scale, "qk_norm.k.L" + std::to_string(layer));
+        }
+        rope_half(q, c.heads, k, c.kv_heads, position);
 
-        size_t current_base = (static_cast<size_t>(layer) * c.context + position) * 2 * c.hidden;
-        std::memcpy(kv_ + current_base, k.data(), static_cast<size_t>(c.hidden) * sizeof(float));
-        std::memcpy(kv_ + current_base + c.hidden, v.data(), static_cast<size_t>(c.hidden) * sizeof(float));
+        size_t current_base = (static_cast<size_t>(layer) * c.context + position) * 2 * kv_dim;
+        std::memcpy(kv_ + current_base, k.data(), static_cast<size_t>(kv_dim) * sizeof(float));
+        std::memcpy(kv_ + current_base + kv_dim, v.data(), static_cast<size_t>(kv_dim) * sizeof(float));
 
         std::vector<float> attention(c.hidden, 0.0f);
         double scale = 1.0 / std::sqrt(static_cast<double>(c.head_dim));
         for (uint32_t head = 0; head < c.heads; ++head) {
-            size_t hb = static_cast<size_t>(head) * c.head_dim;
+            const size_t hb = static_cast<size_t>(head) * c.head_dim;
+            const size_t kvb = static_cast<size_t>(head / group) * c.head_dim;
+            // gemma2/3 restrict most layers to a sliding window. The first
+            // position that is visible is max(0, position + 1 - window).
+            const uint64_t first_visible =
+                c.sliding_window == 0 || position < c.sliding_window
+                    ? 0
+                    : position + 1 - c.sliding_window;
             std::vector<double> scores(position + 1);
-            for (uint64_t t = 0; t <= position; ++t) {
-                size_t base = (static_cast<size_t>(layer) * c.context + t) * 2 * c.hidden;
-                const float *kt = kv_ + base + hb;
+            for (uint64_t t = first_visible; t <= position; ++t) {
+                size_t base = (static_cast<size_t>(layer) * c.context + t) * 2 * kv_dim;
+                const float *kt = kv_ + base + kvb;
                 double dot = 0.0;
                 for (uint32_t j = 0; j < c.head_dim; ++j)
                     dot += static_cast<double>(q[hb + j]) * kt[j];
                 scores[t] = dot * scale;
             }
-            std::vector<float> score_floats(scores.size());
-            for (size_t i = 0; i < scores.size(); ++i) score_floats[i] = static_cast<float>(scores[i]);
+            // Masked positions are excluded before the softmax rather than
+            // given zero weight afterwards, so the normalisation stays exact.
+            std::vector<float> score_floats;
+            score_floats.reserve(position + 1 - first_visible);
+            for (uint64_t t = first_visible; t <= position; ++t) {
+                double value = scores[t];
+                if (c.attn_logit_softcap > 0.0)
+                    value = c.attn_logit_softcap *
+                            std::tanh(value / c.attn_logit_softcap);
+                score_floats.push_back(static_cast<float>(value));
+            }
             std::vector<float> probs = softmax(score_floats);
             std::vector<double> acc(c.head_dim, 0.0);
-            for (uint64_t t = 0; t <= position; ++t) {
-                size_t base = (static_cast<size_t>(layer) * c.context + t) * 2 * c.hidden;
-                const float *vt = kv_ + base + c.hidden + hb;
-                double p = probs[t];
+            for (uint64_t t = first_visible; t <= position; ++t) {
+                size_t base = (static_cast<size_t>(layer) * c.context + t) * 2 * kv_dim;
+                const float *vt = kv_ + base + kv_dim + kvb;
+                double p = probs[t - first_visible];
                 for (uint32_t j = 0; j < c.head_dim; ++j) acc[j] += p * vt[j];
             }
             for (uint32_t j = 0; j < c.head_dim; ++j)
                 attention[hb + j] = static_cast<float>(acc[j]);
         }
         backend_->record_control("attention.L" + std::to_string(layer),
-                                 (position + 1) * c.hidden * 2 * sizeof(float),
+                                 (position + 1) * kv_dim * 2 * sizeof(float),
                                  c.hidden * sizeof(float));
         std::vector<float> attn_out =
             matvec_view(tensor_view(prefix + "attn_output.weight"), attention, c.hidden, c.hidden,
                         "attn_output.L" + std::to_string(layer));
+        if (c.post_norms)
+            attn_out = rmsnorm(attn_out, norm_weights(prefix + "attn_post_norm.weight"),
+                               "rmsnorm.attn_post.L" + std::to_string(layer));
         residual_add(x, attn_out, "residual.attn.L" + std::to_string(layer));
 
         h = rmsnorm(x, norm_weights(prefix + "ffn_norm.weight"),
@@ -543,7 +668,7 @@ std::vector<float> Engine::forward_token(int32_t token, uint64_t position,
                                                 c.intermediate, c.hidden,
                                                 "ffn_up.L" + std::to_string(layer));
             std::vector<float> act(c.intermediate);
-            for (uint32_t i = 0; i < c.intermediate; ++i) act[i] = silu(gate[i]) * up[i];
+            for (uint32_t i = 0; i < c.intermediate; ++i) act[i] = activate(gate[i]) * up[i];
             backend_->record_control("swiglu.L" + std::to_string(layer),
                                      (gate.size() + up.size()) * sizeof(float),
                                      act.size() * sizeof(float));
@@ -553,10 +678,23 @@ std::vector<float> Engine::forward_token(int32_t token, uint64_t position,
             std::vector<float> scores =
                 matvec_view(tensor_view(prefix + "ffn_router.weight"), h, c.expert_count, c.hidden,
                             "router.L" + std::to_string(layer));
-            std::vector<uint32_t> ids = topk(scores, c.expert_top_k);
-            std::vector<float> selected_scores(c.expert_top_k);
-            for (uint32_t i = 0; i < c.expert_top_k; ++i) selected_scores[i] = scores[ids[i]];
-            std::vector<float> selected_weights = softmax(selected_scores);
+            // Full softmax over every expert, then top-k on the probabilities.
+            // Renormalising over only the selected experts is a different
+            // function whenever top_k < expert_count, so the model's own
+            // semantics decide: normalise only when the checkpoint asks for it.
+            std::vector<float> probs = softmax(scores);
+            std::vector<uint32_t> ids = topk(probs, c.expert_top_k);
+            std::vector<float> selected_weights(c.expert_top_k);
+            float total = 0.0f;
+            for (uint32_t i = 0; i < c.expert_top_k; ++i) {
+                selected_weights[i] = probs[ids[i]];
+                total += selected_weights[i];
+            }
+            if (c.expert_weights_norm && total > 0.0f) {
+                for (float &w : selected_weights) w /= total;
+            }
+            for (float &w : selected_weights)
+                w = static_cast<float>(w * c.expert_weights_scale);
             backend_->record_control("router_topk.L" + std::to_string(layer),
                                      scores.size() * sizeof(float),
                                      ids.size() * sizeof(uint32_t));
@@ -575,8 +713,14 @@ std::vector<float> Engine::forward_token(int32_t token, uint64_t position,
                 const TensorInfo *down_info = manifest_.tensor(prefix + "ffn_down_exps.weight");
                 if (!gate_info || !up_info || !down_info)
                     fail(ErrorCode::MISSING_REQUIRED_TENSOR, "expert tensors are missing");
-                const uint64_t gate_bytes = gate_info->byte_size / c.expert_count;
-                const uint64_t up_bytes = up_info->byte_size / c.expert_count;
+                // Per-projection strides differ when the projections use
+                // different quantisation types, so the offsets come from the
+                // manifest's extents rather than from one shared stride.
+                const ExpertRecord *record = manifest_.expert(layer, expert);
+                const uint64_t gate_bytes =
+                    record ? record->extents[0].bytes : gate_info->byte_size / c.expert_count;
+                const uint64_t up_bytes =
+                    record ? record->extents[1].bytes : up_info->byte_size / c.expert_count;
                 residency_->with_expert(layer, expert, position, [&](const float *expert_data) {
                     const uint8_t *base = reinterpret_cast<const uint8_t *>(expert_data);
                     TensorView gate_view{base, gate_info->type_id};
@@ -604,12 +748,22 @@ std::vector<float> Engine::forward_token(int32_t token, uint64_t position,
                                      ids.size() * c.hidden * sizeof(float),
                                      c.hidden * sizeof(float));
         }
+        if (c.post_norms)
+            ffn = rmsnorm(ffn, norm_weights(prefix + "ffn_post_norm.weight"),
+                          "rmsnorm.ffn_post.L" + std::to_string(layer));
         residual_add(x, ffn, "residual.ffn.L" + std::to_string(layer));
     }
 
     std::vector<float> final_norm = rmsnorm(x, norm_weights("output_norm.weight"), "rmsnorm.final");
     std::vector<float> logits = matvec_view(tensor_view("output.weight"), final_norm, c.vocab,
                                             c.hidden, "output_head");
+    if (c.final_logit_softcap > 0.0) {
+        for (float &v : logits)
+            v = static_cast<float>(c.final_logit_softcap *
+                                   std::tanh(static_cast<double>(v) / c.final_logit_softcap));
+        backend_->record_control("logit_softcap", logits.size() * sizeof(float),
+                                 logits.size() * sizeof(float));
+    }
     return logits;
 }
 

@@ -78,6 +78,19 @@ enum class TensorRole : uint32_t {
     FFN_GATE_EXPS,
     FFN_UP_EXPS,
     FFN_DOWN_EXPS,
+    // Optional per-projection biases. qwen2 and several descendants carry them.
+    ATTN_Q_BIAS,
+    ATTN_K_BIAS,
+    ATTN_V_BIAS,
+    ATTN_OUTPUT_BIAS,
+    // Per-head RMSNorm on q/k, which qwen3 applies before RoPE.
+    ATTN_Q_NORM,
+    ATTN_K_NORM,
+    ATTN_POST_NORM,
+    FFN_POST_NORM,
+    // Fused query/key/value projection (phi3).
+    ATTN_QKV,
+    ATTN_QKV_BIAS,
 };
 
 const char *tensor_role_name(TensorRole role);
@@ -90,11 +103,26 @@ struct TensorInfo {
     uint64_t relative_offset = 0;
     uint64_t absolute_offset = 0;
     uint64_t byte_size = 0;
+    // Canonical name the engine addresses this tensor by. Equals `name` for
+    // files that already use canonical names; adapters may map a vendor name
+    // onto it while `name` keeps the original.
+    std::string canonical;
     uint32_t block_size = 1;
     uint32_t block_bytes = 4;
+    // False when the container declares a type this build has no geometry for.
+    // The tensor is still bounded (from offsets) but cannot be decoded.
+    bool type_known = true;
+    bool byte_size_derived = false;
     TensorRole role = TensorRole::UNKNOWN;
     int layer = -1;
     bool expert_tensor = false;
+
+    // Number of scalar elements the tensor holds.
+    uint64_t element_count() const {
+        uint64_t n = 1;
+        for (uint64_t d : dims) n *= d;
+        return n;
+    }
 };
 
 struct GGUFDocument {
@@ -128,10 +156,36 @@ struct ModelConfig {
     uint32_t heads = 0;
     uint32_t kv_heads = 0;
     uint32_t head_dim = 0;
+    // Rotary dimensions actually rotated; 0 means "whole head".
+    uint32_t rope_dim = 0;
     uint32_t vocab = 0;
     uint32_t context = 0;
     uint32_t expert_count = 0;
     uint32_t expert_top_k = 0;
+    // Routing semantics, straight from the checkpoint. Renormalising over the
+    // selected experts is only equivalent to a full softmax when every expert is
+    // selected, so these cannot be assumed.
+    bool expert_weights_norm = false;
+    double expert_weights_scale = 1.0;
+    // Attention projections carry biases (qwen2 family).
+    bool attn_qkv_bias = false;
+    // Q and K are normalised per head before RoPE (qwen3 family).
+    bool qk_norm = false;
+    // gemma scales the token embeddings by sqrt(hidden) before the first block.
+    bool embedding_scale = false;
+    // gemma stores RMSNorm scales zero-centred: the effective scale is 1 + w.
+    bool norm_add_one = false;
+    // "silu" (SwiGLU) or "gelu" (GeGLU). The two are not interchangeable.
+    std::string activation = "silu";
+    // gemma2/3 clamp attention scores and/or final logits through tanh.
+    double attn_logit_softcap = 0.0;
+    double final_logit_softcap = 0.0;
+    // gemma2/3 apply an extra RMSNorm after attention and after the FFN.
+    bool post_norms = false;
+    // gemma2/3 restrict most layers to a sliding attention window.
+    uint32_t sliding_window = 0;
+    // phi3 fuses q, k and v into one projection (and one optional bias).
+    bool fused_qkv = false;
     uint32_t bos_id = 0;
     uint32_t eos_id = 0;
     double rms_eps = 0.0;
@@ -150,6 +204,10 @@ struct ExpertRecord {
     uint32_t expert = 0;
     uint64_t payload_bytes = 0;
     uint64_t checksum = 0;
+    // False for checkpoints that carry no checksum manifest (every vendor file).
+    // The loader then verifies only that the bytes it read are the bytes it
+    // asked for, and reports that source checksums were unavailable.
+    bool checksum_known = false;
     std::array<ExpertExtent, 3> extents{};
 };
 
@@ -159,14 +217,23 @@ struct ModelManifest {
     std::string source_path;
     std::vector<std::string> tokenizer_tokens;
     std::vector<ExpertRecord> experts;
+    // Canonical name -> real canonical name, for tensors the model shares.
+    // Tied embeddings are the common case: `output.weight` is the token table.
+    std::map<std::string, std::string> alias;
     std::map<uint64_t, size_t> expert_index;
     uint64_t fixed_weight_bytes = 0;
     uint64_t expert_tensor_bytes = 0;
     uint64_t slot_bytes = 0;
 
+    // Looks up by real name first, then by canonical name. Adapters may rename
+    // a vendor tensor (ffn_gate_inp -> ffn_router) while `doc` keeps the
+    // original name, so both must be addressable.
     const TensorInfo *tensor(const std::string &name) const {
         auto it = doc.tensor_by_name.find(name);
-        return it == doc.tensor_by_name.end() ? nullptr : &doc.tensors[it->second];
+        if (it != doc.tensor_by_name.end()) return &doc.tensors[it->second];
+        for (const auto &candidate : doc.tensors)
+            if (candidate.canonical == name) return &candidate;
+        return nullptr;
     }
     const ExpertRecord *expert(uint32_t layer, uint32_t id) const {
         auto it = expert_index.find(expert_key(layer, id));

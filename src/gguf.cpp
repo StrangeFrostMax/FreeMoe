@@ -69,6 +69,12 @@ const std::map<uint32_t, QuantGeometry> &quantisation_table() {
         {13, {256, 176, "Q5_K"}},
         {14, {256, 210, "Q6_K"}},
         {15, {256, 292, "Q8_K"}},
+        {20, {32, 18, "IQ4_NL"}},
+        {24, {1, 1, "I8"}},
+        {25, {1, 2, "I16"}},
+        {26, {1, 4, "I32"}},
+        {27, {1, 8, "I64"}},
+        {28, {1, 8, "F64"}},
         {30, {1, 2, "BF16"}},
     };
     return table;
@@ -93,6 +99,16 @@ const char *tensor_role_name(TensorRole role) {
     case TensorRole::FFN_GATE_EXPS: return "FFN_GATE_EXPS";
     case TensorRole::FFN_UP_EXPS: return "FFN_UP_EXPS";
     case TensorRole::FFN_DOWN_EXPS: return "FFN_DOWN_EXPS";
+    case TensorRole::ATTN_Q_BIAS: return "ATTN_Q_BIAS";
+    case TensorRole::ATTN_K_BIAS: return "ATTN_K_BIAS";
+    case TensorRole::ATTN_V_BIAS: return "ATTN_V_BIAS";
+    case TensorRole::ATTN_OUTPUT_BIAS: return "ATTN_OUTPUT_BIAS";
+    case TensorRole::ATTN_Q_NORM: return "ATTN_Q_NORM";
+    case TensorRole::ATTN_K_NORM: return "ATTN_K_NORM";
+    case TensorRole::ATTN_POST_NORM: return "ATTN_POST_NORM";
+    case TensorRole::FFN_POST_NORM: return "FFN_POST_NORM";
+    case TensorRole::ATTN_QKV: return "ATTN_QKV";
+    case TensorRole::ATTN_QKV_BIAS: return "ATTN_QKV_BIAS";
     }
     return "UNKNOWN";
 }
@@ -323,6 +339,16 @@ TensorRole role_from_name(const std::string &name, uint32_t &layer) {
         {"ffn_gate_exps.weight", TensorRole::FFN_GATE_EXPS},
         {"ffn_up_exps.weight", TensorRole::FFN_UP_EXPS},
         {"ffn_down_exps.weight", TensorRole::FFN_DOWN_EXPS},
+        {"attn_q.bias", TensorRole::ATTN_Q_BIAS},
+        {"attn_k.bias", TensorRole::ATTN_K_BIAS},
+        {"attn_v.bias", TensorRole::ATTN_V_BIAS},
+        {"attn_output.bias", TensorRole::ATTN_OUTPUT_BIAS},
+        {"attn_q_norm.weight", TensorRole::ATTN_Q_NORM},
+        {"attn_k_norm.weight", TensorRole::ATTN_K_NORM},
+        {"attn_post_norm.weight", TensorRole::ATTN_POST_NORM},
+        {"ffn_post_norm.weight", TensorRole::FFN_POST_NORM},
+        {"attn_qkv.weight", TensorRole::ATTN_QKV},
+        {"attn_qkv.bias", TensorRole::ATTN_QKV_BIAS},
     };
     for (const auto &entry : suffixes)
         if (parse_layer_suffix(name, entry.first, layer)) return entry.second;
@@ -394,15 +420,25 @@ GGUFDocument parse_gguf(const uint8_t *data, size_t size) {
         }
         t.type_id = c.u32("tensor quantisation type");
         auto qit = qtable.find(t.type_id);
-        if (qit == qtable.end())
-            fail(ErrorCode::MALFORMED_GGUF, "unknown quantisation type " + std::to_string(t.type_id) + " in " + t.name);
-        t.block_size = qit->second.block_size;
-        t.block_bytes = qit->second.block_bytes;
-        t.type_name = qit->second.name;
-        if (t.dims[0] % t.block_size != 0)
-            fail(ErrorCode::MALFORMED_GGUF, "ne0 is not a whole number of blocks in " + t.name);
-        uint64_t blocks = elements / t.block_size;
-        t.byte_size = checked_mul(blocks, t.block_bytes, "tensor " + t.name + " byte count");
+        if (qit == qtable.end()) {
+            // An unknown type is reported, not fatal. The container stays
+            // inspectable so `freemoe probe` can name the exact blocker; the
+            // byte range is recovered from the neighbouring offsets instead of
+            // being guessed from a geometry we do not have.
+            t.block_size = 0;
+            t.block_bytes = 0;
+            t.type_name = "TYPE_" + std::to_string(t.type_id);
+            t.type_known = false;
+        } else {
+            t.block_size = qit->second.block_size;
+            t.block_bytes = qit->second.block_bytes;
+            t.type_name = qit->second.name;
+            if (t.dims[0] % t.block_size != 0)
+                fail(ErrorCode::MALFORMED_GGUF, "ne0 is not a whole number of blocks in " + t.name);
+            uint64_t blocks = elements / t.block_size;
+            t.byte_size = checked_mul(blocks, t.block_bytes, "tensor " + t.name + " byte count");
+            t.type_known = true;
+        }
         t.relative_offset = c.u64("tensor offset");
         if (t.relative_offset % alignment != 0)
             fail(ErrorCode::MALFORMED_GGUF, "misaligned tensor offset for " + t.name);
@@ -417,6 +453,33 @@ GGUFDocument parse_gguf(const uint8_t *data, size_t size) {
     doc.data_offset = align_up(c.pos, alignment);
     if (doc.data_offset > size)
         fail(ErrorCode::MALFORMED_GGUF, "data section starts beyond file end");
+
+    // Recover byte ranges for tensors whose type has no geometry. Offsets are
+    // the only trustworthy source: they are authoritative in the container, so
+    // a gap between neighbours is this tensor's extent. A geometry we do not
+    // implement must never cause a guessed size.
+    {
+        std::vector<size_t> order;
+        order.reserve(doc.tensors.size());
+        for (size_t i = 0; i < doc.tensors.size(); ++i) order.push_back(i);
+        std::sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+            return doc.tensors[a].relative_offset < doc.tensors[b].relative_offset;
+        });
+        for (size_t k = 0; k < order.size(); ++k) {
+            TensorInfo &tensor = doc.tensors[order[k]];
+            if (tensor.type_known) continue;
+            const uint64_t begin = tensor.relative_offset;
+            const uint64_t end = (k + 1 < order.size())
+                                     ? doc.tensors[order[k + 1]].relative_offset
+                                     : (size > doc.data_offset ? size - doc.data_offset : 0);
+            if (end <= begin)
+                fail(ErrorCode::MALFORMED_GGUF,
+                     "cannot bound unknown-type tensor " + tensor.name);
+            tensor.byte_size = end - begin;
+            tensor.byte_size_derived = true;
+        }
+    }
+
     for (auto &tensor : doc.tensors) {
         tensor.absolute_offset = checked_add(doc.data_offset, tensor.relative_offset,
                                              "tensor " + tensor.name + " offset");
@@ -445,6 +508,94 @@ GGUFDocument parse_gguf_file(const std::string &path) {
 // ---------------------------------------------------------------------------
 
 namespace {
+
+// Optional metadata lookup: returns false instead of failing when absent.
+bool opt_metadata(const GGUFDocument &doc, const std::string &key, MetadataValue *out) {
+    auto it = doc.metadata.find(key);
+    if (it == doc.metadata.end()) return false;
+    if (out) *out = it->second;
+    return true;
+}
+
+// Reads an integer under the GGUF convention `<arch>.<name>`, then the bare
+// `name`. Vendor files use the prefixed form; our own fixtures use `freemoe.`.
+bool opt_u64(const GGUFDocument &doc, const std::set<std::string> &keys, uint64_t *out) {
+    for (const auto &key : keys) {
+        MetadataValue value;
+        if (!opt_metadata(doc, key, &value)) continue;
+        switch (value.type) {
+        case GGUFValueType::UINT8: case GGUFValueType::UINT16:
+        case GGUFValueType::UINT32: case GGUFValueType::UINT64:
+            *out = value.u;
+            return true;
+        case GGUFValueType::INT8: case GGUFValueType::INT16:
+        case GGUFValueType::INT32: case GGUFValueType::INT64:
+            if (value.i < 0) return false;
+            *out = static_cast<uint64_t>(value.i);
+            return true;
+        case GGUFValueType::FLOAT32: case GGUFValueType::FLOAT64:
+            *out = static_cast<uint64_t>(value.as_double());
+            return true;
+        default:
+            return false;
+        }
+    }
+    return false;
+}
+
+bool opt_bool(const GGUFDocument &doc, const std::set<std::string> &keys, bool *out) {
+    for (const auto &key : keys) {
+        auto it = doc.metadata.find(key);
+        if (it == doc.metadata.end()) continue;
+        if (it->second.type != GGUFValueType::BOOL) continue;
+        *out = it->second.b;
+        return true;
+    }
+    return false;
+}
+
+bool opt_double(const GGUFDocument &doc, const std::set<std::string> &keys, double *out) {
+    for (const auto &key : keys) {
+        MetadataValue value;
+        if (!opt_metadata(doc, key, &value)) continue;
+        if (value.type == GGUFValueType::FLOAT32 || value.type == GGUFValueType::FLOAT64) {
+            *out = value.as_double();
+            return true;
+        }
+        if (value.type == GGUFValueType::UINT32 || value.type == GGUFValueType::UINT64) {
+            *out = static_cast<double>(value.u);
+            return true;
+        }
+        if (value.type == GGUFValueType::INT32 || value.type == GGUFValueType::INT64) {
+            *out = static_cast<double>(value.i);
+            return true;
+        }
+    }
+    return false;
+}
+
+bool opt_string(const GGUFDocument &doc, const std::set<std::string> &keys, std::string *out) {
+    for (const auto &key : keys) {
+        MetadataValue value;
+        if (!opt_metadata(doc, key, &value)) continue;
+        if (value.type != GGUFValueType::STRING) continue;
+        *out = value.s;
+        return true;
+    }
+    return false;
+}
+
+// Which architectures this build can map. Everything here shares the same
+// pre-norm block structure and llama.cpp tensor naming; the differences are
+// handled by per-architecture flags below rather than by separate code paths.
+bool is_llama_family(const std::string &arch) {
+    static const std::set<std::string> family = {
+        "llama", "qwen2", "qwen3", "smollm", "smollm2", "tinyllama",
+        "gemma", "gemma2", "gemma3", "phi3",
+    };
+    return family.count(arch) != 0;
+}
+
 
 const MetadataValue &require_metadata(const GGUFDocument &doc, const std::string &key) {
     auto it = doc.metadata.find(key);
@@ -485,7 +636,436 @@ std::string layer_name(uint32_t layer, const std::string &suffix) {
 
 } // namespace
 
+// Maps a llama.cpp-family checkpoint onto the engine's canonical tensor names.
+//
+// The block structure is the same as the reference adapter (pre-norm RMSNorm,
+// RoPE, SwiGLU, optional top-k MoE), so the forward pass is shared. What differs
+// is the metadata vocabulary (`llama.block_count` vs `freemoe.num_hidden_layers`),
+// the router tensor name, and the fact that vendor files carry no expert
+// checksums. Each of those is handled explicitly rather than by guessing.
+ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &source_path,
+                                   const std::string &arch) {
+    ModelManifest m;
+    m.doc = doc;
+    m.source_path = source_path;
+    ModelConfig &cfg = m.config;
+
+    auto keys = [&arch](const std::string &name) {
+        return std::set<std::string>{arch + "." + name, "freemoe." + name, name};
+    };
+
+    cfg.architecture = arch;
+    cfg.adapter = "llama-family-v1";
+    cfg.model_kind = "dense";
+    cfg.rope_mode = "half";
+    cfg.router_operation = "linear-topk-softmax-v1";
+    cfg.expert_layout = "stacked-f32";
+
+    uint64_t value = 0;
+    auto require_key = [&](const std::string &name, const std::string &what) -> uint64_t {
+        if (!opt_u64(doc, keys(name), &value))
+            fail(ErrorCode::METADATA_MISMATCH,
+                 "missing required " + what + " metadata (" + arch + "." + name + ")");
+        return value;
+    };
+
+    cfg.layers = static_cast<uint32_t>(require_key("block_count", "layer count"));
+    cfg.hidden = static_cast<uint32_t>(require_key("embedding_length", "embedding length"));
+    cfg.intermediate =
+        static_cast<uint32_t>(require_key("feed_forward_length", "feed-forward length"));
+    cfg.heads = static_cast<uint32_t>(require_key("attention.head_count", "attention head count"));
+    uint64_t kv_heads = 0;
+    if (!opt_u64(doc, keys("attention.head_count_kv"), &kv_heads)) kv_heads = cfg.heads;
+    cfg.kv_heads = static_cast<uint32_t>(kv_heads);
+    uint64_t head_dim = 0;
+    if (!opt_u64(doc, keys("attention.key_length"), &head_dim)) {
+        if (cfg.heads == 0 || cfg.hidden % cfg.heads != 0)
+            fail(ErrorCode::SHAPE_MISMATCH, "cannot derive head dimension from embedding length");
+        head_dim = cfg.hidden / cfg.heads;
+    }
+    cfg.head_dim = static_cast<uint32_t>(head_dim);
+    uint64_t rope_dim = 0;
+    if (opt_u64(doc, keys("rope.dimension_count"), &rope_dim))
+        cfg.rope_dim = static_cast<uint32_t>(rope_dim);
+    uint64_t vocab = 0;
+    if (!opt_u64(doc, keys("vocab_size"), &vocab)) {
+        MetadataValue tokens;
+        if (!opt_metadata(doc, "tokenizer.ggml.tokens", &tokens) || !tokens.is_array())
+            fail(ErrorCode::INVALID_TOKENIZER, "no vocabulary size and no token table");
+        vocab = tokens.array.size();
+    }
+    cfg.vocab = static_cast<uint32_t>(vocab);
+    cfg.context = static_cast<uint32_t>(require_key("context_length", "context length"));
+    if (!opt_u64(doc, keys("expert_count"), &value)) value = 0;
+    cfg.expert_count = static_cast<uint32_t>(value);
+    uint64_t top_k = 0;
+    if (!opt_u64(doc, keys("expert_used_count"), &top_k)) top_k = 0;
+    cfg.expert_top_k = static_cast<uint32_t>(top_k);
+    if (cfg.expert_count != 0) {
+        opt_bool(doc, keys("expert_weights_norm"), &cfg.expert_weights_norm);
+        opt_double(doc, keys("expert_weights_scale"), &cfg.expert_weights_scale);
+        if (!(cfg.expert_weights_scale > 0.0))
+            fail(ErrorCode::METADATA_MISMATCH, "expert_weights_scale must be positive");
+    }
+    uint64_t shared = 0;
+    if (opt_u64(doc, keys("expert_shared_count"), &shared)) cfg.shared_expert = shared > 0;
+    cfg.model_kind = cfg.expert_count > 0 ? "moe" : "dense";
+
+    // --- family semantics ---------------------------------------------------
+    // These change the arithmetic, not just the vocabulary, so each is stated
+    // explicitly and validated rather than inferred from whatever tensors
+    // happen to be present.
+    if (arch == "gemma" || arch == "gemma2" || arch == "gemma3") {
+        // gemma scales embeddings by sqrt(n_embd), stores norm scales
+        // zero-centred, and uses GeGLU instead of SwiGLU.
+        cfg.embedding_scale = true;
+        cfg.norm_add_one = true;
+        cfg.activation = "gelu";
+    }
+    double number = 0.0;
+    if (arch == "gemma2" || arch == "gemma3") {
+        cfg.post_norms = true;
+        if (opt_double(doc, keys("attn_logit_softcapping"), &number)) {
+            if (!(number > 0.0))
+                fail(ErrorCode::METADATA_MISMATCH, "attn_logit_softcapping must be positive");
+            cfg.attn_logit_softcap = number;
+        }
+        if (opt_double(doc, keys("final_logit_softcapping"), &number)) {
+            if (!(number > 0.0))
+                fail(ErrorCode::METADATA_MISMATCH, "final_logit_softcapping must be positive");
+            cfg.final_logit_softcap = number;
+        }
+        uint64_t window = 0;
+        if (opt_u64(doc, keys("attention.sliding_window"), &window))
+            cfg.sliding_window = static_cast<uint32_t>(window);
+        if (cfg.sliding_window != 0 && cfg.sliding_window >= cfg.context)
+            // A window at least as wide as the context cannot change anything,
+            // so treating it as "no window" is exact rather than approximate.
+            cfg.sliding_window = 0;
+    }
+    if (cfg.activation != "silu" && cfg.activation != "gelu")
+        fail(ErrorCode::METADATA_MISMATCH, "unsupported activation " + cfg.activation);
+
+    if (opt_double(doc, keys("attention.layer_norm_rms_epsilon"), &number)) cfg.rms_eps = number;
+    else cfg.rms_eps = 1e-5;
+    if (opt_double(doc, keys("rope.freq_base"), &number)) cfg.rope_theta = number;
+    else if (opt_double(doc, keys("rope_theta"), &number)) cfg.rope_theta = number;
+    else cfg.rope_theta = 10000.0;
+
+    cfg.bos_id = 1;
+    cfg.eos_id = 2;
+    if (opt_u64(doc, {"tokenizer.ggml.bos_token_id"}, &value))
+        cfg.bos_id = static_cast<uint32_t>(value);
+    if (opt_u64(doc, {"tokenizer.ggml.eos_token_id"}, &value))
+        cfg.eos_id = static_cast<uint32_t>(value);
+
+    std::string tokenizer;
+    if (!opt_string(doc, {"tokenizer.ggml.model"}, &tokenizer) || tokenizer.empty())
+        fail(ErrorCode::INVALID_TOKENIZER, "checkpoint carries no tokenizer model");
+    cfg.tokenizer_model = tokenizer;
+    std::string chat_template;
+    if (opt_string(doc, {"tokenizer.chat_template"}, &chat_template))
+        cfg.chat_template = chat_template;
+
+    // --- semantic checks that must fail closed rather than be approximated ---
+    if (cfg.heads == 0 || cfg.kv_heads == 0 || cfg.head_dim == 0 ||
+        cfg.heads % cfg.kv_heads != 0 || cfg.kv_heads > cfg.heads)
+        fail(ErrorCode::SHAPE_MISMATCH, "grouped-query head counts are inconsistent");
+    if (static_cast<uint64_t>(cfg.heads) * cfg.head_dim != cfg.hidden)
+        fail(ErrorCode::SHAPE_MISMATCH,
+             "attention head count times head dimension does not equal embedding length");
+    if (cfg.rope_dim != 0 && (cfg.rope_dim % 2 != 0 || cfg.rope_dim > cfg.head_dim))
+        fail(ErrorCode::SHAPE_MISMATCH, "rotary dimension is invalid");
+    if (cfg.shared_expert)
+        fail(ErrorCode::METADATA_MISMATCH,
+             "shared-expert checkpoints are not implemented; refusing rather than dropping it");
+    auto reject = [&](const char *metadata_key, const char *what) {
+        MetadataValue v;
+        if (opt_metadata(doc, arch + "." + metadata_key, &v) && v.as_bool())
+            fail(ErrorCode::NOT_IMPLEMENTED, std::string(what) + " is not implemented");
+    };
+    // phi3 stores one fused q/k/v projection instead of three. Detect it from
+    // the tensors, because the metadata does not say either way.
+    {
+        const bool fused = doc.tensor_by_name.count(layer_name(0, "attn_qkv.weight")) != 0;
+        const bool split = doc.tensor_by_name.count(layer_name(0, "attn_q.weight")) != 0;
+        if (fused && split)
+            fail(ErrorCode::METADATA_MISMATCH,
+                 "checkpoint carries both a fused attn_qkv and split q/k/v projections");
+        if (!fused && !split)
+            fail(ErrorCode::MISSING_REQUIRED_TENSOR,
+                 "no attention projection found (neither attn_qkv nor attn_q)");
+        cfg.fused_qkv = fused;
+    }
+
+    // qwen2 and its descendants add a bias to the query/key/value projections.
+    // The checkpoint says so with `attention.qkv_bias`, and the bias tensors
+    // must then exist: a declared-but-absent bias would silently change the
+    // maths, so the two are cross-checked rather than trusted.
+    {
+        MetadataValue declared;
+        bool wants_bias = false;
+        if (opt_metadata(doc, arch + ".attention.qkv_bias", &declared)) wants_bias = declared.as_bool();
+        const bool has_bias_tensors =
+            cfg.fused_qkv ? doc.tensor_by_name.count(layer_name(0, "attn_qkv.bias")) != 0
+                          : doc.tensor_by_name.count(layer_name(0, "attn_q.bias")) != 0;
+        if (wants_bias && !has_bias_tensors)
+            fail(ErrorCode::MISSING_REQUIRED_TENSOR,
+                 arch + ".attention.qkv_bias is set but blk.0.attn_q.bias is absent");
+        if (has_bias_tensors && !wants_bias && doc.metadata.count(arch + ".attention.qkv_bias"))
+            fail(ErrorCode::METADATA_MISMATCH,
+                 "attention bias tensors are present but " + arch +
+                     ".attention.qkv_bias is false");
+        cfg.attn_qkv_bias = has_bias_tensors;
+    }
+    reject("attention.o_bias", "attention output bias");
+    // qwen3 normalises q and k per head before RoPE. The tensors are the only
+    // evidence a file uses it, so presence drives the decision and the shape is
+    // then validated: the scale is one head's worth, shared by every head.
+    {
+        const bool has_q_norm = doc.tensor_by_name.count(layer_name(0, "attn_q_norm.weight")) != 0;
+        const bool has_k_norm = doc.tensor_by_name.count(layer_name(0, "attn_k_norm.weight")) != 0;
+        if (has_q_norm != has_k_norm)
+            fail(ErrorCode::MISSING_REQUIRED_TENSOR,
+                 "q/k normalisation must be present on both q and k, not just one");
+        cfg.qk_norm = has_q_norm;
+    }
+
+    if (cfg.hidden > 65536 || cfg.layers > 1024 || cfg.heads > 4096 || cfg.head_dim > 1024 ||
+        cfg.vocab > (1u << 20) || cfg.context > (1u << 20) || cfg.expert_count > 4096 ||
+        (cfg.expert_count && cfg.expert_top_k > cfg.expert_count))
+        fail(ErrorCode::SHAPE_MISMATCH, "model dimension exceeds adapter safety bounds");
+
+    // --- canonical tensor map ------------------------------------------------
+    // `name` keeps the bytes' real identity; `canonical` is what the engine
+    // addresses. Only the router is renamed, because llama.cpp stores the
+    // gate in `ffn_gate_inp` while the reference adapter calls it `ffn_router`.
+    std::set<std::string> expected;
+    auto expect = [&](const std::string &name) { expected.insert(name); };
+    expect("token_embd.weight");
+    expect("output_norm.weight");
+    // A checkpoint without `output.weight` ties the output projection to the
+    // token table. That is a supported layout, not a missing tensor: the maths
+    // is identical, so it is aliased rather than duplicated.
+    const bool tied_output = m.doc.tensor_by_name.count("output.weight") == 0;
+    if (tied_output) m.alias["output.weight"] = "token_embd.weight";
+    else expect("output.weight");
+    for (uint32_t l = 0; l < cfg.layers; ++l) {
+        for (const char *suffix : {"attn_norm.weight", "attn_output.weight", "ffn_norm.weight"})
+            expect(layer_name(l, suffix));
+        if (cfg.fused_qkv) {
+            expect(layer_name(l, "attn_qkv.weight"));
+        } else {
+            for (const char *suffix : {"attn_q.weight", "attn_k.weight", "attn_v.weight"})
+                expect(layer_name(l, suffix));
+        }
+        if (cfg.attn_qkv_bias) {
+            if (cfg.fused_qkv) {
+                expect(layer_name(l, "attn_qkv.bias"));
+            } else {
+                for (const char *suffix : {"attn_q.bias", "attn_k.bias", "attn_v.bias"})
+                    expect(layer_name(l, suffix));
+            }
+        }
+        if (cfg.qk_norm)
+            for (const char *suffix : {"attn_q_norm.weight", "attn_k_norm.weight"})
+                expect(layer_name(l, suffix));
+        if (cfg.post_norms)
+            for (const char *suffix : {"attn_post_norm.weight", "ffn_post_norm.weight"})
+                expect(layer_name(l, suffix));
+        if (cfg.expert_count) {
+            for (const char *suffix : {"ffn_gate_inp.weight", "ffn_gate_exps.weight",
+                                       "ffn_up_exps.weight", "ffn_down_exps.weight"})
+                expect(layer_name(l, suffix));
+        } else {
+            for (const char *suffix : {"ffn_gate.weight", "ffn_up.weight", "ffn_down.weight"})
+                expect(layer_name(l, suffix));
+        }
+    }
+    for (auto &tensor : m.doc.tensors) {
+        if (!expected.count(tensor.name))
+            fail(ErrorCode::UNKNOWN_TENSOR,
+                 "tensor " + tensor.name + " has no mapping in the " + arch + " adapter");
+        if (!tensor.type_known)
+            fail(ErrorCode::UNSUPPORTED_QUANTISATION,
+                 "tensor " + tensor.name + " uses type " + std::to_string(tensor.type_id) +
+                     ", which this build cannot decode");
+        if (!tensor_capability(tensor.type_id).execute)
+            fail(ErrorCode::UNSUPPORTED_QUANTISATION,
+                 "tensor " + tensor.name + " uses type " + tensor.type_name +
+                     ", which has no execution kernel");
+        uint32_t layer = 0;
+        TensorRole role = role_from_name(tensor.name, layer);
+        if (role == TensorRole::UNKNOWN && parse_layer_suffix(tensor.name, "ffn_gate_inp.weight", layer))
+            role = TensorRole::FFN_ROUTER;
+        if (role == TensorRole::UNKNOWN)
+            fail(ErrorCode::UNKNOWN_TENSOR, "cannot map tensor role for " + tensor.name);
+        tensor.role = role;
+        const bool global_role = role == TensorRole::TOKEN_EMBD || role == TensorRole::OUTPUT ||
+                                 role == TensorRole::OUTPUT_NORM;
+        tensor.layer = global_role ? -1 : static_cast<int>(layer);
+        tensor.canonical = role == TensorRole::FFN_ROUTER
+                               ? layer_name(layer, "ffn_router.weight")
+                               : tensor.name;
+    }
+
+    // Every expected tensor must be present: a partially mapped model would
+    // silently change the forward pass.
+    for (const auto &name : expected) {
+        if (!m.doc.tensor_by_name.count(name))
+            fail(ErrorCode::MISSING_REQUIRED_TENSOR, "missing required tensor " + name);
+    }
+    if (tied_output) {
+        // The token table must have the output projection's shape.
+        const TensorInfo &embd = *m.tensor("token_embd.weight");
+        if (embd.dims.size() != 2 || embd.dims[0] != cfg.hidden)
+            fail(ErrorCode::SHAPE_MISMATCH,
+                 "tied output requires token_embd.weight to be [hidden, vocab]");
+    }
+
+    // --- shape validation against the declared hyperparameters ---------------
+    auto dims_of = [&](const std::string &name) -> const std::vector<uint64_t> & {
+        return m.doc.tensors[m.doc.tensor_by_name.at(name)].dims;
+    };
+    const uint64_t kv_dim = static_cast<uint64_t>(cfg.kv_heads) * cfg.head_dim;
+    expect_dims(*m.tensor("token_embd.weight"), {cfg.hidden, cfg.vocab});
+    if (const TensorInfo *t = m.tensor("output.weight"))
+        expect_dims(*t, {cfg.hidden, cfg.vocab});
+    expect_dims(*m.tensor("output_norm.weight"), {cfg.hidden});
+    for (uint32_t l = 0; l < cfg.layers; ++l) {
+        expect_dims(*m.tensor(layer_name(l, "attn_norm.weight")), {cfg.hidden});
+        expect_dims(*m.tensor(layer_name(l, "ffn_norm.weight")), {cfg.hidden});
+        if (cfg.fused_qkv) {
+            // The fused projection holds q, then k, then v along its output axis.
+            expect_dims(*m.tensor(layer_name(l, "attn_qkv.weight")),
+                        {cfg.hidden, cfg.hidden + 2 * kv_dim});
+        } else {
+            expect_dims(*m.tensor(layer_name(l, "attn_q.weight")), {cfg.hidden, cfg.hidden});
+            expect_dims(*m.tensor(layer_name(l, "attn_k.weight")), {cfg.hidden, kv_dim});
+            expect_dims(*m.tensor(layer_name(l, "attn_v.weight")), {cfg.hidden, kv_dim});
+        }
+        expect_dims(*m.tensor(layer_name(l, "attn_output.weight")), {cfg.hidden, cfg.hidden});
+        if (cfg.post_norms) {
+            expect_dims(*m.tensor(layer_name(l, "attn_post_norm.weight")), {cfg.hidden});
+            expect_dims(*m.tensor(layer_name(l, "ffn_post_norm.weight")), {cfg.hidden});
+        }
+        if (cfg.qk_norm) {
+            expect_dims(*m.tensor(layer_name(l, "attn_q_norm.weight")), {cfg.head_dim});
+            expect_dims(*m.tensor(layer_name(l, "attn_k_norm.weight")), {cfg.head_dim});
+        }
+        if (cfg.attn_qkv_bias) {
+            if (cfg.fused_qkv) {
+                expect_dims(*m.tensor(layer_name(l, "attn_qkv.bias")),
+                            {cfg.hidden + 2 * kv_dim});
+            } else {
+                expect_dims(*m.tensor(layer_name(l, "attn_q.bias")), {cfg.hidden});
+                expect_dims(*m.tensor(layer_name(l, "attn_k.bias")), {kv_dim});
+                expect_dims(*m.tensor(layer_name(l, "attn_v.bias")), {kv_dim});
+            }
+        }
+        if (cfg.expert_count) {
+            expect_dims(*m.tensor(layer_name(l, "ffn_gate_inp.weight")),
+                        {cfg.hidden, cfg.expert_count});
+            for (const char *suffix : {"ffn_gate_exps.weight", "ffn_up_exps.weight"})
+                expect_dims(*m.tensor(layer_name(l, suffix)),
+                            {cfg.hidden, cfg.intermediate, cfg.expert_count});
+            expect_dims(*m.tensor(layer_name(l, "ffn_down_exps.weight")),
+                        {cfg.intermediate, cfg.hidden, cfg.expert_count});
+        } else {
+            for (const char *suffix : {"ffn_gate.weight", "ffn_up.weight"})
+                expect_dims(*m.tensor(layer_name(l, suffix)), {cfg.hidden, cfg.intermediate});
+            expect_dims(*m.tensor(layer_name(l, "ffn_down.weight")),
+                        {cfg.intermediate, cfg.hidden});
+        }
+    }
+    (void)dims_of;
+
+    // --- token table ---------------------------------------------------------
+    MetadataValue tokens;
+    if (!opt_metadata(doc, "tokenizer.ggml.tokens", &tokens) || !tokens.is_array())
+        fail(ErrorCode::INVALID_TOKENIZER, "checkpoint carries no token table");
+    if (tokens.array.size() != cfg.vocab)
+        fail(ErrorCode::INVALID_TOKENIZER, "token table size does not match vocabulary size");
+    for (const auto &token : tokens.array) {
+        if (!token.is_string()) fail(ErrorCode::INVALID_TOKENIZER, "non-string tokenizer token");
+        m.tokenizer_tokens.push_back(token.s);
+    }
+
+    // --- residency layout ----------------------------------------------------
+    for (const auto &tensor : m.doc.tensors)
+        if (!tensor.expert_tensor) m.fixed_weight_bytes += tensor.byte_size;
+
+    if (cfg.expert_count) {
+        // Each expert's slice of a stacked tensor must be a whole number of
+        // quantisation blocks, otherwise a slice would start or end mid-block.
+        const uint32_t expert_count = cfg.expert_count;
+        const std::array<TensorRole, 3> roles = {TensorRole::FFN_GATE_EXPS,
+                                                 TensorRole::FFN_UP_EXPS,
+                                                 TensorRole::FFN_DOWN_EXPS};
+        const std::array<std::string, 3> suffixes = {"ffn_gate_exps.weight",
+                                                     "ffn_up_exps.weight",
+                                                     "ffn_down_exps.weight"};
+        for (uint32_t l = 0; l < cfg.layers; ++l) {
+            // Each projection may use a different quantisation type (Q4_K gate
+            // and up, Q6_K down is common), so their per-expert strides differ
+            // legitimately. The record carries three independent extents and the
+            // loader concatenates them in role order.
+            std::array<uint64_t, 3> strides{};
+            for (int r = 0; r < 3; ++r) {
+                const TensorInfo &tensor = *m.tensor(layer_name(l, suffixes[r]));
+                if (tensor.byte_size % expert_count != 0)
+                    fail(ErrorCode::SHAPE_MISMATCH, "stacked expert tensor is not evenly divisible");
+                strides[r] = tensor.byte_size / expert_count;
+                if (tensor.block_size > 1 &&
+                    (tensor.dims[0] * tensor.dims[1] / expert_count) % tensor.block_size != 0)
+                    fail(ErrorCode::SHAPE_MISMATCH,
+                         "expert slice is not a whole number of quantisation blocks");
+            }
+            for (uint32_t e = 0; e < expert_count; ++e) {
+                ExpertRecord rec;
+                rec.layer = l;
+                rec.expert = e;
+                rec.payload_bytes = strides[0] + strides[1] + strides[2];
+                rec.checksum_known = false; // vendor files publish no checksums
+                for (int r = 0; r < 3; ++r) {
+                    const TensorInfo &tensor = *m.tensor(layer_name(l, suffixes[r]));
+                    rec.extents[r] = {roles[r], tensor.absolute_offset + e * strides[r], strides[r]};
+                }
+                m.expert_index.emplace(ModelManifest::expert_key(l, e), m.experts.size());
+                m.experts.push_back(rec);
+                m.slot_bytes = std::max(m.slot_bytes, rec.payload_bytes);
+            }
+        }
+        for (auto &tensor : m.doc.tensors) {
+            bool expert = false;
+            for (uint32_t l = 0; l < cfg.layers; ++l)
+                for (const auto &suffix : suffixes)
+                    if (tensor.name == layer_name(l, suffix)) expert = true;
+            tensor.expert_tensor = expert;
+        }
+        uint64_t expert_bytes = 0;
+        for (const auto &tensor : m.doc.tensors)
+            if (tensor.expert_tensor) expert_bytes += tensor.byte_size;
+        m.expert_tensor_bytes = expert_bytes;
+        // The manifest above summed every tensor; rebuild it without experts.
+        m.fixed_weight_bytes = 0;
+        for (const auto &tensor : m.doc.tensors)
+            if (!tensor.expert_tensor) m.fixed_weight_bytes += tensor.byte_size;
+    }
+    return m;
+}
+
 ModelManifest build_manifest(const GGUFDocument &doc, const std::string &source_path) {
+    {
+        const std::string arch = require_string(doc, "general.architecture");
+        if (arch != "freemoe-tiny") {
+            if (!is_llama_family(arch))
+                fail(ErrorCode::UNSUPPORTED_ARCHITECTURE,
+                     "no adapter for architecture '" + arch + "'; run `freemoe probe` for the "
+                     "exact blockers");
+            return build_manifest_llama(doc, source_path, arch);
+        }
+    }
     ModelManifest m;
     m.doc = doc;
     m.source_path = source_path;
@@ -508,6 +1088,12 @@ ModelManifest build_manifest(const GGUFDocument &doc, const std::string &source_
     cfg.context = static_cast<uint32_t>(require_u64(doc, "freemoe.max_context_length"));
     cfg.expert_count = static_cast<uint32_t>(require_u64(doc, "freemoe.expert_count"));
     cfg.expert_top_k = static_cast<uint32_t>(require_u64(doc, "freemoe.expert_top_k"));
+    // The reference fixture is defined as normalising its router weights over
+    // the selected experts. Stating it here keeps the fixture's semantics a
+    // property of the adapter instead of an implicit engine default, which is
+    // what the real models need (they do not renormalise).
+    cfg.expert_weights_norm = true;
+    cfg.expert_weights_scale = 1.0;
     cfg.bos_id = static_cast<uint32_t>(require_u64(doc, "tokenizer.ggml.bos_token_id"));
     cfg.eos_id = static_cast<uint32_t>(require_u64(doc, "tokenizer.ggml.eos_token_id"));
     cfg.rms_eps = require_double(doc, "freemoe.rms_norm_epsilon");
@@ -580,6 +1166,7 @@ ModelManifest build_manifest(const GGUFDocument &doc, const std::string &source_
     for (auto &tensor : m.doc.tensors) {
         if (!expected.count(tensor.name))
             fail(ErrorCode::UNKNOWN_TENSOR, "unknown tensor " + tensor.name);
+        if (tensor.canonical.empty()) tensor.canonical = tensor.name;
         uint32_t layer = 0;
         tensor.role = role_from_name(tensor.name, layer);
         bool global_role = tensor.role == TensorRole::TOKEN_EMBD ||
@@ -666,6 +1253,7 @@ ModelManifest build_manifest(const GGUFDocument &doc, const std::string &source_
                 rec.payload_bytes = checked_mul(3, expert_stride, "expert payload");
                 size_t checksum_index = static_cast<size_t>(l) * cfg.expert_count + e;
                 rec.checksum = checksums.array[checksum_index].as_u64();
+                rec.checksum_known = true;
                 for (int r = 0; r < 3; ++r) {
                     const TensorInfo &tensor = t(layer_name(l, extent_suffixes[r]));
                     uint64_t rel = checked_mul(e, expert_stride, "expert relative offset");
@@ -684,8 +1272,12 @@ ModelManifest build_manifest(const GGUFDocument &doc, const std::string &source_
 }
 
 Json metadata_summary_json(const ModelManifest &manifest) {
+    // `inspect` must describe any checkpoint, including the many that omit
+    // optional keys. Every key that exists is reported; the rest are listed in
+    // `absent` rather than silently dropped or turned into a hard failure.
     static const std::vector<std::string> keys = {
         "general.architecture", "general.name", "general.alignment",
+        "general.file_type", "general.quantization_version", "general.basename",
         "freemoe.adapter", "freemoe.model_kind", "freemoe.hidden_size",
         "freemoe.intermediate_size", "freemoe.num_hidden_layers",
         "freemoe.num_attention_heads", "freemoe.num_key_value_heads",
@@ -696,11 +1288,51 @@ Json metadata_summary_json(const ModelManifest &manifest) {
         "freemoe.expert_top_k", "freemoe.seed", "tokenizer.chat_template",
     };
     Json out = Json::object();
+    Json absent = Json::array();
     for (const auto &key : keys) {
         auto it = manifest.doc.metadata.find(key);
-        if (it == manifest.doc.metadata.end())
-            fail(ErrorCode::METADATA_MISMATCH, "missing summary metadata " + key);
+        if (it == manifest.doc.metadata.end()) {
+            if (key == "general.alignment") continue; // optional, defaults to 32
+            absent.push(Json::string(key));
+            continue;
+        }
         out.set(key, it->second.display());
+    }
+    // general.alignment is optional in GGUF and defaults to 32.
+    if (!manifest.doc.metadata.count("general.alignment")) out.set("general.alignment", "32");
+    out.set("absent_keys", std::move(absent));
+
+    // Architecture-prefixed dims drive everything real: expose them under stable
+    // names so callers do not have to know the architecture.
+    const std::string arch = [&] {
+        auto it = manifest.doc.metadata.find("general.architecture");
+        return it == manifest.doc.metadata.end() ? std::string() : it->second.as_string();
+    }();
+    if (!arch.empty()) {
+        const std::pair<const char *, const char *> dims[] = {
+            {"block_count", "layer_count"},
+            {"embedding_length", "hidden_size"},
+            {"feed_forward_length", "intermediate_size"},
+            {"attention.head_count", "head_count"},
+            {"attention.head_count_kv", "head_count_kv"},
+            {"attention.key_length", "key_length"},
+            {"attention.value_length", "value_length"},
+            {"rope.dimension_count", "rope_dimension_count"},
+            {"rope.freq_base", "rope_freq_base"},
+            {"attention.layer_norm_rms_epsilon", "rms_epsilon"},
+            {"context_length", "context_length"},
+            {"expert_count", "expert_count"},
+            {"expert_used_count", "expert_used_count"},
+            {"vocab_size", "vocab_size"},
+        };
+        Json derived = Json::object();
+        for (const auto &[gguf_key, out_key] : dims) {
+            auto it = manifest.doc.metadata.find(arch + "." + gguf_key);
+            if (it != manifest.doc.metadata.end()) derived.set(out_key, it->second.display());
+        }
+        auto tok = manifest.doc.metadata.find("tokenizer.ggml.model");
+        if (tok != manifest.doc.metadata.end()) derived.set("tokenizer_model", tok->second.display());
+        out.set("architecture_fields", std::move(derived));
     }
     return out;
 }
@@ -753,22 +1385,66 @@ Json inspect_json(const ModelManifest &manifest, const std::string &source_path)
     out.set("expert_top_k", static_cast<int64_t>(cfg.expert_top_k));
     out.set("expert_layout", cfg.expert_layout);
 
-    Json roles = Json::array();
+    // Section 6.3 canonical model map: the internal representation that joins
+    // the GGUF source to the engine's logical roles. One entry per source
+    // tensor, carrying everything needed to page it and to prove the mapping.
+    Json model_map = Json::array();
     for (const TensorInfo *tensor : sorted) {
-        Json role = Json::object();
-        role.set("name", tensor->name);
-        role.set("role", tensor_role_name(tensor->role));
-        role.set("layer", static_cast<int64_t>(tensor->layer));
-        role.set("expert", static_cast<int64_t>(-1));
-        role.set("type", tensor->type_name);
+        Json entry = Json::object();
+        entry.set("source_name", tensor->name);
+        // The engine's address for this tensor. For most files it equals the
+        // source name; adapters rename where an architecture uses a different
+        // convention (ffn_gate_inp -> ffn_router).
+        entry.set("canonical_name",
+                  tensor->canonical.empty() ? tensor->name : tensor->canonical);
+        entry.set("role", tensor_role_name(tensor->role));
+        entry.set("type", tensor->type_name);
+        // Whether the type byte was recognised and whether `bytes` is the
+        // decoder's own figure or was recovered from the neighbouring tensor.
+        entry.set("type_known", tensor->type_known);
+        entry.set("byte_size_derived", tensor->byte_size_derived);
+
         Json dims = Json::array();
         for (uint64_t d : tensor->dims) dims.push(Json::integer(static_cast<int64_t>(d)));
-        role.set("dims", std::move(dims));
-        role.set("offset", tensor->absolute_offset);
-        role.set("bytes", tensor->byte_size);
-        roles.push(std::move(role));
+        entry.set("dims", std::move(dims));
+        entry.set("element_count", tensor->element_count());
+        Json geometry = Json::object();
+        geometry.set("block_size", static_cast<int64_t>(tensor->block_size));
+        geometry.set("block_bytes", static_cast<int64_t>(tensor->block_bytes));
+        const uint64_t blocks =
+            tensor->block_size ? tensor->element_count() / tensor->block_size : 0;
+        geometry.set("block_count", blocks);
+        entry.set("quant_geometry", std::move(geometry));
+
+        // Exact source byte range.
+        entry.set("source_offset", tensor->absolute_offset);
+        entry.set("source_end", tensor->absolute_offset + tensor->byte_size);
+        entry.set("bytes", tensor->byte_size);
+
+        // Layer is only reported when the adapter verified it.
+        entry.set("layer", tensor->layer < 0 ? Json::null()
+                                            : Json::integer(tensor->layer));
+        if (tensor->expert_tensor) {
+            // Stacked expert tensors hold many experts; the expert index is not
+            // parsed from the name, it comes from the adapter's stacking rule.
+            entry.set("expert_count", static_cast<int64_t>(cfg.expert_count));
+            const uint64_t stride =
+                cfg.expert_count ? tensor->byte_size / cfg.expert_count : 0;
+            entry.set("expert_stride_bytes", stride);
+            // Each expert slice is pageable on its own only when the stride is a
+            // whole number of quantisation blocks, so a read never cuts a block.
+            entry.set("independently_pageable",
+                      tensor->block_bytes != 0 && stride % tensor->block_bytes == 0);
+        } else {
+            entry.set("expert", Json::null());
+            entry.set("expert_count", Json::integer(0));
+            entry.set("independently_pageable", true);
+        }
+        entry.set("adapter_id", cfg.adapter);
+        entry.set("adapter_version", Json::integer(1));
+        model_map.push(std::move(entry));
     }
-    out.set("roles", std::move(roles));
+    out.set("model_map", std::move(model_map));
     out.set("unresolved_roles", Json::array());
 
     Json experts = Json::array();
@@ -845,6 +1521,16 @@ TensorCapability tensor_capability(uint32_t type_id) {
         cap.dequantize = true;
         cap.execute = true;
         cap.note = "block decoder plus quantised GEMV kernel";
+        break;
+    case 20: // IQ4_NL: 4-bit non-linear lookup, decode + execute
+        cap.dequantize = true;
+        cap.execute = true;
+        cap.note = "non-linear 4-bit block decoder plus quantised GEMV kernel";
+        break;
+    case 24: case 25: case 26: case 27: case 28: // I8..F64
+        cap.dequantize = true;
+        cap.execute = true;
+        cap.note = "integer/float element type, widened on read";
         break;
     default:
         cap.note = "parsed geometry only; block decoder not implemented";

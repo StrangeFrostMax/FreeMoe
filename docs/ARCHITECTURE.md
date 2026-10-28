@@ -49,6 +49,7 @@ CLI / run recorder
 | EXISTS | `src/backend.cpp` | Scalar CPU, patched Virtual NPU and explicit GPU placeholder backends. |
 | EXISTS | `src/residency.cpp` | Budget calculator, authoritative state table, safe eviction, checksums, fault handling. |
 | EXISTS | `src/kernels.cpp` | Vectorised GEMV (F32 and block-quantised), runtime ISA resolution with Zen 3 policy, thread pool, kernel benchmark harness. |
+| EXISTS | `src/tokenizer.cpp` | Real tokenizers for published checkpoints: SentencePiece-style piece tables with byte fallback and GPT-2 style BPE, with an honest coverage report instead of silent byte loss. |
 | EXISTS | `src/support.cpp` | Architecture-agnostic support probe: reads any GGUF and reports architecture, hyperparameters, tensor types, tokenizer and every concrete blocker before claiming a model is runnable. |
 | EXISTS | `src/quant.cpp` | Scalar reference block decoders for every supported GGUF tensor type, plus block geometry. The oracle that the vectorised quantised kernels are checked against. |
 | EXISTS | `src/engine.cpp` | Llama-like forward pass, MoE routing/execution, reference comparison and reports. |
@@ -58,6 +59,8 @@ CLI / run recorder
 | EXISTS | `tools/gguf_format.py` | Independent fixture GGUF writer/parser. |
 | EXISTS | `tools/reference_oracle.py` | Independent scalar reference runtime. |
 | EXISTS | `tools/make_fixtures.py` | Deterministic checkpoints, prompts, references and malformed fixtures. |
+| EXISTS | `tools/llama_oracle.py` | Independent llama-family forward pass (GQA, qkv bias, q/k norm, gemma semantics, fused qkv) used to verify the engine's architecture adapters. |
+| EXISTS | `tools/make_arch_fixtures.py` | Checkpoint fixtures shaped like real llama.cpp files, one per supported architecture, each paired with oracle logits. |
 | PLANNED | `src/backend/cuda/` | Real CUDA backend; requires D1/D6 hardware and kernel correctness gates. |
 | PLANNED | `src/backend/vulkan/` | Real Vulkan backend; requires Windows/AMD evidence. |
 | PLANNED | `src/backend/hip/` | Real HIP backend; requires Linux/AMD evidence. |

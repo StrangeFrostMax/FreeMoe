@@ -171,8 +171,11 @@ BudgetResult compute_budget(const ModelManifest &manifest, const BudgetConfig &c
     b.total_hot_bytes = config.total_hot_bytes;
     b.fixed_weights_bytes = manifest.fixed_weight_bytes;
     const ModelConfig &cfg = manifest.config;
+    // Under grouped-query attention the cache holds kv_heads * head_dim, not
+    // the full hidden width, so budgeting by `hidden` over-reserves.
+    const uint64_t kv_dim = static_cast<uint64_t>(cfg.kv_heads) * cfg.head_dim;
     b.kv_bytes = checked_mul(static_cast<uint64_t>(cfg.layers) * cfg.context,
-                             static_cast<uint64_t>(cfg.hidden) * 2ull * sizeof(float), "KV cache");
+                             kv_dim * 2ull * sizeof(float), "KV cache");
     b.workspace_bytes = config.workspace_bytes;
     b.staging_bytes = config.staging_bytes;
     b.margin_bytes = config.margin_bytes;
@@ -222,6 +225,7 @@ Json ResidencyMetrics::to_json() const {
     j.set("stale_completions", stale_completions);
     j.set("checksum_checks", checksum_checks);
     j.set("checksum_failures", checksum_failures);
+    j.set("checksum_unavailable", checksum_unavailable);
     j.set("transfer_failures", transfer_failures);
     j.set("fence_timeouts", fence_timeouts);
     j.set("device_loss_events", device_loss_events);
@@ -294,12 +298,16 @@ void ResidencyManager::preload_resident_experts() {
     for (const auto &record : manifest_.experts) {
         uint64_t key = ModelManifest::expert_key(record.layer, record.expert);
         std::vector<uint8_t> payload = scheduler_.read_record(record_extents(record), ReadPriority::Demand);
-        ++metrics_.checksum_checks;
-        if (fnv1a64(payload) != record.checksum) {
-            ++metrics_.checksum_failures;
-            fail(ErrorCode::EXPERT_CHECKSUM_MISMATCH,
-                 "resident expert checksum mismatch at layer " + std::to_string(record.layer) +
-                 " expert " + std::to_string(record.expert));
+        if (record.checksum_known) {
+            ++metrics_.checksum_checks;
+            if (fnv1a64(payload) != record.checksum) {
+                ++metrics_.checksum_failures;
+                fail(ErrorCode::EXPERT_CHECKSUM_MISMATCH,
+                     "resident expert checksum mismatch at layer " + std::to_string(record.layer) +
+                     " expert " + std::to_string(record.expert));
+            }
+        } else {
+            ++metrics_.checksum_unavailable;
         }
         metrics_.resident_expert_bytes += payload.size();
         resident_payloads_[key] = std::move(payload);
@@ -622,13 +630,20 @@ void ResidencyManager::load_slot(Slot &slot, const ExpertRecord &record, uint64_
         mark_error(slot, ErrorCode::IO_ERROR, "expert payload has wrong length");
         fail(ErrorCode::IO_ERROR, "expert payload has wrong length");
     }
-    ++metrics_.checksum_checks;
-    if (fnv1a64(payload) != record.checksum) {
-        ++metrics_.checksum_failures;
-        mark_error(slot, ErrorCode::EXPERT_CHECKSUM_MISMATCH, "source expert checksum mismatch");
-        fail(ErrorCode::EXPERT_CHECKSUM_MISMATCH,
-             "source expert checksum mismatch at layer " + std::to_string(record.layer) +
-             " expert " + std::to_string(record.expert));
+    if (!record.checksum_known) {
+        // Vendor checkpoints carry no checksum manifest. Integrity against the
+        // source file is still checked by the offset/extent bounds, but the
+        // value check is honestly reported as unavailable rather than skipped.
+        ++metrics_.checksum_unavailable;
+    } else {
+        ++metrics_.checksum_checks;
+        if (fnv1a64(payload) != record.checksum) {
+            ++metrics_.checksum_failures;
+            mark_error(slot, ErrorCode::EXPERT_CHECKSUM_MISMATCH, "source expert checksum mismatch");
+            fail(ErrorCode::EXPERT_CHECKSUM_MISMATCH,
+                 "source expert checksum mismatch at layer " + std::to_string(record.layer) +
+                 " expert " + std::to_string(record.expert));
+        }
     }
     if (!transition(slot, SlotEvent::IOComplete, "load_slot"))
         fail(ErrorCode::INTERNAL_ERROR, "invalid IOComplete transition");
@@ -662,13 +677,26 @@ void ResidencyManager::load_slot(Slot &slot, const ExpertRecord &record, uint64_
     if (!complete_upload(slot.index, slot.generation))
         fail(ErrorCode::STALE_COMPLETION, "upload completion did not publish slot");
 
-    ++metrics_.checksum_checks;
-    std::vector<uint8_t> slot_copy(payload.size());
-    std::memcpy(slot_copy.data(), slot.buffer->data, payload.size());
-    if (fnv1a64(slot_copy) != record.checksum) {
-        ++metrics_.checksum_failures;
-        mark_error(slot, ErrorCode::EXPERT_CHECKSUM_MISMATCH, "slot payload checksum mismatch");
-        fail(ErrorCode::EXPERT_CHECKSUM_MISMATCH, "slot payload checksum mismatch");
+    if (!record.checksum_known) {
+        // No source checksum to compare against; the slot copy is still checked
+        // against the host payload so a staging fault cannot pass unnoticed.
+        std::vector<uint8_t> slot_copy(payload.size());
+        std::memcpy(slot_copy.data(), slot.buffer->data, payload.size());
+        if (fnv1a64(slot_copy) != fnv1a64(payload)) {
+            ++metrics_.checksum_failures;
+            mark_error(slot, ErrorCode::EXPERT_CHECKSUM_MISMATCH, "slot payload checksum mismatch");
+            fail(ErrorCode::EXPERT_CHECKSUM_MISMATCH, "slot payload checksum mismatch");
+        }
+        ++metrics_.checksum_unavailable;
+    } else {
+        ++metrics_.checksum_checks;
+        std::vector<uint8_t> slot_copy(payload.size());
+        std::memcpy(slot_copy.data(), slot.buffer->data, payload.size());
+        if (fnv1a64(slot_copy) != record.checksum) {
+            ++metrics_.checksum_failures;
+            mark_error(slot, ErrorCode::EXPERT_CHECKSUM_MISMATCH, "slot payload checksum mismatch");
+            fail(ErrorCode::EXPERT_CHECKSUM_MISMATCH, "slot payload checksum mismatch");
+        }
     }
     ++slot.demand_use_count;
     slot.clock_bit = 1;
