@@ -132,6 +132,15 @@ const char *tensor_role_name(TensorRole role) {
     case TensorRole::FFN_UP_BIAS: return "FFN_UP_BIAS";
     case TensorRole::FFN_DOWN_BIAS: return "FFN_DOWN_BIAS";
     case TensorRole::OUTPUT_BIAS: return "OUTPUT_BIAS";
+    case TensorRole::ATTN_Q_A: return "ATTN_Q_A";
+    case TensorRole::ATTN_Q_A_NORM: return "ATTN_Q_A_NORM";
+    case TensorRole::ATTN_Q_B: return "ATTN_Q_B";
+    case TensorRole::ATTN_KV_A_MQA: return "ATTN_KV_A_MQA";
+    case TensorRole::ATTN_KV_A_NORM: return "ATTN_KV_A_NORM";
+    case TensorRole::ATTN_K_B: return "ATTN_K_B";
+    case TensorRole::ATTN_V_B: return "ATTN_V_B";
+    case TensorRole::FFN_EXP_PROBS_B: return "FFN_EXP_PROBS_B";
+    case TensorRole::IGNORED: return "IGNORED";
     }
     return "UNKNOWN";
 }
@@ -343,6 +352,24 @@ bool parse_layer_suffix(const std::string &name, const std::string &suffix, uint
     return true;
 }
 
+// A tensor the file may legally carry that the main forward pass does not use.
+// Returning a reason (rather than true/false) is deliberate: the probe prints
+// it, so "supported" never quietly means "part of this was skipped".
+const char *ignorable_reason(const std::string &name) {
+    static const std::pair<const char *, const char *> prefixes[] = {
+        {"nextn.", "next-token-prediction head (used only for speculative decoding)"},
+        {"mtp.", "multi-token-prediction head (used only for speculative decoding)"},
+    };
+    // These appear inside a layer name (blk.N.nextn.eh_proj) or as a top-level
+    // prefix, so the test is on the substring after the layer index.
+    for (const auto &entry : prefixes) {
+        if (name.find(std::string(".", 1) + entry.first) != std::string::npos ||
+            name.rfind(entry.first, 0) == 0)
+            return entry.second;
+    }
+    return nullptr;
+}
+
 TensorRole role_from_name(const std::string &name, uint32_t &layer) {
     layer = 0;
     if (name == "token_embd.weight") return TensorRole::TOKEN_EMBD;
@@ -384,6 +411,14 @@ TensorRole role_from_name(const std::string &name, uint32_t &layer) {
         {"ffn_norm.bias", TensorRole::FFN_NORM_BIAS},
         {"ffn_up.bias", TensorRole::FFN_UP_BIAS},
         {"ffn_down.bias", TensorRole::FFN_DOWN_BIAS},
+        {"attn_q_a.weight", TensorRole::ATTN_Q_A},
+        {"attn_q_a_norm.weight", TensorRole::ATTN_Q_A_NORM},
+        {"attn_q_b.weight", TensorRole::ATTN_Q_B},
+        {"attn_kv_a_mqa.weight", TensorRole::ATTN_KV_A_MQA},
+        {"attn_kv_a_norm.weight", TensorRole::ATTN_KV_A_NORM},
+        {"attn_k_b.weight", TensorRole::ATTN_K_B},
+        {"attn_v_b.weight", TensorRole::ATTN_V_B},
+        {"ffn_exp_probs_b.bias", TensorRole::FFN_EXP_PROBS_B},
     };
     for (const auto &entry : suffixes)
         if (parse_layer_suffix(name, entry.first, layer)) return entry.second;
@@ -627,7 +662,7 @@ bool is_llama_family(const std::string &arch) {
     static const std::set<std::string> family = {
         "llama", "qwen2", "qwen3", "smollm", "smollm2", "tinyllama",
         "gemma", "gemma2", "gemma3", "phi3", "minicpm", "qwen3moe", "glm4",
-        "qwen2moe", "phi2",
+        "qwen2moe", "phi2", "deepseek2",
     };
     return family.count(arch) != 0;
 }
@@ -720,6 +755,37 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
         head_dim = cfg.hidden / cfg.heads;
     }
     cfg.head_dim = static_cast<uint32_t>(head_dim);
+    // --- multi-head latent attention ---------------------------------------
+    // Detected from the tensors: only MLA files carry `attn_kv_a_mqa`, which is
+    // the projection into the latent. `head_dim` is then the *key* width
+    // (nope + rope) and `attention.value_length_mla` the value width.
+    if (doc.tensor_by_name.count(layer_name(0, "attn_kv_a_mqa.weight")) != 0) {
+        cfg.mla = true;
+        uint64_t rank = 0;
+        if (opt_u64(doc, keys("attention.q_lora_rank"), &rank)) cfg.q_lora_rank = static_cast<uint32_t>(rank);
+        if (!opt_u64(doc, keys("attention.kv_lora_rank"), &rank))
+            fail(ErrorCode::METADATA_MISMATCH, "MLA needs attention.kv_lora_rank");
+        cfg.kv_lora_rank = static_cast<uint32_t>(rank);
+        uint64_t value_dim = 0;
+        if (opt_u64(doc, keys("attention.value_length_mla"), &value_dim))
+            cfg.head_v = static_cast<uint32_t>(value_dim);
+        else
+            cfg.head_v = cfg.head_dim;
+        if (cfg.q_lora_rank == 0) {
+            // The "lite" variant projects q in one step. That is a layout
+            // difference only, so it is recorded and both are supported.
+            if (doc.tensor_by_name.count(layer_name(0, "attn_q_a.weight")) != 0)
+                fail(ErrorCode::METADATA_MISMATCH,
+                     "q_lora_rank is zero but a low-rank q projection is present");
+        }
+        // RoPE applies to the trailing part of the key only.
+        uint64_t mla_rope = 0;
+        if (opt_u64(doc, keys("rope.dimension_count"), &mla_rope)) cfg.rope_dim = static_cast<uint32_t>(mla_rope);
+        if (cfg.rope_dim == 0 || cfg.rope_dim >= cfg.head_dim)
+            fail(ErrorCode::SHAPE_MISMATCH,
+                 "MLA needs a rotary width strictly smaller than the key width");
+    }
+
     uint64_t rope_dim = 0;
     if (opt_u64(doc, keys("rope.dimension_count"), &rope_dim))
         cfg.rope_dim = static_cast<uint32_t>(rope_dim);
@@ -742,7 +808,38 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
         opt_double(doc, keys("expert_weights_scale"), &cfg.expert_weights_scale);
         if (!(cfg.expert_weights_scale > 0.0))
             fail(ErrorCode::METADATA_MISMATCH, "expert_weights_scale must be positive");
+        // Which function turns router logits into probabilities is a per-family
+        // fact, not an MoE fact: V2 softmaxes, V3 and later use a sigmoid.
+        // GGUF stores it as an enum, so the numbers are read as numbers.
+        uint64_t gating = 0;
+        if (opt_u64(doc, keys("expert_gating_func"), &gating)) {
+            switch (gating) {
+            case 0: case 1: cfg.expert_gating = "softmax"; break;
+            case 2: cfg.expert_gating = "sigmoid"; break;
+            case 3: cfg.expert_gating = "softmax-weight"; break;
+            case 4: cfg.expert_gating = "sqrt-softplus"; break;
+            default:
+                fail(ErrorCode::METADATA_MISMATCH,
+                     "expert_gating_func " + std::to_string(gating) + " has no known meaning");
+            }
+        }
+        uint64_t groups = 0, groups_used = 0;
+        if (opt_u64(doc, keys("expert_group_count"), &groups) && groups > 1) {
+            cfg.expert_groups = static_cast<uint32_t>(groups);
+            if (!opt_u64(doc, keys("expert_group_used_count"), &groups_used))
+                fail(ErrorCode::METADATA_MISMATCH,
+                     "group-limited routing needs expert_group_used_count");
+            cfg.expert_groups_used = static_cast<uint32_t>(groups_used);
+            if (cfg.expert_groups_used == 0 || cfg.expert_groups_used > cfg.expert_groups)
+                fail(ErrorCode::METADATA_MISMATCH, "expert_group_used_count is out of range");
+            if (cfg.expert_count % cfg.expert_groups != 0)
+                fail(ErrorCode::SHAPE_MISMATCH,
+                     "expert_count is not a multiple of expert_group_count");
+        }
     }
+    uint64_t dense_lead = 0;
+    if (opt_u64(doc, keys("leading_dense_block_count"), &dense_lead))
+        cfg.dense_lead = static_cast<uint32_t>(dense_lead);
     // Routed experts and the qwen2moe shared expert each have their own width.
     // Both default to the dense width, which is what every other MoE family
     // does; a checkpoint that narrows either one says so explicitly.
@@ -756,16 +853,33 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
     // they are the evidence. A file that declares a count without the tensors
     // is caught by the missing-tensor check below.
     {
-        const bool shexp_gate = doc.tensor_by_name.count(layer_name(0, "ffn_gate_shexp.weight")) != 0;
-        const bool shexp_up = doc.tensor_by_name.count(layer_name(0, "ffn_up_shexp.weight")) != 0;
-        const bool shexp_down = doc.tensor_by_name.count(layer_name(0, "ffn_down_shexp.weight")) != 0;
-        const bool shexp_inp = doc.tensor_by_name.count(layer_name(0, "ffn_gate_inp_shexp.weight")) != 0;
+        // These features belong to the MoE layers, and the first MoE layer is
+        // not necessarily layer 0: deepseek2 has plain-FFN blocks in front. So
+        // the test scans every layer instead of assuming blk.0.
+        auto has_any_layer = [&](const char *suffix) {
+            const std::string tail = std::string(".") + suffix;
+            for (const auto &tensor : doc.tensors) {
+                if (tensor.name.size() < tail.size()) continue;
+                if (tensor.name.compare(tensor.name.size() - tail.size(), tail.size(), tail) == 0)
+                    return true;
+            }
+            return false;
+        };
+        const bool shexp_gate = has_any_layer("ffn_gate_shexp.weight");
+        const bool shexp_up = has_any_layer("ffn_up_shexp.weight");
+        const bool shexp_down = has_any_layer("ffn_down_shexp.weight");
+        const bool shexp_inp = has_any_layer("ffn_gate_inp_shexp.weight");
+        cfg.expert_selection_bias = has_any_layer("ffn_exp_probs_b.bias");
         if (shexp_gate || shexp_up || shexp_down || shexp_inp) {
-            if (!(shexp_gate && shexp_up && shexp_down && shexp_inp))
+            // The three projections are the branch; the per-token gate on top of
+            // them is a qwen2moe addition, so it is optional and its presence is
+            // what switches the scaling on.
+            if (!(shexp_gate && shexp_up && shexp_down))
                 fail(ErrorCode::MISSING_REQUIRED_TENSOR,
-                     "shared expert is only partly present: gate, up, down and its input gate "
+                     "shared expert is only partly present: its gate, up and down projections "
                      "must all be there or none");
             cfg.shared_expert = true;
+            cfg.shared_expert_gate = shexp_inp;
             cfg.shared_expert_intermediate = 0;
             if (opt_u64(doc, keys("expert_shared_feed_forward_length"), &value))
                 cfg.shared_expert_intermediate = static_cast<uint32_t>(value);
@@ -919,7 +1033,9 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
     if (cfg.heads == 0 || cfg.kv_heads == 0 || cfg.head_dim == 0 ||
         cfg.heads % cfg.kv_heads != 0 || cfg.kv_heads > cfg.heads)
         fail(ErrorCode::SHAPE_MISMATCH, "grouped-query head counts are inconsistent");
-    if (static_cast<uint64_t>(cfg.heads) * cfg.head_dim != cfg.hidden)
+    // MLA projects q through a bottleneck, so the per-head key width has no
+    // reason to fill the embedding. Every other family keeps the identity.
+    if (!cfg.mla && static_cast<uint64_t>(cfg.heads) * cfg.head_dim != cfg.hidden)
         fail(ErrorCode::SHAPE_MISMATCH,
              "attention head count times head dimension does not equal embedding length");
     if (cfg.rope_dim != 0 && (cfg.rope_dim % 2 != 0 || cfg.rope_dim > cfg.head_dim))
@@ -945,7 +1061,8 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
 
     // phi3 stores one fused q/k/v projection instead of three. Detect it from
     // the tensors, because the metadata does not say either way.
-    {
+    if (!cfg.mla) {
+        // MLA builds q from a low-rank pair, so it has neither shape.
         const bool fused = doc.tensor_by_name.count(layer_name(0, "attn_qkv.weight")) != 0;
         const bool split = doc.tensor_by_name.count(layer_name(0, "attn_q.weight")) != 0;
         if (fused && split)
@@ -1039,7 +1156,20 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
             expect(layer_name(l, "ffn_down.bias"));
         }
         if (cfg.norm_bias && !cfg.parallel_residual) expect(layer_name(l, "ffn_norm.bias"));
-        if (cfg.fused_qkv) {
+        if (cfg.mla) {
+            // Keys and values never exist as weights: each head expands the
+            // per-token latent through its own slice of k_b / v_b.
+            if (cfg.q_lora_rank != 0)
+                for (const char *suffix :
+                     {"attn_q_a.weight", "attn_q_a_norm.weight", "attn_q_b.weight"})
+                    expect(layer_name(l, suffix));
+            else
+                expect(layer_name(l, "attn_q.weight"));
+            for (const char *suffix :
+                 {"attn_kv_a_mqa.weight", "attn_kv_a_norm.weight", "attn_k_b.weight",
+                  "attn_v_b.weight"})
+                expect(layer_name(l, suffix));
+        } else if (cfg.fused_qkv) {
             expect(layer_name(l, "attn_qkv.weight"));
         } else {
             for (const char *suffix : {"attn_q.weight", "attn_k.weight", "attn_v.weight"})
@@ -1059,14 +1189,25 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
         if (cfg.post_norms)
             for (const char *suffix : {"attn_post_norm.weight", "ffn_post_norm.weight"})
                 expect(layer_name(l, suffix));
-        if (cfg.expert_count) {
+        // The leading `dense_lead` blocks carry a plain FFN even in an MoE
+        // model, so the branch is chosen per layer rather than per model.
+        const bool moe_layer = cfg.expert_count != 0 && l >= cfg.dense_lead;
+        if (moe_layer) {
             for (const char *suffix : {"ffn_gate_inp.weight", "ffn_gate_exps.weight",
                                        "ffn_up_exps.weight", "ffn_down_exps.weight"})
                 expect(layer_name(l, suffix));
-            if (cfg.shared_expert)
-                for (const char *suffix : {"ffn_gate_inp_shexp.weight", "ffn_gate_shexp.weight",
-                                           "ffn_up_shexp.weight", "ffn_down_shexp.weight"})
+            if (cfg.shared_expert) {
+                for (const char *suffix : {"ffn_gate_shexp.weight", "ffn_up_shexp.weight",
+                                           "ffn_down_shexp.weight"})
                     expect(layer_name(l, suffix));
+                if (cfg.shared_expert_gate) expect(layer_name(l, "ffn_gate_inp_shexp.weight"));
+            }
+            // The bias only steers selection, so it is required on MoE layers
+            // independently of whether a shared expert exists.
+            if (cfg.expert_selection_bias) expect(layer_name(l, "ffn_exp_probs_b.bias"));
+        } else if (cfg.dense_lead != 0 && l < cfg.dense_lead) {
+            for (const char *suffix : {"ffn_gate.weight", "ffn_up.weight", "ffn_down.weight"})
+                expect(layer_name(l, suffix));
         } else if (cfg.fused_gate_up) {
             for (const char *suffix : {"ffn_up.weight", "ffn_down.weight"})
                 expect(layer_name(l, suffix));
@@ -1079,9 +1220,17 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
         }
     }
     for (auto &tensor : m.doc.tensors) {
-        if (!expected.count(tensor.name))
-            fail(ErrorCode::UNKNOWN_TENSOR,
-                 "tensor " + tensor.name + " has no mapping in the " + arch + " adapter");
+        if (!expected.count(tensor.name)) {
+            const char *reason = ignorable_reason(tensor.name);
+            if (reason == nullptr)
+                fail(ErrorCode::UNKNOWN_TENSOR,
+                     "tensor " + tensor.name + " has no mapping in the " + arch + " adapter");
+            tensor.role = TensorRole::IGNORED;
+            tensor.layer = -1;
+            tensor.canonical = tensor.name;
+            m.ignored_tensors.emplace_back(tensor.name, reason);
+            continue;
+        }
         if (!tensor.type_known)
             fail(ErrorCode::UNSUPPORTED_QUANTISATION,
                  "tensor " + tensor.name + " uses type " + std::to_string(tensor.type_id) +
@@ -1145,16 +1294,42 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
         }
         if (cfg.norm_bias && !cfg.parallel_residual)
             expect_dims(*m.tensor(layer_name(l, "ffn_norm.bias")), {cfg.hidden});
-        if (cfg.fused_qkv) {
-            // The fused projection holds q, then k, then v along its output axis.
-            expect_dims(*m.tensor(layer_name(l, "attn_qkv.weight")),
-                        {cfg.hidden, cfg.hidden + 2 * kv_dim});
+        if (cfg.mla) {
+            // k_b is [nope, kv_lora_rank, heads] and v_b is
+            // [kv_lora_rank, head_v, heads]: one slice per head.
+            const uint64_t nope = cfg.head_dim - cfg.rope_dim;
+            if (cfg.q_lora_rank != 0) {
+                expect_dims(*m.tensor(layer_name(l, "attn_q_a.weight")),
+                            {cfg.hidden, cfg.q_lora_rank});
+                expect_dims(*m.tensor(layer_name(l, "attn_q_a_norm.weight")), {cfg.q_lora_rank});
+                expect_dims(*m.tensor(layer_name(l, "attn_q_b.weight")),
+                            {cfg.q_lora_rank, static_cast<uint64_t>(cfg.heads) * cfg.head_dim});
+            } else {
+                expect_dims(*m.tensor(layer_name(l, "attn_q.weight")),
+                            {cfg.hidden, static_cast<uint64_t>(cfg.heads) * cfg.head_dim});
+            }
+            expect_dims(*m.tensor(layer_name(l, "attn_kv_a_mqa.weight")),
+                        {cfg.hidden, static_cast<uint64_t>(cfg.kv_lora_rank) + cfg.rope_dim});
+            expect_dims(*m.tensor(layer_name(l, "attn_kv_a_norm.weight")), {cfg.kv_lora_rank});
+            expect_dims(*m.tensor(layer_name(l, "attn_k_b.weight")),
+                        {nope, cfg.kv_lora_rank, cfg.heads});
+            expect_dims(*m.tensor(layer_name(l, "attn_v_b.weight")),
+                        {cfg.kv_lora_rank, cfg.head_v_dim(), cfg.heads});
+            // The output projection maps the per-head value widths, not `hidden`.
+            expect_dims(*m.tensor(layer_name(l, "attn_output.weight")),
+                        {static_cast<uint64_t>(cfg.heads) * cfg.head_v_dim(), cfg.hidden});
         } else {
-            expect_dims(*m.tensor(layer_name(l, "attn_q.weight")), {cfg.hidden, cfg.hidden});
-            expect_dims(*m.tensor(layer_name(l, "attn_k.weight")), {cfg.hidden, kv_dim});
-            expect_dims(*m.tensor(layer_name(l, "attn_v.weight")), {cfg.hidden, kv_dim});
+            if (cfg.fused_qkv) {
+                // The fused projection holds q, then k, then v along its output axis.
+                expect_dims(*m.tensor(layer_name(l, "attn_qkv.weight")),
+                            {cfg.hidden, cfg.hidden + 2 * kv_dim});
+            } else {
+                expect_dims(*m.tensor(layer_name(l, "attn_q.weight")), {cfg.hidden, cfg.hidden});
+                expect_dims(*m.tensor(layer_name(l, "attn_k.weight")), {cfg.hidden, kv_dim});
+                expect_dims(*m.tensor(layer_name(l, "attn_v.weight")), {cfg.hidden, kv_dim});
+            }
+            expect_dims(*m.tensor(layer_name(l, "attn_output.weight")), {cfg.hidden, cfg.hidden});
         }
-        expect_dims(*m.tensor(layer_name(l, "attn_output.weight")), {cfg.hidden, cfg.hidden});
         if (cfg.post_norms) {
             expect_dims(*m.tensor(layer_name(l, "attn_post_norm.weight")), {cfg.hidden});
             expect_dims(*m.tensor(layer_name(l, "ffn_post_norm.weight")), {cfg.hidden});
@@ -1173,10 +1348,14 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
                 expect_dims(*m.tensor(layer_name(l, "attn_v.bias")), {kv_dim});
             }
         }
-        if (cfg.expert_count) {
+        const bool moe_layer = cfg.expert_count != 0 && l >= cfg.dense_lead;
+        if (moe_layer) {
             const uint32_t ewidth = cfg.expert_width();
             expect_dims(*m.tensor(layer_name(l, "ffn_gate_inp.weight")),
                         {cfg.hidden, cfg.expert_count});
+            if (cfg.expert_selection_bias)
+                expect_dims(*m.tensor(layer_name(l, "ffn_exp_probs_b.bias")),
+                            {cfg.expert_count});
             for (const char *suffix : {"ffn_gate_exps.weight", "ffn_up_exps.weight"})
                 expect_dims(*m.tensor(layer_name(l, suffix)),
                             {cfg.hidden, ewidth, cfg.expert_count});
@@ -1185,7 +1364,9 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
             if (cfg.shared_expert) {
                 const uint32_t swidth = cfg.shared_expert_intermediate;
                 // One scalar per token, so the gate is a hidden-vector.
-                expect_dims(*m.tensor(layer_name(l, "ffn_gate_inp_shexp.weight")), {cfg.hidden});
+                if (cfg.shared_expert_gate)
+                    expect_dims(*m.tensor(layer_name(l, "ffn_gate_inp_shexp.weight")),
+                                {cfg.hidden});
                 for (const char *suffix : {"ffn_gate_shexp.weight", "ffn_up_shexp.weight"})
                     expect_dims(*m.tensor(layer_name(l, suffix)), {cfg.hidden, swidth});
                 expect_dims(*m.tensor(layer_name(l, "ffn_down_shexp.weight")),
@@ -1232,7 +1413,9 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
         const std::array<std::string, 3> suffixes = {"ffn_gate_exps.weight",
                                                      "ffn_up_exps.weight",
                                                      "ffn_down_exps.weight"};
-        for (uint32_t l = 0; l < cfg.layers; ++l) {
+        // Only layers at or past the dense lead carry stacked experts; the
+        // leading blocks of a deepseek checkpoint are plain FFNs.
+        for (uint32_t l = cfg.dense_lead; l < cfg.layers; ++l) {
             // Each projection may use a different quantisation type (Q4_K gate
             // and up, Q6_K down is common), so their per-expert strides differ
             // legitimately. The record carries three independent extents and the
@@ -1265,7 +1448,7 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
         }
         for (auto &tensor : m.doc.tensors) {
             bool expert = false;
-            for (uint32_t l = 0; l < cfg.layers; ++l)
+            for (uint32_t l = cfg.dense_lead; l < cfg.layers && !expert; ++l)
                 for (const auto &suffix : suffixes)
                     if (tensor.name == layer_name(l, suffix)) expert = true;
             tensor.expert_tensor = expert;

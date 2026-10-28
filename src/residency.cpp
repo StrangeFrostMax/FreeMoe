@@ -172,10 +172,12 @@ BudgetResult compute_budget(const ModelManifest &manifest, const BudgetConfig &c
     b.fixed_weights_bytes = manifest.fixed_weight_bytes;
     const ModelConfig &cfg = manifest.config;
     // Under grouped-query attention the cache holds kv_heads * head_dim, not
-    // the full hidden width, so budgeting by `hidden` over-reserves.
+    // the full hidden width, so budgeting by `hidden` over-reserves. MLA stores
+    // a value of a different width than the key, so the two are summed.
     const uint64_t kv_dim = static_cast<uint64_t>(cfg.kv_heads) * cfg.head_dim;
+    const uint64_t v_dim = cfg.v_dim();
     b.kv_bytes = checked_mul(static_cast<uint64_t>(cfg.layers) * cfg.context,
-                             kv_dim * 2ull * sizeof(float), "KV cache");
+                             (kv_dim + v_dim) * sizeof(float), "KV cache");
     b.workspace_bytes = config.workspace_bytes;
     b.staging_bytes = config.staging_bytes;
     b.margin_bytes = config.margin_bytes;

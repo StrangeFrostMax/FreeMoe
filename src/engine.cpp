@@ -214,7 +214,8 @@ void Engine::load_fixed_weights() {
                              tensor.role == TensorRole::OUTPUT_NORM_BIAS ||
                              tensor.role == TensorRole::FFN_UP_BIAS ||
                              tensor.role == TensorRole::FFN_DOWN_BIAS ||
-                             tensor.role == TensorRole::OUTPUT_BIAS;
+                             tensor.role == TensorRole::OUTPUT_BIAS ||
+                             tensor.role == TensorRole::FFN_EXP_PROBS_B;
         if (tensor.type_id == 0 && !is_bias) continue; // already plain floats
         std::vector<float> values(tensor.dims[0]);
         dequantize_row(tensor.type_id, file_->data() + tensor.absolute_offset,
@@ -324,7 +325,11 @@ std::vector<uint32_t> Engine::topk(const std::vector<float> &scores, uint32_t k)
     std::vector<uint32_t> order(scores.size());
     for (uint32_t i = 0; i < order.size(); ++i) order[i] = i;
     std::stable_sort(order.begin(), order.end(), [&](uint32_t a, uint32_t b) {
-        if (!std::isfinite(scores[a]) || !std::isfinite(scores[b]))
+        // A NaN, or a positive infinity, means the router has diverged. A
+        // negative infinity is the documented way to mask an expert out (group
+        // limited routing does exactly that), so it is allowed through.
+        auto bad = [](float v) { return std::isnan(v) || v == std::numeric_limits<float>::infinity(); };
+        if (bad(scores[a]) || bad(scores[b]))
             fail(ErrorCode::INTERNAL_ERROR, "non-finite router score");
         if (scores[a] == scores[b]) return a < b;
         return scores[a] > scores[b];
@@ -488,7 +493,10 @@ std::vector<float> Engine::forward_token(int32_t token, uint64_t position,
     auto rmsnorm = [&](const std::vector<float> &x, const float *w, const std::string &name) {
         double ss = 0.0;
         for (float v : x) ss += static_cast<double>(v) * v;
-        double scale = 1.0 / std::sqrt(ss / c.hidden + c.rms_eps);
+        // RMS over the vector's own length, not the hidden size: MLA normalises
+        // the q and kv latents, which are narrower than `hidden`, and dividing
+        // by `hidden` scales those by sqrt(hidden/width).
+        double scale = 1.0 / std::sqrt(ss / static_cast<double>(x.size()) + c.rms_eps);
         std::vector<float> y(x.size());
         for (uint32_t i = 0; i < x.size(); ++i)
             y[i] = static_cast<float>(x[i] * scale * (norm_bias + w[i]));
@@ -579,10 +587,108 @@ std::vector<float> Engine::forward_token(int32_t token, uint64_t position,
         const std::vector<float> attn_normed = c.parallel_residual ? h : std::vector<float>();
         // Grouped-query attention: `kv_heads` key/value heads feed `heads`
         // query heads, each query head repeating a contiguous group.
+        // Under MLA the value width differs from the key width, so the two are
+        // tracked separately; for every other family v_dim == kv_dim.
         const uint32_t kv_dim = c.kv_heads * c.head_dim;
+        const uint32_t v_dim = c.v_dim();
+        // The cache stores one value per kv head, but every query head gets its
+        // own output slice, so the attention output is heads*head_v wide. These
+        // are the same under multi-head attention and differ under GQA.
+        const uint32_t attn_out_dim = c.heads * c.head_v_dim();
+        const uint32_t kv_stride = kv_dim + v_dim;
         const uint32_t group = c.heads / c.kv_heads;
         std::vector<float> q, k, v;
-        if (c.fused_qkv) {
+        if (c.mla) {
+            // Multi-head latent attention. The file stores no keys or values: a
+            // per-token latent is normalised, and each head expands it with its
+            // own slice of k_b / v_b. llama.cpp keeps the latent in the cache
+            // and absorbs k_b into the query; because k_b and v_b are linear and
+            // the attention weights do not depend on them, expanding per head is
+            // the same arithmetic, and it keeps one attention path for every
+            // architecture. Reported as `mla_expand` in the operation log.
+            std::vector<float> qflat;
+            if (c.q_lora_rank != 0) {
+                std::vector<float> qa = matvec_view(tensor_view(prefix + "attn_q_a.weight"), h,
+                                                    c.q_lora_rank, c.hidden,
+                                                    "attn_q_a.L" + std::to_string(layer));
+                qa = rmsnorm(qa, norm_weights(prefix + "attn_q_a_norm.weight"),
+                             "attn_q_a_norm.L" + std::to_string(layer));
+                qflat = matvec_view(tensor_view(prefix + "attn_q_b.weight"), qa,
+                                    c.heads * c.head_dim, c.q_lora_rank,
+                                    "attn_q_b.L" + std::to_string(layer));
+            } else {
+                qflat = matvec_view(tensor_view(prefix + "attn_q.weight"), h,
+                                    c.heads * c.head_dim, c.hidden,
+                                    "attn_q.L" + std::to_string(layer));
+            }
+            const uint32_t latent = c.kv_lora_rank;
+            std::vector<float> kvpe =
+                matvec_view(tensor_view(prefix + "attn_kv_a_mqa.weight"), h, latent + c.rope_dim,
+                            c.hidden, "attn_kv_a_mqa.L" + std::to_string(layer));
+            std::vector<float> ckv(kvpe.begin(), kvpe.begin() + latent);
+            std::vector<float> kpe(kvpe.begin() + latent, kvpe.end());
+            auto rope_part = [&](std::vector<float> &vec, uint32_t heads, uint32_t stride,
+                                 uint32_t offset, const std::string &name) {
+                // Rotary positions, applied to the rope slice only: the trailing
+                // `rope_dim` of each query head, and the whole shared k_pe.
+                const uint32_t width = c.rope_dim;
+                for (uint32_t head = 0; head < heads; ++head) {
+                    const size_t base = static_cast<size_t>(head) * stride + offset;
+                    for (uint32_t i = 0; i < width / 2; ++i) {
+                        const double inv =
+                            std::pow(c.rope_theta, -(2.0 * static_cast<double>(i)) / width);
+                        const double angle = static_cast<double>(position) * inv;
+                        const double cs = std::cos(angle);
+                        const double sn = std::sin(angle);
+                        const float a0 = vec[base + 2 * i];
+                        const float a1 = vec[base + 2 * i + 1];
+                        vec[base + 2 * i] = static_cast<float>(a0 * cs - a1 * sn);
+                        vec[base + 2 * i + 1] = static_cast<float>(a0 * sn + a1 * cs);
+                    }
+                }
+                backend_->record_control(name, vec.size() * sizeof(float),
+                                         vec.size() * sizeof(float));
+            };
+            rope_part(qflat, c.heads, c.head_dim, c.head_dim - c.rope_dim,
+                      "mla_rope_q.L" + std::to_string(layer));
+            rope_part(kpe, 1, c.rope_dim, 0, "mla_rope_k.L" + std::to_string(layer));
+            ckv = rmsnorm(ckv, norm_weights(prefix + "attn_kv_a_norm.weight"),
+                          "attn_kv_a_norm.L" + std::to_string(layer));
+
+            const uint32_t nope = c.head_dim - c.rope_dim;
+            const uint32_t head_v = c.head_v_dim();
+            k.assign(static_cast<size_t>(c.heads) * c.head_dim, 0.0f);
+            v.assign(static_cast<size_t>(c.heads) * head_v, 0.0f);
+            const float *kb = weights(prefix + "attn_k_b.weight");
+            const float *vb = weights(prefix + "attn_v_b.weight");
+            for (uint32_t head = 0; head < c.heads; ++head) {
+                float *k_head = k.data() + static_cast<size_t>(head) * c.head_dim;
+                // k_b is [nope, kv_lora_rank, heads], ggml's ne0-fastest order,
+                // so element (o, i, head) sits at o + nope*(i + latent*head): the
+                // latent index is the *slow* axis of each row, not the fast one.
+                const size_t kb_head = static_cast<size_t>(head) * nope * latent;
+                for (uint32_t o = 0; o < nope; ++o) {
+                    double acc = 0.0;
+                    for (uint32_t i = 0; i < latent; ++i)
+                        acc += kb[kb_head + static_cast<size_t>(i) * nope + o] * ckv[i];
+                    k_head[o] = static_cast<float>(acc);
+                }
+                for (uint32_t i = 0; i < c.rope_dim; ++i) k_head[nope + i] = kpe[i];
+                // v_b is [kv_lora_rank, head_v, heads].
+                float *v_head = v.data() + static_cast<size_t>(head) * head_v;
+                for (uint32_t o = 0; o < head_v; ++o) {
+                    const float *row = vb + (static_cast<size_t>(head) * head_v + o) * latent;
+                    double acc = 0.0;
+                    for (uint32_t i = 0; i < latent; ++i) acc += row[i] * ckv[i];
+                    v_head[o] = static_cast<float>(acc);
+                }
+            }
+            q = qflat;
+            backend_->record_control(
+                "mla_expand.L" + std::to_string(layer),
+                static_cast<uint64_t>(c.heads) * (nope + head_v) * latent * sizeof(float),
+                (k.size() + v.size()) * sizeof(float));
+        } else if (c.fused_qkv) {
             // phi3: one projection produces q, k and v back to back.
             std::vector<float> qkv =
                 matvec_view(tensor_view(prefix + "attn_qkv.weight"), h, c.hidden + 2 * kv_dim,
@@ -641,13 +747,13 @@ std::vector<float> Engine::forward_token(int32_t token, uint64_t position,
             head_norm(q, c.heads, q_scale, "qk_norm.q.L" + std::to_string(layer));
             head_norm(k, c.kv_heads, k_scale, "qk_norm.k.L" + std::to_string(layer));
         }
-        rope_half(q, c.heads, k, c.kv_heads, position);
+        if (!c.mla) rope_half(q, c.heads, k, c.kv_heads, position);
 
-        size_t current_base = (static_cast<size_t>(layer) * c.context + position) * 2 * kv_dim;
+        size_t current_base = (static_cast<size_t>(layer) * c.context + position) * kv_stride;
         std::memcpy(kv_ + current_base, k.data(), static_cast<size_t>(kv_dim) * sizeof(float));
-        std::memcpy(kv_ + current_base + kv_dim, v.data(), static_cast<size_t>(kv_dim) * sizeof(float));
+        std::memcpy(kv_ + current_base + kv_dim, v.data(), static_cast<size_t>(v_dim) * sizeof(float));
 
-        std::vector<float> attention(c.hidden, 0.0f);
+        std::vector<float> attention(attn_out_dim, 0.0f);
         double scale = 1.0 / std::sqrt(static_cast<double>(c.head_dim));
         for (uint32_t head = 0; head < c.heads; ++head) {
             const size_t hb = static_cast<size_t>(head) * c.head_dim;
@@ -660,7 +766,7 @@ std::vector<float> Engine::forward_token(int32_t token, uint64_t position,
                     : position + 1 - c.sliding_window;
             std::vector<double> scores(position + 1);
             for (uint64_t t = first_visible; t <= position; ++t) {
-                size_t base = (static_cast<size_t>(layer) * c.context + t) * 2 * kv_dim;
+                size_t base = (static_cast<size_t>(layer) * c.context + t) * kv_stride;
                 const float *kt = kv_ + base + kvb;
                 double dot = 0.0;
                 for (uint32_t j = 0; j < c.head_dim; ++j)
@@ -679,22 +785,24 @@ std::vector<float> Engine::forward_token(int32_t token, uint64_t position,
                 score_floats.push_back(static_cast<float>(value));
             }
             std::vector<float> probs = softmax(score_floats);
-            std::vector<double> acc(c.head_dim, 0.0);
+            std::vector<double> acc(c.head_v_dim(), 0.0);
+            const size_t vb = static_cast<size_t>(head / group) * c.head_v_dim();
             for (uint64_t t = first_visible; t <= position; ++t) {
-                size_t base = (static_cast<size_t>(layer) * c.context + t) * 2 * kv_dim;
-                const float *vt = kv_ + base + kv_dim + kvb;
+                size_t base = (static_cast<size_t>(layer) * c.context + t) * kv_stride;
+                const float *vt = kv_ + base + kv_dim + vb;
                 double p = probs[t - first_visible];
-                for (uint32_t j = 0; j < c.head_dim; ++j) acc[j] += p * vt[j];
+                for (uint32_t j = 0; j < c.head_v_dim(); ++j) acc[j] += p * vt[j];
             }
-            for (uint32_t j = 0; j < c.head_dim; ++j)
-                attention[hb + j] = static_cast<float>(acc[j]);
+            const size_t ab = static_cast<size_t>(head) * c.head_v_dim();
+            for (uint32_t j = 0; j < c.head_v_dim(); ++j)
+                attention[ab + j] = static_cast<float>(acc[j]);
         }
         backend_->record_control("attention.L" + std::to_string(layer),
-                                 (position + 1) * kv_dim * 2 * sizeof(float),
-                                 c.hidden * sizeof(float));
+                                 (position + 1) * kv_stride * sizeof(float),
+                                 attention.size() * sizeof(float));
         std::vector<float> attn_out =
-            matvec_view(tensor_view(prefix + "attn_output.weight"), attention, c.hidden, c.hidden,
-                        "attn_output.L" + std::to_string(layer));
+            matvec_view(tensor_view(prefix + "attn_output.weight"), attention, c.hidden,
+                        attn_out_dim, "attn_output.L" + std::to_string(layer));
         if (c.attn_output_bias) {
             const float *b = bias_weights(prefix + "attn_output.bias");
             for (uint32_t i = 0; i < c.hidden; ++i) attn_out[i] += b[i];
@@ -712,7 +820,9 @@ std::vector<float> Engine::forward_token(int32_t token, uint64_t position,
             h = norm(x, prefix + "ffn_norm", "ffn_norm.L" + std::to_string(layer));
         }
         std::vector<float> ffn(c.hidden, 0.0f);
-        if (c.model_kind == "dense" && c.ffn_no_gate) {
+        // The leading blocks of an MoE model can still carry a plain FFN.
+        const bool moe_layer = c.model_kind == "moe" && layer >= c.dense_lead;
+        if (!moe_layer && c.ffn_no_gate) {
             // phi2: one up projection, GELU, one down projection, both biased.
             std::vector<float> act = matvec_view(tensor_view(prefix + "ffn_up.weight"), h,
                                                  c.intermediate, c.hidden,
@@ -734,7 +844,7 @@ std::vector<float> Engine::forward_token(int32_t token, uint64_t position,
                 backend_->record_control("ffn_down_bias.L" + std::to_string(layer),
                                          ffn.size() * sizeof(float), 0);
             }
-        } else if (c.model_kind == "dense") {
+        } else if (!moe_layer) {
             std::vector<float> gate, up;
             if (c.fused_gate_up) {
                 // glm4: one projection emits both halves, gate first then up
@@ -761,18 +871,77 @@ std::vector<float> Engine::forward_token(int32_t token, uint64_t position,
             std::vector<float> scores =
                 matvec_view(tensor_view(prefix + "ffn_router.weight"), h, c.expert_count, c.hidden,
                             "router.L" + std::to_string(layer));
-            // Full softmax over every expert, then top-k on the probabilities.
-            // Renormalising over only the selected experts is a different
-            // function whenever top_k < expert_count, so the model's own
-            // semantics decide: normalise only when the checkpoint asks for it.
-            std::vector<float> probs = softmax(scores);
-            std::vector<uint32_t> ids = topk(probs, c.expert_top_k);
+            // Which function turns logits into probabilities is a per-family
+            // fact: V2 softmaxes, V3 and later use a sigmoid. The weights that
+            // come out are always the *unbiased* probabilities; a selection
+            // bias only changes which experts are picked.
+            std::vector<float> probs(scores.size());
+            if (c.expert_gating == "sigmoid") {
+                for (size_t i = 0; i < scores.size(); ++i)
+                    probs[i] = static_cast<float>(1.0 / (1.0 + std::exp(-static_cast<double>(scores[i]))));
+            } else if (c.expert_gating == "sqrt-softplus") {
+                for (size_t i = 0; i < scores.size(); ++i)
+                    probs[i] = static_cast<float>(
+                        std::sqrt(std::log1p(std::exp(static_cast<double>(scores[i])))));
+            } else if (c.expert_gating == "softmax-weight") {
+                // Weights are softmaxed over the selected experts below, so the
+                // probabilities here are the raw logits.
+                probs = scores;
+            } else {
+                probs = softmax(scores);
+            }
+            backend_->record_control("router_gating.L" + std::to_string(layer),
+                                     scores.size() * sizeof(float), probs.size() * sizeof(float));
+
+            std::vector<float> selection(probs);
+            if (c.expert_selection_bias) {
+                const float *b = bias_weights(prefix + "ffn_exp_probs_b.bias");
+                for (size_t i = 0; i < selection.size(); ++i) selection[i] += b[i];
+                backend_->record_control("router_bias.L" + std::to_string(layer),
+                                         selection.size() * sizeof(float), 0);
+            }
+            if (c.expert_groups > 1) {
+                // Group-limited routing (deepseek V3): keep the groups whose two
+                // best experts score highest in total, and mask the rest out of
+                // the selection.
+                const uint32_t per_group = c.expert_count / c.expert_groups;
+                std::vector<std::pair<float, uint32_t>> group_scores;
+                group_scores.reserve(c.expert_groups);
+                for (uint32_t g = 0; g < c.expert_groups; ++g) {
+                    std::vector<float> best;
+                    for (uint32_t e = 0; e < per_group; ++e)
+                        best.push_back(selection[g * per_group + e]);
+                    std::sort(best.begin(), best.end(), std::greater<float>());
+                    float sum = 0.0f;
+                    for (uint32_t k = 0; k < std::min<uint32_t>(2, per_group); ++k) sum += best[k];
+                    group_scores.emplace_back(sum, g);
+                }
+                std::stable_sort(group_scores.begin(), group_scores.end(),
+                                 [](const auto &a, const auto &b) {
+                                     if (a.first != b.first) return a.first > b.first;
+                                     return a.second < b.second;
+                                 });
+                std::vector<bool> keep(c.expert_groups, false);
+                for (uint32_t i = 0; i < std::min(c.expert_groups_used, c.expert_groups); ++i)
+                    keep[group_scores[i].second] = true;
+                for (uint32_t g = 0; g < c.expert_groups; ++g) {
+                    if (keep[g]) continue;
+                    for (uint32_t e = 0; e < per_group; ++e)
+                        selection[g * per_group + e] = -std::numeric_limits<float>::infinity();
+                }
+                backend_->record_control("router_groups.L" + std::to_string(layer),
+                                         selection.size() * sizeof(float),
+                                         c.expert_groups * sizeof(uint32_t));
+            }
+            std::vector<uint32_t> ids = topk(selection, c.expert_top_k);
             std::vector<float> selected_weights(c.expert_top_k);
             float total = 0.0f;
             for (uint32_t i = 0; i < c.expert_top_k; ++i) {
                 selected_weights[i] = probs[ids[i]];
                 total += selected_weights[i];
             }
+            if (c.expert_gating == "softmax-weight")
+                selected_weights = softmax(selected_weights);
             if (c.expert_weights_norm && total > 0.0f) {
                 for (float &w : selected_weights) w /= total;
             }
@@ -839,11 +1008,14 @@ std::vector<float> Engine::forward_token(int32_t token, uint64_t position,
                 // division is NaN at exactly s == 0, so the limit 0.5 is used
                 // there instead. Every other value is identical.
                 const uint32_t swidth = c.shared_expert_intermediate;
-                std::vector<float> s_in = matvec_view(
-                    tensor_view(prefix + "ffn_gate_inp_shexp.weight"), h, 1, c.hidden,
-                    "shexp_gate_inp.L" + std::to_string(layer));
-                const float s = s_in[0];
-                const float gate_scalar = s != 0.0f ? activate(s) / s : 0.5f;
+                float gate_scalar = 1.0f;
+                if (c.shared_expert_gate) {
+                    std::vector<float> s_in = matvec_view(
+                        tensor_view(prefix + "ffn_gate_inp_shexp.weight"), h, 1, c.hidden,
+                        "shexp_gate_inp.L" + std::to_string(layer));
+                    const float s = s_in[0];
+                    gate_scalar = s != 0.0f ? activate(s) / s : 0.5f;
+                }
                 std::vector<float> s_gate = matvec_view(
                     tensor_view(prefix + "ffn_gate_shexp.weight"), h, swidth, c.hidden,
                     "shexp_gate.L" + std::to_string(layer));
@@ -915,6 +1087,13 @@ PromptResult Engine::run_prompt(const std::string &prompt, uint32_t generated_to
         result.generated_ids.push_back(token);
         backend_->record_control(config_.sampling.greedy() ? "greedy_sampling" : "sampled_sampling",
                                  logits.size() * sizeof(float), sizeof(int32_t));
+        // Generation ends at the checkpoint's end-of-sequence token. Emitting it
+        // and continuing would produce text the model asked not to produce, and
+        // it is the one stopping rule every reference implementation shares.
+        if (static_cast<uint32_t>(token) == manifest_.config.eos_id) {
+            result.inter_token_ms.push_back(step_timer.elapsed_ms());
+            break;
+        }
         logits = forward_token(token, position, "decode", &result.routing);
         ++position;
         result.inter_token_ms.push_back(step_timer.elapsed_ms());

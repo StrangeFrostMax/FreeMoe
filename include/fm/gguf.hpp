@@ -105,6 +105,21 @@ enum class TensorRole : uint32_t {
     FFN_UP_BIAS,
     FFN_DOWN_BIAS,
     OUTPUT_BIAS,
+    // MLA: q through a low-rank bottleneck, and the kv latent that each head
+    // expands with its own slice of k_b / v_b.
+    ATTN_Q_A,
+    ATTN_Q_A_NORM,
+    ATTN_Q_B,
+    ATTN_KV_A_MQA,
+    ATTN_KV_A_NORM,
+    ATTN_K_B,
+    ATTN_V_B,
+    // ffn_exp_probs_b: added to the router output for *selection* only.
+    FFN_EXP_PROBS_B,
+    // Tensors that are valid in the file but are not part of the main forward
+    // pass (nextn/MTP heads, vision towers). They are named in the probe rather
+    // than silently dropped.
+    IGNORED,
 };
 
 const char *tensor_role_name(TensorRole role);
@@ -220,6 +235,9 @@ struct ModelConfig {
     // not the dense width, so it is stored separately. 0 means "no shared
     // expert", which keeps every other architecture's path unchanged.
     bool shared_expert = false;
+    // qwen2moe scales the shared expert with one scalar per token; the deepseek
+    // family adds it unscaled. The gate tensor's presence decides.
+    bool shared_expert_gate = false;
     uint32_t shared_expert_intermediate = 0;
     // Routed experts may be narrower than the dense FFN (`expert_feed_forward_
     // length`). 0 means "same as intermediate", the usual case.
@@ -238,6 +256,30 @@ struct ModelConfig {
     bool ffn_bias = false;          // biases on ffn_up / ffn_down
     bool attn_output_bias = false;  // bias on attn_output
     bool logit_bias = false;        // bias on the output projection
+
+    // --- multi-head latent attention (the deepseek family) ------------------
+    // The decoder never forms full keys and values: it projects into a
+    // low-rank latent per token, and each head expands it. `head_dim` is the
+    // *key* width (nope + rope); `head_v` is the value width, which differs.
+    bool mla = false;
+    uint32_t q_lora_rank = 0;   // 0 for the "lite" variant: q projected in one step
+    uint32_t kv_lora_rank = 0;
+    uint32_t head_v = 0;
+    // Leading dense blocks: the first N layers use a plain FFN, the rest MoE.
+    uint32_t dense_lead = 0;
+
+    // Router semantics. The gating function is not implied by "MoE": deepseek
+    // V2 softmaxes, V3 and later use a sigmoid, and some families use
+    // sqrt(softplus). A selection bias and group-limited routing change which
+    // experts are picked without changing their weights.
+    std::string expert_gating = "softmax";
+    bool expert_selection_bias = false;
+    uint32_t expert_groups = 0;
+    uint32_t expert_groups_used = 0;
+
+    // Value width per head; everywhere outside MLA this equals head_dim.
+    uint32_t head_v_dim() const { return head_v ? head_v : head_dim; }
+    uint32_t v_dim() const { return kv_heads * head_v_dim(); }
 };
 
 struct ExpertExtent {
@@ -271,6 +313,9 @@ struct ModelManifest {
     uint64_t fixed_weight_bytes = 0;
     uint64_t expert_tensor_bytes = 0;
     uint64_t slot_bytes = 0;
+    // Tensors that are valid in the file but outside the main forward pass,
+    // with the reason. Reported rather than silently dropped.
+    std::vector<std::pair<std::string, std::string>> ignored_tensors;
 
     // Looks up by real name first, then by canonical name. Adapters may rename
     // a vendor tensor (ffn_gate_inp -> ffn_router) while `doc` keeps the
