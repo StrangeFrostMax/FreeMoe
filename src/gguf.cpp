@@ -126,6 +126,12 @@ const char *tensor_role_name(TensorRole role) {
     case TensorRole::FFN_GATE_SHEXP: return "FFN_GATE_SHEXP";
     case TensorRole::FFN_UP_SHEXP: return "FFN_UP_SHEXP";
     case TensorRole::FFN_DOWN_SHEXP: return "FFN_DOWN_SHEXP";
+    case TensorRole::ATTN_NORM_BIAS: return "ATTN_NORM_BIAS";
+    case TensorRole::FFN_NORM_BIAS: return "FFN_NORM_BIAS";
+    case TensorRole::OUTPUT_NORM_BIAS: return "OUTPUT_NORM_BIAS";
+    case TensorRole::FFN_UP_BIAS: return "FFN_UP_BIAS";
+    case TensorRole::FFN_DOWN_BIAS: return "FFN_DOWN_BIAS";
+    case TensorRole::OUTPUT_BIAS: return "OUTPUT_BIAS";
     }
     return "UNKNOWN";
 }
@@ -341,7 +347,9 @@ TensorRole role_from_name(const std::string &name, uint32_t &layer) {
     layer = 0;
     if (name == "token_embd.weight") return TensorRole::TOKEN_EMBD;
     if (name == "output.weight") return TensorRole::OUTPUT;
+    if (name == "output.bias") return TensorRole::OUTPUT_BIAS;
     if (name == "output_norm.weight") return TensorRole::OUTPUT_NORM;
+    if (name == "output_norm.bias") return TensorRole::OUTPUT_NORM_BIAS;
     static const std::vector<std::pair<std::string, TensorRole>> suffixes = {
         {"attn_norm.weight", TensorRole::ATTN_NORM},
         {"attn_q.weight", TensorRole::ATTN_Q},
@@ -372,6 +380,10 @@ TensorRole role_from_name(const std::string &name, uint32_t &layer) {
         {"ffn_gate_shexp.weight", TensorRole::FFN_GATE_SHEXP},
         {"ffn_up_shexp.weight", TensorRole::FFN_UP_SHEXP},
         {"ffn_down_shexp.weight", TensorRole::FFN_DOWN_SHEXP},
+        {"attn_norm.bias", TensorRole::ATTN_NORM_BIAS},
+        {"ffn_norm.bias", TensorRole::FFN_NORM_BIAS},
+        {"ffn_up.bias", TensorRole::FFN_UP_BIAS},
+        {"ffn_down.bias", TensorRole::FFN_DOWN_BIAS},
     };
     for (const auto &entry : suffixes)
         if (parse_layer_suffix(name, entry.first, layer)) return entry.second;
@@ -615,7 +627,7 @@ bool is_llama_family(const std::string &arch) {
     static const std::set<std::string> family = {
         "llama", "qwen2", "qwen3", "smollm", "smollm2", "tinyllama",
         "gemma", "gemma2", "gemma3", "phi3", "minicpm", "qwen3moe", "glm4",
-        "qwen2moe",
+        "qwen2moe", "phi2",
     };
     return family.count(arch) != 0;
 }
@@ -813,6 +825,77 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
 
     if (opt_double(doc, keys("attention.layer_norm_rms_epsilon"), &number)) cfg.rms_eps = number;
     else cfg.rms_eps = 1e-5;
+
+    // Norm type. RMSNorm files declare `attention.layer_norm_rms_epsilon`;
+    // LayerNorm files declare `attention.layer_norm_epsilon`. That key is the
+    // evidence, so the norm is chosen from it rather than from the arch name.
+    {
+        const bool has_ln = opt_metadata(doc, arch + ".attention.layer_norm_epsilon", nullptr);
+        const bool has_rms = opt_metadata(doc, arch + ".attention.layer_norm_rms_epsilon", nullptr);
+        if (has_ln && has_rms)
+            fail(ErrorCode::METADATA_MISMATCH,
+                 "the file declares both a LayerNorm and an RMSNorm epsilon; the norm type is "
+                 "ambiguous");
+        if (has_ln) {
+            cfg.layer_norm = true;
+            if (opt_double(doc, keys("attention.layer_norm_epsilon"), &number)) cfg.rms_eps = number;
+        }
+    }
+    // Biased norms, and the biases phi2 puts on the FFN, the attention output
+    // and the logits. All of them are read from the tensors.
+    {
+        const bool attn_nb = doc.tensor_by_name.count(layer_name(0, "attn_norm.bias")) != 0;
+        const bool out_nb = doc.tensor_by_name.count("output_norm.bias") != 0;
+        const bool ffn_present =
+            doc.tensor_by_name.count(layer_name(0, "ffn_norm.weight")) != 0;
+        const bool ffn_nb = doc.tensor_by_name.count(layer_name(0, "ffn_norm.bias")) != 0;
+        if ((attn_nb || out_nb || ffn_nb) && !(attn_nb && out_nb && (!ffn_present || ffn_nb)))
+            fail(ErrorCode::MISSING_REQUIRED_TENSOR,
+                 "norm biases must be present on every norm, or on none");
+        if (attn_nb != out_nb)
+            fail(ErrorCode::MISSING_REQUIRED_TENSOR,
+                 "the attention norm and the final norm disagree about carrying a bias");
+        cfg.norm_bias = attn_nb;
+        const bool up_b = doc.tensor_by_name.count(layer_name(0, "ffn_up.bias")) != 0;
+        const bool down_b = doc.tensor_by_name.count(layer_name(0, "ffn_down.bias")) != 0;
+        if (up_b != down_b)
+            fail(ErrorCode::MISSING_REQUIRED_TENSOR,
+                 "ffn_up and ffn_down must both carry a bias or neither");
+        cfg.ffn_bias = up_b;
+        cfg.attn_output_bias = doc.tensor_by_name.count(layer_name(0, "attn_output.bias")) != 0;
+        cfg.logit_bias = doc.tensor_by_name.count("output.bias") != 0;
+        // A block with no FFN norm can only work if the FFN reuses the
+        // attention's normalised input: that is phi2's parallel residual.
+        if (!ffn_present) {
+            if (doc.tensor_by_name.count(layer_name(0, "attn_norm.weight")) == 0)
+                fail(ErrorCode::MISSING_REQUIRED_TENSOR,
+                     "no ffn_norm and no attn_norm: nothing normalises the FFN input");
+            cfg.parallel_residual = true;
+        }
+        // A block with up/down but no gate has no gated activation at all. The
+        // activation itself is not representable in GGUF metadata, so it comes
+        // from the architecture table -- the only such decision in this file,
+        // and the reason each such architecture needs a parity fixture.
+        const bool has_gate = doc.tensor_by_name.count(layer_name(0, "ffn_gate.weight")) != 0;
+        // A [hidden, 2*intermediate] up tensor is glm4's fused gate+up, not a
+        // gate-free FFN, so the width decides between the two.
+        const auto up_it = doc.tensor_by_name.find(layer_name(0, "ffn_up.weight"));
+        const bool up_present = up_it != doc.tensor_by_name.end();
+        const bool fused_width =
+            up_present && doc.tensors[up_it->second].dims.size() == 2 &&
+            doc.tensors[up_it->second].dims[1] == static_cast<uint64_t>(cfg.intermediate) * 2;
+        if (!has_gate && up_present && cfg.expert_count == 0 && !fused_width)
+            cfg.ffn_no_gate = true;
+    }
+    if (cfg.ffn_no_gate) {
+        // Only the gate-free activations this build can reproduce are accepted.
+        const bool gelu_arch = arch == "phi2";
+        if (!gelu_arch)
+            fail(ErrorCode::NOT_IMPLEMENTED,
+                 "a gate-free feed-forward is only defined for phi2 here; refusing rather than "
+                 "guessing its activation");
+        cfg.activation = "gelu";
+    }
     if (opt_double(doc, keys("rope.freq_base"), &number)) cfg.rope_theta = number;
     else if (opt_double(doc, keys("rope_theta"), &number)) cfg.rope_theta = number;
     else cfg.rope_theta = 10000.0;
@@ -915,7 +998,7 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
     // glm4 keeps the FFN gate and up halves in a single tensor. Detected from
     // the shapes rather than the architecture name, because the same adapter
     // serves both layouts.
-    if (cfg.expert_count == 0) {
+    if (cfg.expert_count == 0 && !cfg.ffn_no_gate) {
         const TensorInfo *up = m.tensor(layer_name(0, "ffn_up.weight"));
         const bool has_gate = doc.tensor_by_name.count(layer_name(0, "ffn_gate.weight")) != 0;
         if (!up)
@@ -943,9 +1026,19 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
     const bool tied_output = m.doc.tensor_by_name.count("output.weight") == 0;
     if (tied_output) m.alias["output.weight"] = "token_embd.weight";
     else expect("output.weight");
+    if (cfg.norm_bias) expect("output_norm.bias");
+    if (cfg.logit_bias) expect("output.bias");
     for (uint32_t l = 0; l < cfg.layers; ++l) {
-        for (const char *suffix : {"attn_norm.weight", "attn_output.weight", "ffn_norm.weight"})
+        for (const char *suffix : {"attn_norm.weight", "attn_output.weight"})
             expect(layer_name(l, suffix));
+        if (!cfg.parallel_residual) expect(layer_name(l, "ffn_norm.weight"));
+        if (cfg.norm_bias) expect(layer_name(l, "attn_norm.bias"));
+        if (cfg.attn_output_bias) expect(layer_name(l, "attn_output.bias"));
+        if (cfg.ffn_bias) {
+            expect(layer_name(l, "ffn_up.bias"));
+            expect(layer_name(l, "ffn_down.bias"));
+        }
+        if (cfg.norm_bias && !cfg.parallel_residual) expect(layer_name(l, "ffn_norm.bias"));
         if (cfg.fused_qkv) {
             expect(layer_name(l, "attn_qkv.weight"));
         } else {
@@ -977,6 +1070,9 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
         } else if (cfg.fused_gate_up) {
             for (const char *suffix : {"ffn_up.weight", "ffn_down.weight"})
                 expect(layer_name(l, suffix));
+        } else if (cfg.ffn_no_gate) {
+            for (const char *suffix : {"ffn_up.weight", "ffn_down.weight"})
+                expect(layer_name(l, suffix));
         } else {
             for (const char *suffix : {"ffn_gate.weight", "ffn_up.weight", "ffn_down.weight"})
                 expect(layer_name(l, suffix));
@@ -1002,7 +1098,9 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
             fail(ErrorCode::UNKNOWN_TENSOR, "cannot map tensor role for " + tensor.name);
         tensor.role = role;
         const bool global_role = role == TensorRole::TOKEN_EMBD || role == TensorRole::OUTPUT ||
-                                 role == TensorRole::OUTPUT_NORM;
+                                 role == TensorRole::OUTPUT_NORM ||
+                                 role == TensorRole::OUTPUT_BIAS ||
+                                 role == TensorRole::OUTPUT_NORM_BIAS;
         tensor.layer = global_role ? -1 : static_cast<int>(layer);
         tensor.canonical = role == TensorRole::FFN_ROUTER
                                ? layer_name(layer, "ffn_router.weight")
@@ -1032,9 +1130,21 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
     if (const TensorInfo *t = m.tensor("output.weight"))
         expect_dims(*t, {cfg.hidden, cfg.vocab});
     expect_dims(*m.tensor("output_norm.weight"), {cfg.hidden});
+    if (cfg.norm_bias) expect_dims(*m.tensor("output_norm.bias"), {cfg.hidden});
+    if (cfg.logit_bias) expect_dims(*m.tensor("output.bias"), {cfg.vocab});
     for (uint32_t l = 0; l < cfg.layers; ++l) {
         expect_dims(*m.tensor(layer_name(l, "attn_norm.weight")), {cfg.hidden});
-        expect_dims(*m.tensor(layer_name(l, "ffn_norm.weight")), {cfg.hidden});
+        if (!cfg.parallel_residual)
+            expect_dims(*m.tensor(layer_name(l, "ffn_norm.weight")), {cfg.hidden});
+        if (cfg.norm_bias) expect_dims(*m.tensor(layer_name(l, "attn_norm.bias")), {cfg.hidden});
+        if (cfg.attn_output_bias)
+            expect_dims(*m.tensor(layer_name(l, "attn_output.bias")), {cfg.hidden});
+        if (cfg.ffn_bias) {
+            expect_dims(*m.tensor(layer_name(l, "ffn_up.bias")), {cfg.intermediate});
+            expect_dims(*m.tensor(layer_name(l, "ffn_down.bias")), {cfg.hidden});
+        }
+        if (cfg.norm_bias && !cfg.parallel_residual)
+            expect_dims(*m.tensor(layer_name(l, "ffn_norm.bias")), {cfg.hidden});
         if (cfg.fused_qkv) {
             // The fused projection holds q, then k, then v along its output axis.
             expect_dims(*m.tensor(layer_name(l, "attn_qkv.weight")),
@@ -1081,6 +1191,10 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
                 expect_dims(*m.tensor(layer_name(l, "ffn_down_shexp.weight")),
                             {swidth, cfg.hidden});
             }
+        } else if (cfg.ffn_no_gate) {
+            expect_dims(*m.tensor(layer_name(l, "ffn_up.weight")), {cfg.hidden, cfg.intermediate});
+            expect_dims(*m.tensor(layer_name(l, "ffn_down.weight")),
+                        {cfg.intermediate, cfg.hidden});
         } else if (cfg.fused_gate_up) {
             expect_dims(*m.tensor(layer_name(l, "ffn_up.weight")),
                         {cfg.hidden, static_cast<uint64_t>(cfg.intermediate) * 2});

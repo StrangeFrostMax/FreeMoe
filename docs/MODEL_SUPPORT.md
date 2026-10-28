@@ -48,7 +48,8 @@ each family, the tool records what a specific file contains.
 | `minicpm`: embedding scale (12.0 by default), tied output | WORKS |
 | `qwen3moe`: qwen3 q/k norm with stacked-expert FFN and router | WORKS |
 | `qwen2moe`: routed experts plus a dense shared expert, gated per token | WORKS |
-| `glm4-moe`, `minicpm3`, and the remaining 159 architectures in llama.cpp's `src/models/` | **MISSING** |
+| `phi2`: LayerNorm with biases, gate-free GELU FFN, one shared residual | WORKS |
+| `glm4-moe`, `minicpm3`, MLA attention (`deepseek2`), and the remaining 158 architectures in llama.cpp's `src/models/` | **MISSING** |
 | PrismML rotated weight basis (`prism.hadamard.*`) and Hadamard activation transform | **MISSING**, hard blocker |
 | Hybrid linear attention (`ssm_*`, `conv1d` state) | **MISSING**, hard blocker |
 | Shared-expert MoE (`expert_shared_count`) | **MISSING**, refused rather than dropped |
@@ -185,7 +186,8 @@ a feature (biases, q/k norm, embedding scale, softcapping, sliding window) would
 produce logits identical to the plain fixture and the test would catch it.
 
 Current parity fixtures: `llama-gqa`, `qwen2-bias`, `qwen3-qknorm`, `gemma`,
-`gemma2`, `phi3-fused`, `glm4`, `minicpm`, `qwen3moe`, `qwen2moe`.
+`gemma2`, `phi3-fused`, `glm4`, `minicpm`, `qwen3moe`, `qwen2moe`,
+`phi2-layernorm`.
 
 ### What each architecture actually needed
 
@@ -197,9 +199,24 @@ Read from llama.cpp's `src/models/`, not guessed from the model names:
 | `minicpm` | token embedding scaled (12.0 by default) before the first block; tied output |
 | `qwen3moe` | qwen3's per-head q/k norm combined with a stacked-expert FFN and router |
 | `qwen2moe` | routed experts plus a *dense* shared expert, whose whole branch is scaled by one scalar per token; three separate feed-forward widths |
+| `phi2` | LayerNorm with a bias instead of RMSNorm; no `ffn_norm` at all, because the FFN runs on the attention's normalised input and both branches add to one residual; gate-free GELU FFN with biases; biases on the attention output and the logits |
 
 `glm4` also parses `rope.dimension_sections` for multimodal RoPE; a text-only
 checkpoint omits it and uses standard RoPE, which is what is implemented.
+
+### The one thing GGUF does not say
+
+Everything above is decided from tensors, shapes or a metadata key: the norm
+type comes from which epsilon key the file declares, the biases from the
+tensors, the fused layouts from the shapes, and a missing `ffn_norm` from the
+absence of the tensor.
+
+The *activation function* is the exception. GGUF has no key for it, so a
+gate-free FFN — up, activation, down, with no gate to disambiguate it — cannot
+be identified from the file at all. FreeMoe therefore accepts a gate-free FFN
+only for `phi2`, applies GELU there, and refuses every other architecture with
+a `NOT_IMPLEMENTED` error rather than guessing. A parity fixture is the check,
+and `phi2-layernorm` is that fixture.
 
 ### A reference that does not do what it documents
 
@@ -227,9 +244,11 @@ from silence, and `minicpm_scales` pins the decision in a test.
 5. **Q6_K / Q3_K / Q2_K / Q5_K AVX2 kernels** — correctness is already there via
    the scalar path; this is the throughput step.
 6. ~~Architecture variants: `gemma`, `phi3`, `qwen2`, `qwen3`, `glm4`,
-   `minicpm`, `qwen3moe`, `qwen2moe`.~~ **DONE**
+   `minicpm`, `qwen3moe`, `qwen2moe`, `phi2`.~~ **DONE**
    Still open: `glm4-moe`, `minicpm3`, MLA (`deepseek2`), and the rest of
-   llama.cpp's `src/models/` tree.
+   llama.cpp's `src/models/` tree. MLA is the largest remaining capability:
+   it needs low-rank q/kv compression plus per-layer dense-lead blocks, so it
+   is its own milestone rather than a variant of the attention already here.
 7. **Ternary formats** (`PTQ1_0`/`TQ1_0`/`TQ2_0`) for #20 and #21.
 8. **Multimodal** (#8) is out of scope for this engine: the text decoder can be
    supported, the vision tower cannot, and pretending otherwise would be the

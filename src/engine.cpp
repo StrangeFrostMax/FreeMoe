@@ -200,11 +200,21 @@ void Engine::load_fixed_weights() {
     for (const auto &tensor : manifest_.doc.tensors) {
         if (tensor.expert_tensor) continue;
         if (tensor.dims.size() != 1) continue;
+        // Every 1-D vector is either a norm scale (read as a scale, possibly
+        // with a bias) or a projection bias (added). phi2 adds biases to the
+        // norms, the FFN and the output, so this is a role test rather than a
+        // list of attention-only roles.
         const bool is_bias = tensor.role == TensorRole::ATTN_Q_BIAS ||
                              tensor.role == TensorRole::ATTN_K_BIAS ||
                              tensor.role == TensorRole::ATTN_V_BIAS ||
                              tensor.role == TensorRole::ATTN_OUTPUT_BIAS ||
-                             tensor.role == TensorRole::ATTN_QKV_BIAS;
+                             tensor.role == TensorRole::ATTN_QKV_BIAS ||
+                             tensor.role == TensorRole::ATTN_NORM_BIAS ||
+                             tensor.role == TensorRole::FFN_NORM_BIAS ||
+                             tensor.role == TensorRole::OUTPUT_NORM_BIAS ||
+                             tensor.role == TensorRole::FFN_UP_BIAS ||
+                             tensor.role == TensorRole::FFN_DOWN_BIAS ||
+                             tensor.role == TensorRole::OUTPUT_BIAS;
         if (tensor.type_id == 0 && !is_bias) continue; // already plain floats
         std::vector<float> values(tensor.dims[0]);
         dequantize_row(tensor.type_id, file_->data() + tensor.absolute_offset,
@@ -485,6 +495,36 @@ std::vector<float> Engine::forward_token(int32_t token, uint64_t position,
         backend_->record_control(name, x.size() * sizeof(float) * 2, y.size() * sizeof(float));
         return y;
     };
+    // LayerNorm: mean-centred, with a bias. phi2 is the first architecture here
+    // that needs it, and the norm type is chosen from the checkpoint's epsilon
+    // key rather than from the architecture name.
+    auto layernorm = [&](const std::vector<float> &x, const float *w, const float *b,
+                         const std::string &name) {
+        double mean = 0.0;
+        for (float v : x) mean += v;
+        mean /= x.size();
+        double var = 0.0;
+        for (float v : x) {
+            const double d = static_cast<double>(v) - mean;
+            var += d * d;
+        }
+        var /= x.size();
+        const double scale = 1.0 / std::sqrt(var + c.rms_eps);
+        std::vector<float> y(x.size());
+        for (uint32_t i = 0; i < x.size(); ++i)
+            y[i] = static_cast<float>((static_cast<double>(x[i]) - mean) * scale * w[i] + b[i]);
+        backend_->record_control(name, x.size() * sizeof(float) * 3, y.size() * sizeof(float));
+        return y;
+    };
+    // One call site for both norm types keeps every layer honest about which
+    // one the checkpoint asked for.
+    auto norm = [&](const std::vector<float> &x, const std::string &prefix,
+                    const std::string &label) {
+        const std::string w = prefix + ".weight";
+        const std::string b = prefix + ".bias";
+        if (c.layer_norm) return layernorm(x, norm_weights(w), bias_weights(b), label);
+        return rmsnorm(x, norm_weights(w), label);
+    };
     auto silu = [](float x) {
         return static_cast<float>(static_cast<double>(x) / (1.0 + std::exp(-static_cast<double>(x))));
     };
@@ -533,8 +573,10 @@ std::vector<float> Engine::forward_token(int32_t token, uint64_t position,
 
     for (uint32_t layer = 0; layer < c.layers; ++layer) {
         const std::string prefix = "blk." + std::to_string(layer) + ".";
-        std::vector<float> h = rmsnorm(x, norm_weights(prefix + "attn_norm.weight"),
-                                       "rmsnorm.attn.L" + std::to_string(layer));
+        std::vector<float> h = norm(x, prefix + "attn_norm", "attn_norm.L" + std::to_string(layer));
+        // phi2 runs the FFN on the *attention's* normalised input and adds both
+        // branches to the same residual, so `h` is reused rather than replaced.
+        const std::vector<float> attn_normed = c.parallel_residual ? h : std::vector<float>();
         // Grouped-query attention: `kv_heads` key/value heads feed `heads`
         // query heads, each query head repeating a contiguous group.
         const uint32_t kv_dim = c.kv_heads * c.head_dim;
@@ -653,15 +695,46 @@ std::vector<float> Engine::forward_token(int32_t token, uint64_t position,
         std::vector<float> attn_out =
             matvec_view(tensor_view(prefix + "attn_output.weight"), attention, c.hidden, c.hidden,
                         "attn_output.L" + std::to_string(layer));
+        if (c.attn_output_bias) {
+            const float *b = bias_weights(prefix + "attn_output.bias");
+            for (uint32_t i = 0; i < c.hidden; ++i) attn_out[i] += b[i];
+            backend_->record_control("attn_output_bias.L" + std::to_string(layer),
+                                     attn_out.size() * sizeof(float), 0);
+        }
         if (c.post_norms)
             attn_out = rmsnorm(attn_out, norm_weights(prefix + "attn_post_norm.weight"),
                                "rmsnorm.attn_post.L" + std::to_string(layer));
         residual_add(x, attn_out, "residual.attn.L" + std::to_string(layer));
 
-        h = rmsnorm(x, norm_weights(prefix + "ffn_norm.weight"),
-                    "rmsnorm.ffn.L" + std::to_string(layer));
+        if (c.parallel_residual) {
+            h = attn_normed;
+        } else {
+            h = norm(x, prefix + "ffn_norm", "ffn_norm.L" + std::to_string(layer));
+        }
         std::vector<float> ffn(c.hidden, 0.0f);
-        if (c.model_kind == "dense") {
+        if (c.model_kind == "dense" && c.ffn_no_gate) {
+            // phi2: one up projection, GELU, one down projection, both biased.
+            std::vector<float> act = matvec_view(tensor_view(prefix + "ffn_up.weight"), h,
+                                                 c.intermediate, c.hidden,
+                                                 "ffn_up.L" + std::to_string(layer));
+            if (c.ffn_bias) {
+                const float *b = bias_weights(prefix + "ffn_up.bias");
+                for (uint32_t i = 0; i < c.intermediate; ++i) act[i] += b[i];
+                backend_->record_control("ffn_up_bias.L" + std::to_string(layer),
+                                         act.size() * sizeof(float), 0);
+            }
+            for (float &v : act) v = activate(v);
+            backend_->record_control("gelu.L" + std::to_string(layer), act.size() * sizeof(float),
+                                     act.size() * sizeof(float));
+            ffn = matvec_view(tensor_view(prefix + "ffn_down.weight"), act, c.hidden,
+                              c.intermediate, "ffn_down.L" + std::to_string(layer));
+            if (c.ffn_bias) {
+                const float *b = bias_weights(prefix + "ffn_down.bias");
+                for (uint32_t i = 0; i < c.hidden; ++i) ffn[i] += b[i];
+                backend_->record_control("ffn_down_bias.L" + std::to_string(layer),
+                                         ffn.size() * sizeof(float), 0);
+            }
+        } else if (c.model_kind == "dense") {
             std::vector<float> gate, up;
             if (c.fused_gate_up) {
                 // glm4: one projection emits both halves, gate first then up
@@ -797,9 +870,14 @@ std::vector<float> Engine::forward_token(int32_t token, uint64_t position,
         residual_add(x, ffn, "residual.ffn.L" + std::to_string(layer));
     }
 
-    std::vector<float> final_norm = rmsnorm(x, norm_weights("output_norm.weight"), "rmsnorm.final");
+    std::vector<float> final_norm = norm(x, "output_norm", "output_norm.final");
     std::vector<float> logits = matvec_view(tensor_view("output.weight"), final_norm, c.vocab,
                                             c.hidden, "output_head");
+    if (c.logit_bias) {
+        const float *b = bias_weights("output.bias");
+        for (uint32_t i = 0; i < c.vocab; ++i) logits[i] += b[i];
+        backend_->record_control("output_bias", logits.size() * sizeof(float), 0);
+    }
     if (c.final_logit_softcap > 0.0) {
         for (float &v : logits)
             v = static_cast<float>(c.final_logit_softcap *

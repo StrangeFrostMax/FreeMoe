@@ -97,6 +97,14 @@ enum class TensorRole : uint32_t {
     FFN_GATE_SHEXP,
     FFN_UP_SHEXP,
     FFN_DOWN_SHEXP,
+    // LayerNorm carries a bias, and phi2 also biases the FFN, the attention
+    // output and the logits.
+    ATTN_NORM_BIAS,
+    FFN_NORM_BIAS,
+    OUTPUT_NORM_BIAS,
+    FFN_UP_BIAS,
+    FFN_DOWN_BIAS,
+    OUTPUT_BIAS,
 };
 
 const char *tensor_role_name(TensorRole role);
@@ -218,6 +226,18 @@ struct ModelConfig {
     uint32_t expert_intermediate = 0;
 
     uint32_t expert_width() const { return expert_intermediate ? expert_intermediate : intermediate; }
+
+    // phi2 is built differently enough to need four separate switches, and each
+    // is evidence-driven: the norm type comes from which epsilon key the file
+    // declares, the biases from the tensors, and the parallel residual from the
+    // absence of a separate FFN norm.
+    bool layer_norm = false;        // mean-centred LayerNorm instead of RMSNorm
+    bool norm_bias = false;         // norms are scale + bias, not just scale
+    bool parallel_residual = false;  // FFN runs on the attention's normalised input
+    bool ffn_no_gate = false;       // up -> gelu -> down, with no gate projection
+    bool ffn_bias = false;          // biases on ffn_up / ffn_down
+    bool attn_output_bias = false;  // bias on attn_output
+    bool logit_bias = false;        // bias on the output projection
 };
 
 struct ExpertExtent {

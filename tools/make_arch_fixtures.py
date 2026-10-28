@@ -85,6 +85,11 @@ def arch_tensors(spec: dict[str, Any]) -> list[TensorSpec]:
     for layer in range(layers):
         p = f"blk.{layer}."
         out += [tensor(p + "attn_norm.weight", [h], 0.0, norm=True)]
+        if spec.get("layernorm"):
+            out += [tensor(p + "attn_norm.bias", [h], 0.05)]
+        if spec.get("parallel_residual"):
+            # No ffn_norm at all: the FFN consumes the attention norm.
+            pass
         if spec.get("fused_qkv"):
             # q, then k, then v along the output axis of one projection.
             out += [tensor(p + "attn_qkv.weight", [h, h + 2 * kv_dim], 0.16)]
@@ -111,10 +116,25 @@ def arch_tensors(spec: dict[str, Any]) -> list[TensorSpec]:
                 tensor(p + "attn_v.bias", [kv_dim], 0.05),
             ]
         out += [tensor(p + "attn_output.weight", [h, h], 0.16)]
+        if spec.get("attn_output_bias"):
+            out += [tensor(p + "attn_output.bias", [h], 0.05)]
         if spec.get("post_norms"):
             out += [tensor(p + "attn_post_norm.weight", [h], 0.0, norm=True)]
-        out += [tensor(p + "ffn_norm.weight", [h], 0.0, norm=True)]
-        if spec.get("experts"):
+        if not spec.get("parallel_residual"):
+            out += [tensor(p + "ffn_norm.weight", [h], 0.0, norm=True)]
+            if spec.get("layernorm"):
+                out += [tensor(p + "ffn_norm.bias", [h], 0.05)]
+        if spec.get("ffn_no_gate"):
+            out += [
+                tensor(p + "ffn_up.weight", [h, i], 0.16),
+                tensor(p + "ffn_down.weight", [i, h], 0.16),
+            ]
+            if spec.get("ffn_bias"):
+                out += [
+                    tensor(p + "ffn_up.bias", [i], 0.05),
+                    tensor(p + "ffn_down.bias", [h], 0.05),
+                ]
+        elif spec.get("experts"):
             # Stacked experts: one tensor holds every expert's slice, and the
             # router projects hidden -> expert_count. Routed experts may be
             # narrower than the dense FFN, so the width is its own setting.
@@ -151,8 +171,12 @@ def arch_tensors(spec: dict[str, Any]) -> list[TensorSpec]:
         if spec.get("post_norms"):
             out += [tensor(p + "ffn_post_norm.weight", [h], 0.0, norm=True)]
     out += [tensor("output_norm.weight", [h], 0.0, norm=True)]
+    if spec.get("layernorm"):
+        out += [tensor("output_norm.bias", [h], 0.05)]
     if not spec.get("tied_output"):
         out += [tensor("output.weight", [h, V], 0.25)]
+    if spec.get("logit_bias"):
+        out += [tensor("output.bias", [V], 0.05)]
     return out
 
 
@@ -172,7 +196,10 @@ def arch_metadata(spec: dict[str, Any]) -> dict[str, tuple[Any, ...]]:
         f"{arch}.attention.head_count_kv": ("u32", spec["kv_heads"]),
         f"{arch}.attention.key_length": ("u32", spec["head_dim"]),
         f"{arch}.attention.value_length": ("u32", spec["head_dim"]),
-        f"{arch}.attention.layer_norm_rms_epsilon": ("f32", 1e-5),
+        # LayerNorm files declare a different epsilon key, and that key is what
+        # the adapter uses as evidence for the norm type.
+        (f"{arch}.attention.layer_norm_epsilon" if spec.get("layernorm")
+         else f"{arch}.attention.layer_norm_rms_epsilon"): ("f32", 1e-5),
         f"{arch}.rope.dimension_count": ("u32", spec["rope_dim"]),
         f"{arch}.rope.freq_base": ("f32", 10000.0),
         f"{arch}.context_length": ("u32", spec["context"]),
@@ -245,6 +272,23 @@ SPECS: list[dict[str, Any]] = [
         "qk_norm": True,
         "experts": 4,
         "expert_used": 2,
+    },
+    {
+        # phi2: LayerNorm with a bias instead of RMSNorm, no ffn_norm at all (the
+        # FFN runs on the attention's normalised input and both branches are
+        # added to one residual), a gate-free GELU FFN with biases, and biases on
+        # the attention output and the logits.
+        "slug": "phi2-layernorm",
+        "arch": "phi2",
+        "name": "FreeMoe synthetic phi2 with LayerNorm and a parallel residual",
+        "kv_heads": SHAPE["heads"],
+        "rope_dim": SHAPE["head_dim"],
+        "layernorm": True,
+        "parallel_residual": True,
+        "ffn_no_gate": True,
+        "ffn_bias": True,
+        "attn_output_bias": True,
+        "logit_bias": True,
     },
     {
         # qwen2moe: routed experts plus a dense shared expert, whose output is

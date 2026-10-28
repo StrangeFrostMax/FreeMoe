@@ -65,6 +65,9 @@ const std::map<std::string, ArchFacts> &known_architectures() {
         // qwen2moe: routed experts plus a dense shared expert whose output is
         // gated by one scalar per token.
         {"qwen2moe", {true, false}},
+        // phi2: LayerNorm instead of RMSNorm, a gate-free GELU FFN, and one
+        // shared residual for the attention and FFN branches.
+        {"phi2", {true, false}},
         {"glm4moe", {false, true}},
         {"deepseek2", {false, true}},
         {"multimodal", {false, true}},
@@ -401,6 +404,28 @@ Json probe_model(const GGUFDocument &doc, const std::string &source_path) {
         block("QKV_BIAS_INCONSISTENT",
               "attention bias tensors are present but attention.qkv_bias is false");
     out.set("attention_qkv_bias", declares_bias || has_bias_tensor);
+    // The block structure that the RMSNorm/SwiGLU assumption does not cover.
+    // Each is read from the tensors or from the epsilon key, never guessed.
+    {
+        const bool ln = find(doc, arch + ".attention.layer_norm_epsilon") != nullptr;
+        const bool rms = find(doc, arch + ".attention.layer_norm_rms_epsilon") != nullptr;
+        if (ln && rms)
+            block("AMBIGUOUS_NORM_TYPE",
+                  "both a LayerNorm and an RMSNorm epsilon are declared");
+        out.set("norm_type", ln ? "layernorm" : "rmsnorm");
+        const bool ffn_norm = doc.tensor_by_name.count("blk.0.ffn_norm.weight") != 0;
+        const bool gate = doc.tensor_by_name.count("blk.0.ffn_gate.weight") != 0;
+        if (!ffn_norm) {
+            if (doc.tensor_by_name.count("blk.0.attn_norm.weight") == 0)
+                block("NO_NORM_ON_FFN_INPUT",
+                      "no ffn_norm and no attn_norm: nothing normalises the FFN input");
+            out.set("parallel_residual", true);
+        }
+        if (!gate && doc.tensor_by_name.count("blk.0.ffn_up.weight") != 0)
+            out.set("ffn_without_gate", true);
+        if (doc.tensor_by_name.count("output.bias") != 0) out.set("output_bias", true);
+        if (doc.tensor_by_name.count("blk.0.ffn_up.bias") != 0) out.set("ffn_bias", true);
+    }
     // qwen2moe's shared expert is a dense FFN added to the routed output. The
     // tensors are the evidence, and a half-present branch is an error rather
     // than something to skip.

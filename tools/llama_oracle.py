@@ -80,7 +80,9 @@ def load_model(path: Path) -> dict[str, Any]:
         "hd": hd,
         "V": int(key("vocab_size", len(md.get("tokenizer.ggml.tokens", [])))),
         "ctx": int(key("context_length")),
-        "eps": float(key("attention.layer_norm_rms_epsilon", 1e-5)),
+        "eps": float(key("attention.layer_norm_epsilon", 1e-5)
+                     if f"{arch}.attention.layer_norm_epsilon" in md
+                     else key("attention.layer_norm_rms_epsilon", 1e-5)),
         "theta": float(key("rope.freq_base", 10000.0)),
         "rope_dim": int(key("rope.dimension_count", hd)),
         "qkv_bias": bool(key("attention.qkv_bias", False)),
@@ -91,10 +93,21 @@ def load_model(path: Path) -> dict[str, Any]:
         "qk_norm": "blk.0.attn_q_norm.weight" in tensors,
         # phi3 fuses q/k/v into one projection (and one optional bias).
         "fused_qkv": "blk.0.attn_qkv.weight" in tensors,
-        # glm4 keeps gate and up in one tensor: gate first, then up.
+        # glm4 keeps gate and up in one tensor: gate first, then up. The width is
+        # the evidence -- phi2 also has no gate, but its up is [hidden, I].
         "fused_gate_up": ("blk.0.ffn_gate.weight" not in tensors
                           and "blk.0.ffn_up.weight" in tensors
-                          and "blk.0.ffn_gate_exps.weight" not in tensors),
+                          and "blk.0.ffn_gate_exps.weight" not in tensors
+                          and tensors["blk.0.ffn_up.weight"][0][1] == 2 * int(key("feed_forward_length"))),
+        # phi2's block: LayerNorm, biases on the norms/FFN/logits, a gate-free
+        # GELU feed-forward fed by the attention norm, and one shared residual.
+        # Every one of these is read from the tensors or the epsilon key.
+        "layer_norm": f"{arch}.attention.layer_norm_epsilon" in md,
+        "norm_bias": "blk.0.attn_norm.bias" in tensors,
+        "parallel_residual": "blk.0.ffn_norm.weight" not in tensors,
+        "ffn_bias": "blk.0.ffn_up.bias" in tensors,
+        "attn_output_bias": "blk.0.attn_output.bias" in tensors,
+        "logit_bias": "output.bias" in tensors,
         # gemma family: scaled embeddings, zero-centred norm scales, GeGLU.
         # A multiplier, not a flag: gemma uses sqrt(hidden), minicpm 12.0.
         "embedding_scale": (math.sqrt(hidden) if arch in ("gemma", "gemma2", "gemma3")
@@ -126,6 +139,15 @@ def load_model(path: Path) -> dict[str, Any]:
         "expert_norm": bool(key("expert_weights_norm", False)),
         "expert_scale": float(key("expert_weights_scale", 1.0)),
     }
+    # A block with up/down but no gate has no gated activation. GGUF cannot say
+    # which activation, so phi2's GELU is applied and anything else is refused --
+    # the same rule the engine's adapter enforces.
+    cfg["ffn_no_gate"] = (cfg["experts"] == 0 and "blk.0.ffn_gate.weight" not in tensors
+                          and "blk.0.ffn_up.weight" in tensors and not cfg["fused_gate_up"])
+    if cfg["ffn_no_gate"]:
+        if arch != "phi2":
+            raise ReferenceError("gate-free feed-forward is only defined for phi2")
+        cfg["activation"] = "gelu"
     if cfg["heads"] * cfg["hd"] != cfg["H"]:
         raise ReferenceError("heads * head_dim != hidden")
     if cfg["kv_heads"] > cfg["heads"] or cfg["heads"] % cfg["kv_heads"]:
@@ -152,6 +174,15 @@ def rmsnorm(x: list[float], w: list[float], eps: float, add_one: bool = False) -
     scale = 1.0 / math.sqrt(mean_sq + eps)
     bias = 1.0 if add_one else 0.0
     return [x[i] * scale * (bias + w[i]) for i in range(len(x))]
+
+
+def layernorm(x: list[float], w: list[float], b: list[float], eps: float) -> list[float]:
+    """Mean-centred normalisation with a bias, which phi2 uses instead of RMSNorm."""
+    n = len(x)
+    mean = sum(x) / n
+    var = sum((v - mean) * (v - mean) for v in x) / n
+    inv = 1.0 / math.sqrt(var + eps)
+    return [(x[i] - mean) * inv * w[i] + b[i] for i in range(n)]
 
 
 def gelu(x: float) -> float:
@@ -264,10 +295,17 @@ class Session:
             scale = cfg["embedding_scale"]
             x = [v * scale for v in x]
 
+        def norm_of(vec: list[float], prefix: str) -> list[float]:
+            """The one place both norm types are chosen, mirroring the engine."""
+            w = self.tensor(prefix + ".weight")
+            if cfg["layer_norm"]:
+                return layernorm(vec, w, self.tensor(prefix + ".bias"), cfg["eps"])
+            return rmsnorm(vec, w, cfg["eps"], cfg["norm_add_one"])
+
         for layer in range(cfg["L"]):
             p = f"blk.{layer}."
-            h = rmsnorm(x, self.tensor(p + "attn_norm.weight"), cfg["eps"],
-                        cfg["norm_add_one"])
+            h = norm_of(x, p + "attn_norm")
+            attn_normed = list(h) if cfg["parallel_residual"] else None
             if cfg["fused_qkv"]:
                 fused = matvec(self.tensor(p + "attn_qkv.weight"), h, H + 2 * kv_dim, H)
                 if cfg["qkv_bias"]:
@@ -318,14 +356,27 @@ class Session:
                         acc[j] += p_i * vt[kvb + j]
                 attention[qb:qb + hd] = acc
             attn_out = matvec(self.tensor(p + "attn_output.weight"), attention, H, H)
+            if cfg["attn_output_bias"]:
+                bias = self.tensor(p + "attn_output.bias")
+                attn_out = [attn_out[i] + bias[i] for i in range(H)]
             if cfg["post_norms"]:
                 attn_out = rmsnorm(attn_out, self.tensor(p + "attn_post_norm.weight"),
                                    cfg["eps"], cfg["norm_add_one"])
             x = [x[i] + attn_out[i] for i in range(H)]
 
-            h = rmsnorm(x, self.tensor(p + "ffn_norm.weight"), cfg["eps"],
-                        cfg["norm_add_one"])
-            if cfg["experts"]:
+            h = attn_normed if cfg["parallel_residual"] else norm_of(x, p + "ffn_norm")
+            if cfg["ffn_no_gate"]:
+                # phi2: up -> gelu -> down, with a bias on both projections.
+                up = matvec(self.tensor(p + "ffn_up.weight"), h, cfg["I"], H)
+                if cfg["ffn_bias"]:
+                    bias = self.tensor(p + "ffn_up.bias")
+                    up = [up[i] + bias[i] for i in range(cfg["I"])]
+                act = [gelu(v) for v in up]
+                down = matvec(self.tensor(p + "ffn_down.weight"), act, H, cfg["I"])
+                if cfg["ffn_bias"]:
+                    bias = self.tensor(p + "ffn_down.bias")
+                    down = [down[i] + bias[i] for i in range(H)]
+            elif cfg["experts"]:
                 # Router -> full softmax -> top-k -> combine. The selected experts
                 # are renormalised only when the checkpoint asks for it.
                 logits = matvec(self.tensor(p + "ffn_gate_inp.weight"), h,
@@ -379,11 +430,13 @@ class Session:
                                cfg["eps"], cfg["norm_add_one"])
             x = [x[i] + down[i] for i in range(H)]
 
-        final = rmsnorm(x, self.tensor("output_norm.weight"), cfg["eps"],
-                        cfg["norm_add_one"])
+        final = norm_of(x, "output_norm")
         out_name = "output.weight" if "output.weight" in self.tensors else "token_embd.weight"
         self.pos += 1
         logits = matvec(self.tensor(out_name), final, cfg["V"], H)
+        if cfg["logit_bias"]:
+            bias = self.tensor("output.bias")
+            logits = [logits[i] + bias[i] for i in range(cfg["V"])]
         if cfg["final_softcap"] > 0.0:
             cap = cfg["final_softcap"]
             logits = [cap * math.tanh(v / cap) for v in logits]
