@@ -422,14 +422,10 @@ void gemv(const KernelConfig &config, const float *weights, const float *x, floa
 }
 
 bool kernel_supports_type(uint32_t type_id) {
-    switch (type_id) {
-    case 0: case 1: case 30:
-    case 2: case 3: case 6: case 7: case 8: case 9:
-    case 10: case 11: case 12: case 13: case 14: case 15:
-        return true;
-    default:
-        return false;
-    }
+    // Derive support from the decoder table instead of keeping a second list
+    // that can drift. If a type decodes, the fused scalar path can execute it;
+    // the AVX2 kernels are a throughput refinement, not a support requirement.
+    return tensor_capability(type_id).execute;
 }
 
 namespace {

@@ -105,6 +105,8 @@ void print_usage() {
         "\n"
         "Common options:\n"
         "  --reader resident|buffered|mmap|direct  --cache-slots N\n"
+        "  --context N                    cap the KV context for large models\n"
+        "  --budget-mb N                  host memory budget for weights and expert cache\n"
         "  --replacement lru|clock                --tokens N\n"
         "  --queue-depth N --coalesce-gap N       --t-wait-ms N\n"
         "  --prefetch 0|1 --budget-mb N           --vnpu-isa PROFILE\n"
@@ -142,6 +144,7 @@ fm::RunConfig build_run_config(const Args &args) {
     cfg.coalesce_gap = args.get_u64("coalesce-gap", 4096);
     cfg.t_wait_ms = args.get_u32("t-wait-ms", 100);
     cfg.generated_tokens = args.get_u32("tokens", fm::DEFAULT_N_GREEDY);
+    cfg.context_limit = args.get_u32("context", 0);
     cfg.prompt_limit = args.get_u32("limit", 0);
     cfg.force_direct_fallback = args.has("force-direct-fallback");
     cfg.budget.total_hot_bytes = args.get_u64("budget-mb", 64) * 1024ull * 1024ull;

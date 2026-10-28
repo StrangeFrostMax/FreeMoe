@@ -39,6 +39,14 @@ GEOMETRY = {
     13: (256, 176),
     14: (256, 210),
     15: (256, 292),
+    20: (32, 18),   # IQ4_NL: f16 scale + 16 nibble bytes
+    # ggml treats these as element types, not blocked quants: one element per
+    # block, so the block size is 1 and the block bytes are the element width.
+    24: (1, 1),     # I8
+    25: (1, 2),     # I16
+    26: (1, 4),     # I32
+    27: (1, 8),     # I64
+    28: (1, 8),     # F64
     30: (1, 2),
 }
 
@@ -246,9 +254,49 @@ def bf16(b):
     return [struct.unpack("<f", struct.pack("<I", bits))[0]]
 
 
+# The published IQ4_NL codebook (ggml kvalues_iq4nl), kept as a literal so this
+# decoder does not share an implementation with src/quant.cpp.
+KVALUES_IQ4NL = [-127, -104, -83, -65, -49, -35, -22, -10,
+                 1, 13, 25, 38, 53, 69, 89, 113]
+
+
+def iq4_nl(b):
+    """f16 scale, then 32 four-bit codebook indices packed Q4_0 style."""
+    d = rd_half(b, 0)
+    out = []
+    for j in range(16):
+        byte = b[2 + j]
+        out.append(d * KVALUES_IQ4NL[byte & 0x0F])
+    for j in range(16):
+        byte = b[2 + j]
+        out.append(d * KVALUES_IQ4NL[byte >> 4])
+    return out
+
+
+def i8(b):
+    return [float(struct.unpack_from("<b", b, 0)[0])]
+
+
+def i16(b):
+    return [float(struct.unpack_from("<h", b, 0)[0])]
+
+
+def i32(b):
+    return [float(struct.unpack_from("<i", b, 0)[0])]
+
+
+def i64(b):
+    return [float(struct.unpack_from("<q", b, 0)[0])]
+
+
+def f64(b):
+    return [struct.unpack_from("<d", b, 0)[0]]
+
+
 DECODERS = {
     30: bf16, 2: q4_0, 3: q4_1, 6: q5_0, 7: q5_1, 8: q8_0, 9: q8_1,
     10: q2_k, 11: q3_k, 12: q4_k, 13: q5_k, 14: q6_k, 15: q8_k,
+    20: iq4_nl, 24: i8, 25: i16, 26: i32, 27: i64, 28: f64,
 }
 
 
@@ -292,7 +340,7 @@ def make_block(type_id: int, rng_state: int) -> tuple[bytes, int]:
         struct.pack_into("<f", raw, 0, 0.02 + (rand() % 50) / 500.0)
     elif type_id in (1, 30):
         pass
-    elif type_id in (2, 6, 8):
+    elif type_id in (2, 6, 8, 20):
         raw[0:2] = half_scale
     elif type_id in (3, 7):
         raw[0:2] = half_scale
@@ -307,6 +355,16 @@ def make_block(type_id: int, rng_state: int) -> tuple[bytes, int]:
         raw[2:4] = encode_f16(-0.004)
     elif type_id == 14:  # Q6_K
         raw[208:210] = half_scale
+    if type_id == 24:  # I8
+        struct.pack_into("<b", raw, 0, -73)
+    elif type_id == 25:  # I16
+        struct.pack_into("<h", raw, 0, -12345)
+    elif type_id == 26:  # I32
+        struct.pack_into("<i", raw, 0, -123456789)
+    elif type_id == 27:  # I64
+        struct.pack_into("<q", raw, 0, -7654321987654)
+    elif type_id == 28:  # F64
+        struct.pack_into("<d", raw, 0, -2.718281828459045)
     return bytes(raw), state
 
 
