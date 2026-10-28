@@ -114,6 +114,15 @@ def load_model(path: Path) -> dict[str, Any]:
         # is selected, so it cannot be assumed.
         "experts": int(key("expert_count", 0)),
         "top_k": int(key("expert_used_count", 0)),
+        # Routed experts and the shared expert can each be narrower than the
+        # dense FFN, so the three widths are separate.
+        "I_exp": int(key("expert_feed_forward_length",
+                         key("feed_forward_length"))),
+        "I_shexp": int(key("expert_shared_feed_forward_length",
+                           key("feed_forward_length"))),
+        # Evidence, not architecture name: the tensors are what the forward pass
+        # reads, so their presence is what decides whether the branch runs.
+        "shared_expert": "blk.0.ffn_gate_shexp.weight" in tensors,
         "expert_norm": bool(key("expert_weights_norm", False)),
         "expert_scale": float(key("expert_weights_scale", 1.0)),
     }
@@ -196,7 +205,7 @@ def expert_output(cfg: dict[str, Any], layer: int, expert: int,
     contiguous slice. The slice geometry comes from the declared shapes, never
     from an assumption about float sizes.
     """
-    H, I = cfg["H"], cfg["I"]
+    H, I = cfg["H"], cfg["I_exp"]
     count = cfg["experts"]
     tensors = cfg["tensors"]
     out = []
@@ -348,6 +357,23 @@ class Session:
                     act = [gate[i] / (1.0 + math.exp(-gate[i])) * up[i]
                            for i in range(cfg["I"])]
                 down = matvec(self.tensor(p + "ffn_down.weight"), act, H, cfg["I"])
+            if cfg["shared_expert"]:
+                # qwen2moe's shared expert: a dense FFN beside the routed ones,
+                # scaled by sigmoid(dot(gate_inp, h)). The reference writes that
+                # gate as silu(s)/s, which is the same number except at s == 0
+                # (0/0); the limit 0.5 is used there.
+                s = matvec(self.tensor(p + "ffn_gate_inp_shexp.weight"), h, 1, H)[0]
+                gate_scalar = (s / (1.0 + math.exp(-s)) / s) if s != 0.0 else 0.5
+                W = cfg["I_shexp"]
+                s_gate = matvec(self.tensor(p + "ffn_gate_shexp.weight"), h, W, H)
+                s_up = matvec(self.tensor(p + "ffn_up_shexp.weight"), h, W, H)
+                if cfg["activation"] == "gelu":
+                    s_act = [gelu(s_gate[i]) * s_up[i] for i in range(W)]
+                else:
+                    s_act = [s_gate[i] / (1.0 + math.exp(-s_gate[i])) * s_up[i]
+                             for i in range(W)]
+                s_down = matvec(self.tensor(p + "ffn_down_shexp.weight"), s_act, H, W)
+                down = [down[i] + gate_scalar * s_down[i] for i in range(H)]
             if cfg["post_norms"]:
                 down = rmsnorm(down, self.tensor(p + "ffn_post_norm.weight"),
                                cfg["eps"], cfg["norm_add_one"])

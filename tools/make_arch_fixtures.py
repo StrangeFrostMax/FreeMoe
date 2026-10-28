@@ -116,14 +116,26 @@ def arch_tensors(spec: dict[str, Any]) -> list[TensorSpec]:
         out += [tensor(p + "ffn_norm.weight", [h], 0.0, norm=True)]
         if spec.get("experts"):
             # Stacked experts: one tensor holds every expert's slice, and the
-            # router projects hidden -> expert_count.
+            # router projects hidden -> expert_count. Routed experts may be
+            # narrower than the dense FFN, so the width is its own setting.
             experts = spec["experts"]
+            ew = spec.get("expert_width", i)
             out += [
                 tensor(p + "ffn_gate_inp.weight", [h, experts], 0.12),
-                tensor(p + "ffn_gate_exps.weight", [h, i, experts], 0.16),
-                tensor(p + "ffn_up_exps.weight", [h, i, experts], 0.16),
-                tensor(p + "ffn_down_exps.weight", [i, h, experts], 0.16),
+                tensor(p + "ffn_gate_exps.weight", [h, ew, experts], 0.16),
+                tensor(p + "ffn_up_exps.weight", [h, ew, experts], 0.16),
+                tensor(p + "ffn_down_exps.weight", [ew, h, experts], 0.16),
             ]
+            if spec.get("shared_expert"):
+                # A dense FFN beside the routed experts, plus the one-vector
+                # projection that produces its per-token scalar gate.
+                sw = spec.get("shared_width", i)
+                out += [
+                    tensor(p + "ffn_gate_inp_shexp.weight", [h], 0.30),
+                    tensor(p + "ffn_gate_shexp.weight", [h, sw], 0.16),
+                    tensor(p + "ffn_up_shexp.weight", [h, sw], 0.16),
+                    tensor(p + "ffn_down_shexp.weight", [sw, h], 0.16),
+                ]
         elif spec.get("fused_gate_up"):
             # One tensor holds both halves: gate first, then up.
             out += [
@@ -175,6 +187,11 @@ def arch_metadata(spec: dict[str, Any]) -> dict[str, tuple[Any, ...]]:
         md[f"{arch}.expert_used_count"] = ("u32", spec.get("expert_used", 2))
     if spec.get("qkv_bias"):
         md[f"{arch}.attention.qkv_bias"] = ("bool", True)
+    if spec.get("expert_width"):
+        md[f"{arch}.expert_feed_forward_length"] = ("u32", spec["expert_width"])
+    if spec.get("shared_expert"):
+        md[f"{arch}.expert_shared_feed_forward_length"] = (
+            "u32", spec.get("shared_width", spec["intermediate"]))
     if spec.get("embedding_scale") is not None:
         md[f"{arch}.embedding_scale"] = ("f32", spec["embedding_scale"])
     if spec.get("residual_scale") is not None:
@@ -228,6 +245,22 @@ SPECS: list[dict[str, Any]] = [
         "qk_norm": True,
         "experts": 4,
         "expert_used": 2,
+    },
+    {
+        # qwen2moe: routed experts plus a dense shared expert, whose output is
+        # scaled by one scalar per token. The three feed-forward widths are all
+        # different (64 dense, 48 per routed expert, 40 shared) so a runtime that
+        # reuses one width for another cannot match the golden.
+        "slug": "qwen2moe",
+        "arch": "qwen2moe",
+        "name": "FreeMoe synthetic qwen2moe with a shared expert",
+        "kv_heads": 2,
+        "rope_dim": SHAPE["head_dim"],
+        "experts": 4,
+        "expert_used": 2,
+        "expert_width": 48,
+        "shared_expert": True,
+        "shared_width": 40,
     },
     {
         # phi3: one fused q/k/v projection with a fused bias, and a rotary width

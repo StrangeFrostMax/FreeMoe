@@ -713,6 +713,7 @@ std::vector<float> Engine::forward_token(int32_t token, uint64_t position,
             for (uint32_t expert : ids)
                 residency_->issue_prefetch(layer, expert, position + 1);
 
+            const uint32_t ewidth = c.expert_width();
             for (uint32_t i = 0; i < ids.size(); ++i) {
                 float weight = selected_weights[i];
                 uint32_t expert = ids[i];
@@ -737,18 +738,18 @@ std::vector<float> Engine::forward_token(int32_t token, uint64_t position,
                     TensorView up_view{base + gate_bytes, up_info->type_id};
                     TensorView down_view{base + gate_bytes + up_bytes, down_info->type_id};
                     std::vector<float> gate = matvec_view(
-                        gate_view, h, c.intermediate, c.hidden,
+                        gate_view, h, ewidth, c.hidden,
                         "expert_gate.L" + std::to_string(layer) + ".E" + std::to_string(expert));
                     std::vector<float> up = matvec_view(
-                        up_view, h, c.intermediate, c.hidden,
+                        up_view, h, ewidth, c.hidden,
                         "expert_up.L" + std::to_string(layer) + ".E" + std::to_string(expert));
-                    std::vector<float> act(c.intermediate);
-                    for (uint32_t j = 0; j < c.intermediate; ++j) act[j] = silu(gate[j]) * up[j];
+                    std::vector<float> act(ewidth);
+                    for (uint32_t j = 0; j < ewidth; ++j) act[j] = silu(gate[j]) * up[j];
                     backend_->record_control("expert_swiglu.L" + std::to_string(layer),
                                              (gate.size() + up.size()) * sizeof(float),
                                              act.size() * sizeof(float));
                     std::vector<float> down = matvec_view(
-                        down_view, act, c.hidden, c.intermediate,
+                        down_view, act, c.hidden, ewidth,
                         "expert_down.L" + std::to_string(layer) + ".E" + std::to_string(expert));
                     for (uint32_t j = 0; j < c.hidden; ++j) ffn[j] += weight * down[j];
                 });
@@ -757,6 +758,38 @@ std::vector<float> Engine::forward_token(int32_t token, uint64_t position,
             backend_->record_control("expert_combine.L" + std::to_string(layer),
                                      ids.size() * c.hidden * sizeof(float),
                                      c.hidden * sizeof(float));
+
+            if (c.shared_expert) {
+                // qwen2moe runs a dense FFN beside the routed experts and gates
+                // the whole branch with one scalar per token. The reference
+                // computes that scalar as silu(s)/s, which is sigmoid(s); the
+                // division is NaN at exactly s == 0, so the limit 0.5 is used
+                // there instead. Every other value is identical.
+                const uint32_t swidth = c.shared_expert_intermediate;
+                std::vector<float> s_in = matvec_view(
+                    tensor_view(prefix + "ffn_gate_inp_shexp.weight"), h, 1, c.hidden,
+                    "shexp_gate_inp.L" + std::to_string(layer));
+                const float s = s_in[0];
+                const float gate_scalar = s != 0.0f ? activate(s) / s : 0.5f;
+                std::vector<float> s_gate = matvec_view(
+                    tensor_view(prefix + "ffn_gate_shexp.weight"), h, swidth, c.hidden,
+                    "shexp_gate.L" + std::to_string(layer));
+                std::vector<float> s_up = matvec_view(
+                    tensor_view(prefix + "ffn_up_shexp.weight"), h, swidth, c.hidden,
+                    "shexp_up.L" + std::to_string(layer));
+                std::vector<float> s_act(swidth);
+                for (uint32_t j = 0; j < swidth; ++j) s_act[j] = activate(s_gate[j]) * s_up[j];
+                backend_->record_control("shexp_swiglu.L" + std::to_string(layer),
+                                         (s_gate.size() + s_up.size()) * sizeof(float),
+                                         s_act.size() * sizeof(float));
+                std::vector<float> s_down = matvec_view(
+                    tensor_view(prefix + "ffn_down_shexp.weight"), s_act, c.hidden, swidth,
+                    "shexp_down.L" + std::to_string(layer));
+                for (uint32_t j = 0; j < c.hidden; ++j)
+                    ffn[j] += gate_scalar * s_down[j];
+                backend_->record_control("shexp_combine.L" + std::to_string(layer),
+                                         c.hidden * sizeof(float), c.hidden * sizeof(float));
+            }
         }
         if (c.post_norms)
             ffn = rmsnorm(ffn, norm_weights(prefix + "ffn_post_norm.weight"),

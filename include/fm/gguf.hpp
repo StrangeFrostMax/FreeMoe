@@ -91,6 +91,12 @@ enum class TensorRole : uint32_t {
     // Fused query/key/value projection (phi3).
     ATTN_QKV,
     ATTN_QKV_BIAS,
+    // The dense "shared expert" that qwen2moe adds to the routed experts, and
+    // the per-token scalar that gates it.
+    FFN_GATE_INP_SHEXP,
+    FFN_GATE_SHEXP,
+    FFN_UP_SHEXP,
+    FFN_DOWN_SHEXP,
 };
 
 const char *tensor_role_name(TensorRole role);
@@ -201,7 +207,17 @@ struct ModelConfig {
     uint32_t eos_id = 0;
     double rms_eps = 0.0;
     double rope_theta = 0.0;
+    // qwen2moe adds a dense feed-forward branch to the routed experts. Its
+    // width is its own hyperparameter (`expert_shared_feed_forward_length`),
+    // not the dense width, so it is stored separately. 0 means "no shared
+    // expert", which keeps every other architecture's path unchanged.
     bool shared_expert = false;
+    uint32_t shared_expert_intermediate = 0;
+    // Routed experts may be narrower than the dense FFN (`expert_feed_forward_
+    // length`). 0 means "same as intermediate", the usual case.
+    uint32_t expert_intermediate = 0;
+
+    uint32_t expert_width() const { return expert_intermediate ? expert_intermediate : intermediate; }
 };
 
 struct ExpertExtent {

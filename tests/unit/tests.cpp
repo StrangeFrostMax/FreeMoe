@@ -1770,7 +1770,7 @@ ArchGolden read_arch_golden(const std::string &path) {
 void test_architecture_parity() {
     const std::vector<std::string> slugs = {"llama-gqa", "qwen2-bias", "qwen3-qknorm", "gemma",
                                            "gemma2", "phi3-fused", "minicpm", "qwen3moe",
-                                           "glm4"};
+                                           "glm4", "qwen2moe"};
     for (const std::string &slug : slugs) {
         const std::string model = "tests/fixtures/" + slug + "-shape.gguf";
         ArchGolden golden = read_arch_golden("tests/golden/" + slug + "_reference.txt");
@@ -1903,6 +1903,67 @@ void test_minicpm_scales() {
           "the probe explains why the two scales are not applied");
 }
 
+// qwen2moe adds a dense shared expert to the routed experts and scales it with
+// one scalar per token. Two things can go wrong silently here: the branch gets
+// skipped, or it reuses the dense FFN width for a tensor that has its own. Both
+// are checked against the operation log, which records the width actually used.
+void test_shared_expert() {
+    const std::string path = "tests/fixtures/qwen2moe-shape.gguf";
+    RunConfig config;
+    config.model_path = path;
+    config.budget.total_hot_bytes = 64ull * 1024 * 1024;
+    Engine engine(config);
+    engine.initialize();
+
+    const ModelConfig &cfg = engine.manifest().config;
+    CHECK(cfg.architecture == "qwen2moe", "qwen2moe adapter is selected");
+    CHECK(cfg.shared_expert, "the shared expert is detected from its tensors");
+    CHECK(cfg.shared_expert_intermediate == 40, "the shared expert keeps its own width");
+    // The fixture deliberately uses 48 for routed experts and 64 for the dense
+    // FFN, so using the wrong one cannot go unnoticed.
+    CHECK(cfg.expert_width() == 48, "routed experts keep their own width");
+    CHECK(cfg.intermediate == 64, "the dense width is distinct from both");
+
+    ArchGolden golden = read_arch_golden("tests/golden/qwen2moe_reference.txt");
+    PromptResult result = engine.run_prompt(golden.prompt, 8);
+    if (!golden.logits.empty() && result.prefill_logits.size() == golden.logits.size()) {
+        double worst = 0.0;
+        for (size_t i = 0; i < golden.logits.size(); ++i)
+            worst = std::max(worst, std::fabs(static_cast<double>(result.prefill_logits[i]) -
+                                              golden.logits[i]));
+        CHECK(worst <= 1e-4, "qwen2moe logits match the reference (worst " +
+                                 std::to_string(worst) + ")");
+    }
+
+    // The operation log is the evidence that the branch ran at all, and that
+    // each branch used its own width rather than the dense one.
+    bool saw_shexp_gate = false, saw_shexp_swiglu = false;
+    uint64_t expert_width_used = 0, shared_width_used = 0;
+    for (const OpRecord &op : engine.backend().operations()) {
+        if (op.name == "shexp_gate_inp.L0") saw_shexp_gate = true;
+        if (op.name == "shexp_swiglu.L0") {
+            saw_shexp_swiglu = true;
+            shared_width_used = op.output_bytes / sizeof(float);
+        }
+        if (op.name == "expert_swiglu.L0") expert_width_used = op.output_bytes / sizeof(float);
+    }
+    CHECK(saw_shexp_gate, "the shared expert's per-token gate is computed");
+    CHECK(saw_shexp_swiglu, "the shared expert's SwiGLU runs");
+    CHECK(shared_width_used == 40, "the shared expert executes at its declared width");
+    CHECK(expert_width_used == 48, "routed experts execute at their declared width");
+    engine.release_runtime();
+
+    // A reader of the probe should not have to infer the branch from silence.
+    auto doc = parse_gguf_file(path);
+    const std::string dump = probe_model(doc, path).dump();
+    CHECK(dump.find("\"shared_expert\":true") != std::string::npos,
+          "the probe reports the shared expert");
+    CHECK(dump.find("\"shared_expert_size\":40") != std::string::npos,
+          "the probe reports the shared expert's width");
+    CHECK(dump.find("\"expert_intermediate_size\":48") != std::string::npos,
+          "the probe reports the routed experts' width");
+}
+
 void test_soak_sessions() {
     const uint32_t N_SOAK = 256;
     std::string prompt = first_prompt();
@@ -1954,6 +2015,7 @@ int main(int argc, char **argv) {
     maybe_run("architecture_parity", test_architecture_parity);
     maybe_run("rotated_and_ternary_blockers", test_rotated_and_ternary_blockers);
     maybe_run("minicpm_scales", test_minicpm_scales);
+    maybe_run("shared_expert", test_shared_expert);
     maybe_run("soak_sessions", test_soak_sessions);
     std::cout << g_checks << " checks, " << g_failures << " failures\n";
     return g_failures == 0 ? 0 : 1;

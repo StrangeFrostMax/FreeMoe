@@ -62,6 +62,9 @@ const std::map<std::string, ArchFacts> &known_architectures() {
         {"qwen3moe", {true, false}},
         // glm4: fused gate+up FFN with post-attention and post-FFN norms.
         {"glm4", {true, false}},
+        // qwen2moe: routed experts plus a dense shared expert whose output is
+        // gated by one scalar per token.
+        {"qwen2moe", {true, false}},
         {"glm4moe", {false, true}},
         {"deepseek2", {false, true}},
         {"multimodal", {false, true}},
@@ -96,6 +99,8 @@ bool read_u64(const GGUFDocument &doc, const std::string &arch, const std::strin
         {"attention.key_length", "head_dim"},
         {"block_count", "num_hidden_layers"},
         {"expert_used_count", "expert_top_k"},
+        {"expert_feed_forward_length", "expert_intermediate_size"},
+        {"expert_shared_feed_forward_length", "shared_expert_size"},
     };
     auto alias = aliases.find(name);
     if (alias != aliases.end()) {
@@ -163,7 +168,9 @@ Json probe_model(const GGUFDocument &doc, const std::string &source_path) {
              {"attention.head_count_kv", "num_key_value_heads"},
              {"attention.key_length", "head_dim"},
              {"expert_count", "expert_count"},
-             {"expert_used_count", "expert_top_k"}}) {
+             {"expert_used_count", "expert_top_k"},
+             {"expert_feed_forward_length", "expert_intermediate_size"},
+             {"expert_shared_feed_forward_length", "shared_expert_size"}}) {
         uint64_t value = 0;
         if (read_u64(doc, arch, entry.first, &value))
             hyper.set(entry.second, static_cast<uint64_t>(value));
@@ -394,6 +401,21 @@ Json probe_model(const GGUFDocument &doc, const std::string &source_path) {
         block("QKV_BIAS_INCONSISTENT",
               "attention bias tensors are present but attention.qkv_bias is false");
     out.set("attention_qkv_bias", declares_bias || has_bias_tensor);
+    // qwen2moe's shared expert is a dense FFN added to the routed output. The
+    // tensors are the evidence, and a half-present branch is an error rather
+    // than something to skip.
+    {
+        const bool inp = doc.tensor_by_name.count("blk.0.ffn_gate_inp_shexp.weight") != 0;
+        const bool gate = doc.tensor_by_name.count("blk.0.ffn_gate_shexp.weight") != 0;
+        const bool up = doc.tensor_by_name.count("blk.0.ffn_up_shexp.weight") != 0;
+        const bool down = doc.tensor_by_name.count("blk.0.ffn_down_shexp.weight") != 0;
+        if (inp || gate || up || down) {
+            if (!(inp && gate && up && down))
+                block("SHARED_EXPERT_PARTIAL",
+                      "the shared expert is only partly present; all four tensors are required");
+            out.set("shared_expert", true);
+        }
+    }
     const MetadataValue *tied_flag = find(doc, arch + ".tie_word_embeddings");
     if (tied_flag && tied_flag->b && doc.tensor_by_name.count("output.weight") != 0) {
         block("AMBIGUOUS_TIED_OUTPUT",

@@ -122,6 +122,10 @@ const char *tensor_role_name(TensorRole role) {
     case TensorRole::FFN_POST_NORM: return "FFN_POST_NORM";
     case TensorRole::ATTN_QKV: return "ATTN_QKV";
     case TensorRole::ATTN_QKV_BIAS: return "ATTN_QKV_BIAS";
+    case TensorRole::FFN_GATE_INP_SHEXP: return "FFN_GATE_INP_SHEXP";
+    case TensorRole::FFN_GATE_SHEXP: return "FFN_GATE_SHEXP";
+    case TensorRole::FFN_UP_SHEXP: return "FFN_UP_SHEXP";
+    case TensorRole::FFN_DOWN_SHEXP: return "FFN_DOWN_SHEXP";
     }
     return "UNKNOWN";
 }
@@ -362,6 +366,12 @@ TensorRole role_from_name(const std::string &name, uint32_t &layer) {
         {"ffn_post_norm.weight", TensorRole::FFN_POST_NORM},
         {"attn_qkv.weight", TensorRole::ATTN_QKV},
         {"attn_qkv.bias", TensorRole::ATTN_QKV_BIAS},
+        // The shared expert keeps its own gate/projection names; `_shexp` is
+        // distinct from `_exps`, so these cannot collide with routed experts.
+        {"ffn_gate_inp_shexp.weight", TensorRole::FFN_GATE_INP_SHEXP},
+        {"ffn_gate_shexp.weight", TensorRole::FFN_GATE_SHEXP},
+        {"ffn_up_shexp.weight", TensorRole::FFN_UP_SHEXP},
+        {"ffn_down_shexp.weight", TensorRole::FFN_DOWN_SHEXP},
     };
     for (const auto &entry : suffixes)
         if (parse_layer_suffix(name, entry.first, layer)) return entry.second;
@@ -605,6 +615,7 @@ bool is_llama_family(const std::string &arch) {
     static const std::set<std::string> family = {
         "llama", "qwen2", "qwen3", "smollm", "smollm2", "tinyllama",
         "gemma", "gemma2", "gemma3", "phi3", "minicpm", "qwen3moe", "glm4",
+        "qwen2moe",
     };
     return family.count(arch) != 0;
 }
@@ -720,8 +731,35 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
         if (!(cfg.expert_weights_scale > 0.0))
             fail(ErrorCode::METADATA_MISMATCH, "expert_weights_scale must be positive");
     }
-    uint64_t shared = 0;
-    if (opt_u64(doc, keys("expert_shared_count"), &shared)) cfg.shared_expert = shared > 0;
+    // Routed experts and the qwen2moe shared expert each have their own width.
+    // Both default to the dense width, which is what every other MoE family
+    // does; a checkpoint that narrows either one says so explicitly.
+    if (opt_u64(doc, keys("expert_feed_forward_length"), &value)) {
+        cfg.expert_intermediate = static_cast<uint32_t>(value);
+        if (cfg.expert_intermediate == 0)
+            fail(ErrorCode::METADATA_MISMATCH, "expert feed-forward length must be positive");
+    }
+    // The shared expert is detected from its tensors rather than from
+    // `expert_shared_count`: the tensors are what the forward pass reads, so
+    // they are the evidence. A file that declares a count without the tensors
+    // is caught by the missing-tensor check below.
+    {
+        const bool shexp_gate = doc.tensor_by_name.count(layer_name(0, "ffn_gate_shexp.weight")) != 0;
+        const bool shexp_up = doc.tensor_by_name.count(layer_name(0, "ffn_up_shexp.weight")) != 0;
+        const bool shexp_down = doc.tensor_by_name.count(layer_name(0, "ffn_down_shexp.weight")) != 0;
+        const bool shexp_inp = doc.tensor_by_name.count(layer_name(0, "ffn_gate_inp_shexp.weight")) != 0;
+        if (shexp_gate || shexp_up || shexp_down || shexp_inp) {
+            if (!(shexp_gate && shexp_up && shexp_down && shexp_inp))
+                fail(ErrorCode::MISSING_REQUIRED_TENSOR,
+                     "shared expert is only partly present: gate, up, down and its input gate "
+                     "must all be there or none");
+            cfg.shared_expert = true;
+            cfg.shared_expert_intermediate = 0;
+            if (opt_u64(doc, keys("expert_shared_feed_forward_length"), &value))
+                cfg.shared_expert_intermediate = static_cast<uint32_t>(value);
+            if (cfg.shared_expert_intermediate == 0) cfg.shared_expert_intermediate = cfg.intermediate;
+        }
+    }
     cfg.model_kind = cfg.expert_count > 0 ? "moe" : "dense";
 
     // --- family semantics ---------------------------------------------------
@@ -803,9 +841,9 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
              "attention head count times head dimension does not equal embedding length");
     if (cfg.rope_dim != 0 && (cfg.rope_dim % 2 != 0 || cfg.rope_dim > cfg.head_dim))
         fail(ErrorCode::SHAPE_MISMATCH, "rotary dimension is invalid");
-    if (cfg.shared_expert)
+    if (cfg.shared_expert && cfg.expert_count == 0)
         fail(ErrorCode::METADATA_MISMATCH,
-             "shared-expert checkpoints are not implemented; refusing rather than dropping it");
+             "a shared expert without routed experts has no defined semantics");
     auto reject = [&](const char *metadata_key, const char *what) {
         MetadataValue v;
         if (opt_metadata(doc, arch + "." + metadata_key, &v) && v.as_bool())
@@ -932,6 +970,10 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
             for (const char *suffix : {"ffn_gate_inp.weight", "ffn_gate_exps.weight",
                                        "ffn_up_exps.weight", "ffn_down_exps.weight"})
                 expect(layer_name(l, suffix));
+            if (cfg.shared_expert)
+                for (const char *suffix : {"ffn_gate_inp_shexp.weight", "ffn_gate_shexp.weight",
+                                           "ffn_up_shexp.weight", "ffn_down_shexp.weight"})
+                    expect(layer_name(l, suffix));
         } else if (cfg.fused_gate_up) {
             for (const char *suffix : {"ffn_up.weight", "ffn_down.weight"})
                 expect(layer_name(l, suffix));
@@ -1022,13 +1064,23 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
             }
         }
         if (cfg.expert_count) {
+            const uint32_t ewidth = cfg.expert_width();
             expect_dims(*m.tensor(layer_name(l, "ffn_gate_inp.weight")),
                         {cfg.hidden, cfg.expert_count});
             for (const char *suffix : {"ffn_gate_exps.weight", "ffn_up_exps.weight"})
                 expect_dims(*m.tensor(layer_name(l, suffix)),
-                            {cfg.hidden, cfg.intermediate, cfg.expert_count});
+                            {cfg.hidden, ewidth, cfg.expert_count});
             expect_dims(*m.tensor(layer_name(l, "ffn_down_exps.weight")),
-                        {cfg.intermediate, cfg.hidden, cfg.expert_count});
+                        {ewidth, cfg.hidden, cfg.expert_count});
+            if (cfg.shared_expert) {
+                const uint32_t swidth = cfg.shared_expert_intermediate;
+                // One scalar per token, so the gate is a hidden-vector.
+                expect_dims(*m.tensor(layer_name(l, "ffn_gate_inp_shexp.weight")), {cfg.hidden});
+                for (const char *suffix : {"ffn_gate_shexp.weight", "ffn_up_shexp.weight"})
+                    expect_dims(*m.tensor(layer_name(l, suffix)), {cfg.hidden, swidth});
+                expect_dims(*m.tensor(layer_name(l, "ffn_down_shexp.weight")),
+                            {swidth, cfg.hidden});
+            }
         } else if (cfg.fused_gate_up) {
             expect_dims(*m.tensor(layer_name(l, "ffn_up.weight")),
                         {cfg.hidden, static_cast<uint64_t>(cfg.intermediate) * 2});
