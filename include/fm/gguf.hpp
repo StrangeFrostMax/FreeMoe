@@ -106,6 +106,9 @@ struct GGUFDocument {
     uint64_t file_size = 0;
     uint64_t source_fingerprint = 0;
     std::map<std::string, MetadataValue> metadata;
+    // Insertion order as it appeared in the file. Needed for byte-exact
+    // re-serialisation, because GGUF metadata is an ordered list, not a map.
+    std::vector<std::string> metadata_order;
     std::vector<TensorInfo> tensors;
     std::map<std::string, size_t> tensor_by_name;
 };
@@ -181,6 +184,31 @@ struct QuantGeometry {
 };
 
 const std::map<uint32_t, QuantGeometry> &quantisation_table();
+
+// Per-tensor-type capability. "Parsed" never implies "executable": a type must
+// pass block-exact dequantisation tests before it is advertised as executable.
+struct TensorCapability {
+    bool parse = false;
+    bool dequantize = false;
+    bool execute = false;
+    std::string note;
+};
+
+TensorCapability tensor_capability(uint32_t type_id);
+
+// Decodes `count` elements of `type_id` from `src` into F32 `dst`. Throws a
+// typed error for types whose decode is not implemented rather than guessing.
+void dequantize_row(uint32_t type_id, const uint8_t *src, float *dst, uint64_t count);
+
+// Container-level inspection that works for any GGUF file, independent of any
+// architecture adapter. Never executes the model and never assumes an adapter.
+Json generic_inspect_json(const GGUFDocument &doc, const std::string &source_path);
+
+// Re-serialises a parsed document. Payload bytes are copied from `source`, which
+// must be the exact buffer the document was parsed from. Used to prove that the
+// reader and writer agree byte-for-byte.
+std::vector<uint8_t> write_gguf(const GGUFDocument &doc, const uint8_t *source,
+                                size_t source_size);
 GGUFDocument parse_gguf(const uint8_t *data, size_t size);
 GGUFDocument parse_gguf_file(const std::string &path);
 ModelManifest build_manifest(const GGUFDocument &doc, const std::string &source_path);

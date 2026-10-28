@@ -32,6 +32,7 @@ DETERMINISTIC_COMMANDS = [
     ("python3 scripts/check_architecture.py", "architecture.json"),
     ("python3 scripts/check_dependencies.py", "dependencies.json"),
     ("python3 scripts/zen3_fallback_check.py", "zen3_fallback.json"),
+    ("./build/freemoe bench --iterations 20 --out build/phase0/bench.json", "bench.json"),
 ]
 
 DIRECT_EVIDENCE_OUTPUTS = {"inspect_dense.json", "inspect_moe.json", "zen3_fallback.json"}
@@ -125,6 +126,16 @@ def main() -> int:
     soak_log = read_text(PHASE0 / "soak.log")
     unit_match = re.search(r"(\d+) checks, (\d+) failures", unit_log)
     vendor_match = re.search(r"(\d+) tests, (\d+) failures", test_log)
+    bench = load_json(PHASE0 / "bench.json") or load_json(EVIDENCE / "kernels_bench.json")
+    if bench and (PHASE0 / "bench.json").exists():
+        shutil.copyfile(PHASE0 / "bench.json", EVIDENCE / "kernels_bench.json")
+    kernel_ok = bool(
+        bench and
+        bench.get("status") == "pass" and
+        bool(bench.get("results")) and
+        all(float(row.get("best_ms", 0)) > 0 for row in bench.get("results", [])) and
+        any(float(row.get("gflops", 0)) > 0 for row in bench.get("results", []))
+    )
     zen3_fallback = load_json(EVIDENCE / "zen3_fallback.json")
     zen3_ok = bool(
         zen3_fallback and
@@ -145,6 +156,9 @@ def main() -> int:
         "make_test_exit_recorded": "make test" in test_log or unit_match is not None,
         "zen3_fallback": zen3_ok,
         "zen3_fallback_report": "docs/evidence/zen3_fallback.json",
+        "kernel_benchmark": kernel_ok,
+        "kernel_benchmark_report": "docs/evidence/kernels_bench.json",
+        "resolved_kernel_isa": (bench or {}).get("resolved_isa", "unknown"),
         "soak_passed": "soak: three sessions passed" in soak_log,
         "fuzz": fuzz_json or {},
         "sanitizer_findings": sum(1 for marker in ("AddressSanitizer", "runtime error:", "LeakSanitizer")
@@ -201,6 +215,7 @@ def main() -> int:
             "no_live_allocations": no_live_allocations,
             "unit_and_vendor_selftests": unit_ok,
             "zen3_fallback": zen3_ok,
+            "cpu_kernel_benchmark": kernel_ok,
             "fuzz_72s_clean": fuzz_ok,
             "soak_three_sessions": soak_ok,
         },
@@ -308,6 +323,7 @@ Status source: `docs/evidence/release_status.json` (generated, not hand-edited).
 | Malformed/fuzz tests pass fail-closed | PASS | `tests/malformed_models/manifest.tsv`, `docs/evidence/test_summary.json`, `docs/evidence/fuzz_72s.json` |
 | Reproducible build/test instructions | PASS | `README.md`, `Makefile`, `CMakeLists.txt`, `docs/PHASE0_EXIT.md` |
 | Zen 3 detection falls back to dual AVX2/FMA3 with visible diagnostics | PASS | `docs/evidence/zen3_fallback.json`, `docs/evidence/zen3_fallback.log`, `docs/BACKEND_SUPPORT.md` |
+| CPU kernels dispatch by ISA and match the scalar oracle | PASS | `docs/evidence/kernels_bench.json`, `docs/KERNELS.md`, `cpu_kernels` unit test |
 
 ## Paged MoE prototype
 

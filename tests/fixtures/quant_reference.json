@@ -1,0 +1,84 @@
+{
+  "schema": "freemoe.quant-reference.v1",
+  "generator": "tools/quant_reference.py",
+  "sha256": "84cc85d940fd845841404634b16d80c3b2fc953a01cfd1caec4ecbb726c30aad",
+  "bytes": 8298,
+  "cases": [
+    {
+      "type_id": 0,
+      "block_bytes": 4,
+      "elements": 1
+    },
+    {
+      "type_id": 1,
+      "block_bytes": 2,
+      "elements": 1
+    },
+    {
+      "type_id": 2,
+      "block_bytes": 18,
+      "elements": 32
+    },
+    {
+      "type_id": 3,
+      "block_bytes": 20,
+      "elements": 32
+    },
+    {
+      "type_id": 6,
+      "block_bytes": 22,
+      "elements": 32
+    },
+    {
+      "type_id": 7,
+      "block_bytes": 24,
+      "elements": 32
+    },
+    {
+      "type_id": 8,
+      "block_bytes": 34,
+      "elements": 32
+    },
+    {
+      "type_id": 9,
+      "block_bytes": 40,
+      "elements": 32
+    },
+    {
+      "type_id": 10,
+      "block_bytes": 84,
+      "elements": 256
+    },
+    {
+      "type_id": 11,
+      "block_bytes": 110,
+      "elements": 256
+    },
+    {
+      "type_id": 12,
+      "block_bytes": 144,
+      "elements": 256
+    },
+    {
+      "type_id": 13,
+      "block_bytes": 176,
+      "elements": 256
+    },
+    {
+      "type_id": 14,
+      "block_bytes": 210,
+      "elements": 256
+    },
+    {
+      "type_id": 15,
+      "block_bytes": 292,
+      "elements": 256
+    },
+    {
+      "type_id": 30,
+      "block_bytes": 2,
+      "elements": 1
+    }
+  ],
+  "note": "Expected values are produced by this file's independent decoders. The C++ decoders must match them bit-for-bit where the arithmetic is exactly representable, and within 1e-6 otherwise."
+}

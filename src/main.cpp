@@ -1,6 +1,7 @@
 #include "fm/backend.hpp"
 #include "fm/engine.hpp"
 #include "fm/gguf.hpp"
+#include "fm/quant.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -94,11 +95,12 @@ void print_usage() {
     std::cout <<
         "FreeMoe correctness prototype\n"
         "Usage:\n"
-        "  freemoe inspect <model.gguf> [--json] [--parse-only] [--output path]\n"
+        "  freemoe inspect <model.gguf> [--json] [--parse-only] [--generic] [--output path]\n"
         "  freemoe WAKE_UP <model.gguf> [--json]     # alias for inspect\n"
         "  freemoe device-info --backend cpu|vnpu|gpu [--json]\n"
         "  freemoe run --model <model.gguf> [--backend cpu|vnpu|gpu] [options]\n"
         "  freemoe compare --model <model.gguf> [--backend cpu|vnpu|gpu] [options]\n"
+        "  freemoe bench [--iterations N] [--out path]      # CPU kernel benchmark\n"
         "\n"
         "Common options:\n"
         "  --reader resident|buffered|mmap|direct  --cache-slots N\n"
@@ -106,6 +108,8 @@ void print_usage() {
         "  --queue-depth N --coalesce-gap N       --t-wait-ms N\n"
         "  --prefetch 0|1 --budget-mb N           --vnpu-isa PROFILE\n"
         "      PROFILE = zen3-auto|auto|avx2_dual|zen3|avx2|avx512|scalar\n"
+        "  --kernels auto|scalar|avx2|avx512 --threads N   # CPU kernel dispatch\n"
+        "  --temperature X --top-k N --top-p X --seed N    # sampling (run only)\n"
         "  --allow-cpu-fallback                    --force-direct-fallback\n"
         "  --test-simulate-zen3 (device-info only)# force Zen 3 fallback diagnostics\n"
         "  --trace path --metrics path --report path --run-id ID --results-dir path\n"
@@ -127,6 +131,8 @@ fm::RunConfig build_run_config(const Args &args) {
     cfg.backend.allow_cpu_fallback = args.has("allow-cpu-fallback");
     cfg.backend.vnpu_isa = args.get("vnpu-isa", "avx2_dual");
     cfg.backend.vnpu_threads = args.get_u32("vnpu-threads", 0);
+    cfg.backend.kernel_isa = fm::parse_kernel_isa(args.get("kernels", "auto"));
+    cfg.backend.kernel_threads = args.get_u32("threads", 0);
     cfg.reader_mode = fm::parse_reader_mode(args.get("reader", "buffered"));
     cfg.cache_slots = args.get_u32("cache-slots", 0);
     cfg.queue_depth = std::max(1u, args.get_u32("queue-depth", 2));
@@ -148,6 +154,14 @@ fm::RunConfig build_run_config(const Args &args) {
     cfg.report_path = args.get("report", "");
     cfg.reference_root = args.get("reference-root", "tests/reference");
     cfg.results_dir = args.get("results-dir", "results");
+    cfg.sampling.temperature = args.get_double("temperature", 0.0);
+    cfg.sampling.top_k = args.get_u32("top-k", 0);
+    cfg.sampling.top_p = args.get_double("top-p", 1.0);
+    cfg.sampling.seed = args.get_u64("seed", 0);
+    if (cfg.sampling.temperature < 0.0)
+        fm::fail(fm::ErrorCode::INVALID_ARGUMENT, "--temperature must not be negative");
+    if (cfg.sampling.top_p < 0.0 || cfg.sampling.top_p > 1.0)
+        fm::fail(fm::ErrorCode::INVALID_ARGUMENT, "--top-p must be within [0, 1]");
     cfg.abs_tol = args.get_double("abs-tol", fm::DEFAULT_ABS_TOL);
     cfg.rel_tol = args.get_double("rel-tol", fm::DEFAULT_REL_TOL);
     return cfg;
@@ -162,6 +176,25 @@ std::string load_prompt(const Args &args) {
     return "the quick brown fox";
 }
 
+// The synthetic tokenizer emits raw bytes, which are not always valid UTF-8.
+// Render them with printable ASCII preserved and everything else as \xNN so the
+// JSON stays valid and the output is unambiguous.
+std::string display_text(const std::string &bytes) {
+    static const char *hex = "0123456789abcdef";
+    std::string out;
+    out.reserve(bytes.size());
+    for (unsigned char c : bytes) {
+        if (c >= 0x20 && c < 0x7F && c != '\\') {
+            out.push_back(static_cast<char>(c));
+        } else {
+            out += "\\x";
+            out.push_back(hex[(c >> 4) & 0xF]);
+            out.push_back(hex[c & 0xF]);
+        }
+    }
+    return out;
+}
+
 Json json_result(const std::string &status) {
     Json j = Json::object();
     j.set("status", status);
@@ -171,6 +204,13 @@ Json json_result(const std::string &status) {
 int command_inspect(const Args &args) {
     std::string path = model_path(args);
     auto doc = fm::parse_gguf_file(path);
+    if (args.has("generic")) {
+        Json view = fm::generic_inspect_json(doc, path);
+        if (args.has("out") || args.has("output"))
+            fm::write_text_file(args.get("output", args.get("out")), view.dump() + "\n");
+        std::cout << view.dump() << "\n";
+        return 0;
+    }
     if (args.has("parse-only")) {
         Json j = Json::object();
         j.set("schema", "freemoe.gguf-parse.v1");
@@ -259,6 +299,11 @@ int command_run(const Args &args) {
     Json generated = Json::array();
     for (int32_t id : result.generated_ids) generated.push(Json::integer(id));
     out.set("generated_ids", std::move(generated));
+    out.set("text", display_text(engine.detokenize(result.generated_ids)));
+    out.set("sampling_temperature", fm::fixed_double(cfg.sampling.temperature, 4));
+    out.set("sampling_top_k", static_cast<int64_t>(cfg.sampling.top_k));
+    out.set("sampling_top_p", fm::fixed_double(cfg.sampling.top_p, 4));
+    out.set("sampling_seed", cfg.sampling.seed);
     if (args.has("dump-logits")) {
         std::ostringstream os;
         os << result.prefill_logits.size() << "\n";
@@ -280,6 +325,105 @@ int command_run(const Args &args) {
         out.set("report_path", cfg.report_path);
     }
     if (!cfg.trace_path.empty()) out.set("trace_path", cfg.trace_path);
+    std::cout << out.dump() << "\n";
+    return 0;
+}
+
+
+Json kernel_bench_json(uint32_t iterations) {
+    struct Shape { const char *label; uint32_t out_dim; uint32_t in_dim; };
+    static const Shape shapes[] = {
+        {"qkv_1280x1280", 1280, 1280},
+        {"expert_gate_1920x1280", 1920, 1280},
+        {"expert_down_1280x1920", 1280, 1920},
+        {"output_head_32000x1280", 32000, 1280},
+        {"toy_hidden_16x32", 16, 32},
+    };
+    struct Candidate { const char *label; fm::KernelIsa isa; uint32_t threads; };
+    std::vector<Candidate> candidates = {
+        {"scalar_1t", fm::KernelIsa::Scalar, 1},
+        {"isa_1t", fm::KernelIsa::Auto, 1},
+        {"isa_threads", fm::KernelIsa::Auto, 0},
+    };
+#if defined(__x86_64__) || defined(__i386__)
+    if (fm::host_has_avx2_fma()) candidates.push_back({"avx2_1t", fm::KernelIsa::Avx2Fma, 1});
+    if (fm::host_has_avx512()) candidates.push_back({"avx512_1t", fm::KernelIsa::Avx512, 1});
+#endif
+
+    Json out = Json::object();
+    out.set("schema", "freemoe.kernel-bench.v1");
+    out.set("status", "pass");
+    out.set("host_cpu", fm::host_cpu_name());
+    out.set("detected_avx2_fma", fm::host_has_avx2_fma());
+    out.set("detected_avx512", fm::host_has_avx512());
+    out.set("zen3_detected", fm::host_is_zen3());
+    fm::KernelConfig auto_cfg;
+    out.set("resolved_isa", fm::kernel_isa_name(fm::resolved_isa(auto_cfg)));
+    out.set("resolved_threads", static_cast<int64_t>(fm::resolved_threads(auto_cfg)));
+    out.set("iterations", static_cast<int64_t>(iterations));
+
+    Json results = Json::array();
+    for (const auto &shape : shapes) {
+        for (const auto &candidate : candidates) {
+            fm::KernelConfig cfg;
+            cfg.requested = candidate.isa;
+            cfg.threads = candidate.threads;
+            auto bench = fm::benchmark_gemv(cfg, shape.out_dim, shape.in_dim, iterations);
+            Json row = Json::object();
+            row.set("shape", shape.label);
+            row.set("candidate", candidate.label);
+            row.set("isa", bench.isa);
+            row.set("threads", static_cast<int64_t>(bench.threads));
+            row.set("out_dim", static_cast<int64_t>(bench.out_dim));
+            row.set("in_dim", static_cast<int64_t>(bench.in_dim));
+            row.set("best_ms", fm::fixed_double(bench.best_ms, 6));
+            row.set("gflops", fm::fixed_double(bench.gflops, 4));
+            row.set("gbytes_per_s", fm::fixed_double(bench.gbytes_per_s, 4));
+            results.push(std::move(row));
+        }
+    }
+    out.set("results", std::move(results));
+
+    // Quantised GEMV: same shapes, the two formats that dominate real
+    // checkpoints. Bandwidth is the ceiling here, so report GB/s alongside.
+    struct QuantShape { const char *label; uint32_t out_dim; uint32_t in_dim; uint32_t type_id; };
+    static const QuantShape quant_shapes[] = {
+        {"qkv_1280x1280_q8_0", 1280, 1280, 8},
+        {"qkv_1280x1280_q4_k", 1280, 1280, 12},
+        {"expert_gate_1792x1280_q4_k", 1792, 1280, 12},
+        {"expert_down_1280x1792_q4_k", 1280, 1792, 12},
+        {"output_head_32000x1280_q4_k", 32000, 1280, 12},
+    };
+    Json quant_results = Json::array();
+    for (const auto &shape : quant_shapes) {
+        for (const auto &candidate : candidates) {
+            fm::KernelConfig cfg;
+            cfg.requested = candidate.isa;
+            cfg.threads = candidate.threads;
+            auto bench = fm::benchmark_gemv_quant(cfg, shape.type_id, shape.out_dim,
+                                                  shape.in_dim, iterations);
+            Json row = Json::object();
+            row.set("shape", shape.label);
+            row.set("candidate", candidate.label);
+            row.set("type", fm::quant_geometry(shape.type_id).name);
+            row.set("isa", bench.isa);
+            row.set("threads", static_cast<int64_t>(bench.threads));
+            row.set("out_dim", static_cast<int64_t>(bench.out_dim));
+            row.set("in_dim", static_cast<int64_t>(bench.in_dim));
+            row.set("best_ms", fm::fixed_double(bench.best_ms, 6));
+            row.set("gflops", fm::fixed_double(bench.gflops, 4));
+            row.set("gbytes_per_s", fm::fixed_double(bench.gbytes_per_s, 4));
+            quant_results.push(std::move(row));
+        }
+    }
+    out.set("quant_results", std::move(quant_results));
+    return out;
+}
+
+int command_bench(const Args &args) {
+    uint32_t iterations = std::max(1u, args.get_u32("iterations", 5));
+    Json out = kernel_bench_json(iterations);
+    if (args.has("out")) fm::write_text_file(args.get("out"), out.dump() + "\n");
     std::cout << out.dump() << "\n";
     return 0;
 }
@@ -336,6 +480,7 @@ int main(int argc, char **argv) {
         if (command == "device-info") return command_device_info(args);
         if (command == "run") return command_run(args);
         if (command == "compare") return command_compare(args);
+        if (command == "bench") return command_bench(args);
         if (command == "version") {
             std::cout << "FreeMoe 0.1.0 correctness prototype\n";
             return 0;

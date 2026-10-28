@@ -1,0 +1,74 @@
+{
+  "schema": "freemoe.quant-fixtures.v2",
+  "generator": "tools/make_quant_fixtures.py",
+  "synthetic": true,
+  "variants": {
+    "q8_0": {
+      "model": "quant-moe-q8_0.gguf",
+      "model_sha256": "e4dc6b42fb87c8ed3278c52dc8051851114439b8ba2cc3f1718cb5f10ac3e617",
+      "model_bytes": 287168,
+      "reference": "quant-moe-q8_0-f32ref.gguf",
+      "reference_sha256": "5399bc9c74f9458467a783a9c96956a97967b5e518faacb9c5fb08dd8b09600b",
+      "reference_bytes": 1059424,
+      "quantised_tensors": 18,
+      "quantised_payload_bytes": 280624,
+      "payload_ratio": 3.752,
+      "config": {
+        "hidden": 64,
+        "intermediate": 128,
+        "layers": 2,
+        "heads": 4,
+        "head_dim": 16,
+        "vocab": 258,
+        "context": 512,
+        "experts": 4,
+        "top_k": 2
+      }
+    },
+    "q4_0": {
+      "model": "quant-moe-q4_0.gguf",
+      "model_sha256": "ff2f4629263825aa98975e97132e4f980756e8fc52c97100cfff39d3f54c8ff3",
+      "model_bytes": 155712,
+      "reference": "quant-moe-q4_0-f32ref.gguf",
+      "reference_sha256": "28f4249fed8ff8ca995efe9dfeefc92b5dc672703e4521b71b91ca4498825f3a",
+      "reference_bytes": 1059424,
+      "quantised_tensors": 18,
+      "quantised_payload_bytes": 149168,
+      "payload_ratio": 7.059,
+      "config": {
+        "hidden": 64,
+        "intermediate": 128,
+        "layers": 2,
+        "heads": 4,
+        "head_dim": 16,
+        "vocab": 258,
+        "context": 512,
+        "experts": 4,
+        "top_k": 2
+      }
+    },
+    "q4_k": {
+      "model": "quant-moe-q4_k.gguf",
+      "model_sha256": "c2adb16a25217401900ea8c508ba5e6294858054c8bbe034ea09f174d030e296",
+      "model_bytes": 452096,
+      "reference": "quant-moe-q4_k-f32ref.gguf",
+      "reference_sha256": "2708176bb5fc05f67ee14dd5f1cb0e56e1bebb22b01545fd35efc03c8be50214",
+      "reference_bytes": 3160736,
+      "quantised_tensors": 10,
+      "quantised_payload_bytes": 446304,
+      "payload_ratio": 7.069,
+      "config": {
+        "hidden": 256,
+        "intermediate": 256,
+        "layers": 1,
+        "heads": 4,
+        "head_dim": 64,
+        "vocab": 258,
+        "context": 256,
+        "experts": 2,
+        "top_k": 1
+      }
+    }
+  },
+  "note": "Each -f32ref twin stores exactly the values an *independent Python decoder* (tools/quant_reference.py) produces for the quantised file, so matching greedy tokens and logits prove both the C++ decoder and the execution path."
+}

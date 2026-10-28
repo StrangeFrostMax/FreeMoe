@@ -1,6 +1,7 @@
 #pragma once
 
 #include "fm/common.hpp"
+#include "fm/kernels.hpp"
 
 #include <functional>
 #include <map>
@@ -128,6 +129,10 @@ struct BackendConfig {
     bool allow_cpu_fallback = false;
     uint32_t vnpu_threads = 0;
     std::string vnpu_isa = "avx2_dual";
+    // CPU kernel dispatch for the scalar CPU backend. `Auto` resolves at run
+    // time and never selects AVX-512 on a Zen 3 host.
+    KernelIsa kernel_isa = KernelIsa::Auto;
+    uint32_t kernel_threads = 0;
     // Test-only: forces the detection branch on non-Zen-3 CI hosts.
     // Never set by the CLI or normal engine configuration.
     bool test_simulate_zen3 = false;

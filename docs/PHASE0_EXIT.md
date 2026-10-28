@@ -7,15 +7,16 @@ verification. Hashes are SHA-256 of the exact redirected output file listed.
 
 | Command | Output file | SHA-256 |
 |---|---|---|
-| `make clean && make -j1` | `docs/evidence/phase0_build.log` | `0fec9ae210b2b7bd530f55d81f8a5a59e033e929655cd32401a81c401f9d328f` |
-| `./build/tests` | `docs/evidence/phase0_unit.log` | `3b52b198b3d3f0f5d9a8e7b277cd2d93186a6c571c50bb0e0f8281faee3d28af` |
+| `make clean && make -j1` | `docs/evidence/phase0_build.log` | `464ff5466a0fc58a0f078388cb9e739037180348d1d573bb53f95b76263cbcfd` |
+| `./build/tests` | `docs/evidence/phase0_unit.log` | `c9d857776361f9cdec30cc3be19a6f720ca5f96c6643cfc47d7bf7ff7c012906` |
 | `./build/freemoe inspect tests/fixtures/dense-fm.gguf --json` | `docs/evidence/inspect_dense.json` | `3f4c9cd5d9602c616a0d67da81b9b82702712bb2116066985c300e171a710359` |
 | `./build/freemoe inspect tests/fixtures/moe-fm.gguf --json` | `docs/evidence/inspect_moe.json` | `04813e7681bab5842efd851cdc058e0efad4553732f8abc8bc92f6f44c20781e` |
 | `python3 tools/trace_replay.py --trace build/test-tmp/replay-trace.jsonl --metrics build/test-tmp/replay-metrics.json --check` | `docs/evidence/phase0_replay.json` | `02c8aed9a8de426328d25d923f4888ac40a1ff1c1bf4820557395aec60e2628b` |
 | `python3 tools/check_trace.py build/test-tmp/replay-trace.jsonl build/test-tmp/prefetch-trace.jsonl build/test-tmp/cachehit-trace.jsonl` | `docs/evidence/phase0_trace_events.json` | `17ea47c013f0f7d4f41cd9988867efeaedb72bf6653c088314e7fd9acf10aecf` |
-| `python3 scripts/check_architecture.py` | `docs/evidence/phase0_architecture.json` | `3da9caa6758cdc240b5688a68489ee79b7669d6fd89b1f10ad4614414e9b2870` |
+| `python3 scripts/check_architecture.py` | `docs/evidence/phase0_architecture.json` | `ee19b39a6359a601684b7a01bbf7e9ac4e0c1283801f67c9e64b6fb34c8d34f5` |
 | `python3 scripts/check_dependencies.py` | `docs/evidence/phase0_dependencies.json` | `c21ba1262af523fd8c0173c53fa67b8d3750f55acf26fe6550b44918252e2a58` |
 | `python3 scripts/zen3_fallback_check.py` | `docs/evidence/zen3_fallback.json` | `69b967173f722eada794242e2c35b9fda96ec885457f861ce2f53dcf054c7790` |
+| `./build/freemoe bench --iterations 20 --out build/phase0/bench.json` | `docs/evidence/phase0_bench.json` | `2c9ac5d292ea64b3ef17996b6cc33a2482feed78ff72a2babf68bbfbd3107f34` |
 
 These commands are deterministic in a clean checkout with the same compiler
 and source tree. Re-run them in the recorded order to reproduce each hash.

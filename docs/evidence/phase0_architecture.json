@@ -1,13 +1,15 @@
 {
   "status": "pass",
-  "exists_rows": 18,
+  "exists_rows": 21,
   "src_files": [
     "src/backend.cpp",
     "src/common.cpp",
     "src/engine.cpp",
     "src/gguf.cpp",
     "src/io.cpp",
+    "src/kernels.cpp",
     "src/main.cpp",
+    "src/quant.cpp",
     "src/residency.cpp"
   ],
   "missing_paths": [],
