@@ -86,6 +86,10 @@ def load_model(path: Path) -> dict[str, Any]:
                      else key("attention.layer_norm_rms_epsilon", 1e-5)),
         "theta": float(key("rope.freq_base", 10000.0)),
         "rope_dim": int(key("rope.dimension_count", hd)),
+        # Context extension, read from the same `rope.scaling.*` keys llama.cpp
+        # uses. Derived here rather than in the rotation loop so the formulas can
+        # be checked on their own.
+        "rope_scale": rope_scaling(md, arch, int(key("context_length"))),
         "qkv_bias": bool(key("attention.qkv_bias", False)),
         # The prompt is tokenized with the checkpoint's own BOS id, exactly as
         # the engine does; hard-coding 1 would hide a real disagreement.
@@ -230,8 +234,79 @@ def head_rmsnorm(vec: list[float], heads: int, scale: list[float], eps: float) -
     return out
 
 
+def rope_scaling(md: dict[str, Any], arch: str, n_ctx_train: int) -> dict[str, Any]:
+    """llama.cpp's derived rope-scaling parameters, from the raw keys.
+
+    `freq_scale` is 1/factor (llama.cpp's direction), `ext_factor` is 1 only for
+    YaRN, and `mscale` is the net magnitude multiplier. llama.cpp's kernel folds
+    a `1 + 0.1*log(1/freq_scale)` factor into YaRN's magnitude and its context
+    setup divides it straight back out; the net value is what is returned here.
+    """
+    def key(name: str, default: Any) -> Any:
+        for candidate in (f"{arch}.{name}", f"freemoe.{name}", name):
+            if candidate in md:
+                return md[candidate]
+        return default
+
+    kind = key("rope.scaling.type", "none")
+    factor = float(key("rope.scaling.factor", key("rope.scale_linear", 0.0)) or 1.0)
+    n_ctx_orig = float(key("rope.scaling.original_context_length", n_ctx_train))
+    attn_factor = float(key("rope.scaling.attn_factor", 1.0))
+    log_mul = float(key("rope.scaling.yarn_log_multiplier", 0.0))
+    beta_fast = float(key("rope.scaling.yarn_beta_fast", 32.0))
+    beta_slow = float(key("rope.scaling.yarn_beta_slow", 1.0))
+    if kind == "none":
+        return {"kind": kind, "freq_scale": 1.0, "ext_factor": 0.0,
+                "mscale": attn_factor, "n_ctx_orig": n_ctx_orig, "theta": None}
+    if kind not in ("linear", "yarn"):
+        raise ReferenceError(f"rope.scaling.type {kind!r} is not implemented")
+    if n_ctx_orig <= 0:
+        raise ReferenceError("rope.scaling without an original context length")
+
+    def mscale_of(scale: float, m: float) -> float:
+        return 1.0 if scale <= 1.0 else 0.1 * m * math.log(scale) + 1.0
+
+    if kind == "yarn":
+        if log_mul != 0.0:
+            mscale_dim = log_mul if (arch == "deepseek2" and log_mul != 1.0) else 1.0
+            mscale = mscale_of(factor, mscale_dim) / mscale_of(factor, log_mul)
+        else:
+            mscale = mscale_of(factor, 1.0)
+    else:
+        mscale = 1.0
+    return {"kind": kind, "freq_scale": 1.0 / factor, "ext_factor": 1.0 if kind == "yarn" else 0.0,
+            "mscale": mscale * attn_factor, "n_ctx_orig": n_ctx_orig,
+            "beta_fast": beta_fast, "beta_slow": beta_slow}
+
+
+def yarn_corr_dims(n_dims: int, n_ctx_orig: float, freq_base: float,
+                   beta_fast: float, beta_slow: float) -> tuple[float, float]:
+    """ggml's `ggml_rope_yarn_corr_dims`, in pair indices."""
+    def corr(n_rot: float) -> float:
+        return n_dims * math.log(n_ctx_orig / (n_rot * 2.0 * math.pi)) / (2.0 * math.log(freq_base))
+
+    start = math.floor(corr(beta_fast))
+    end = math.ceil(corr(beta_slow))
+    return max(0.0, start), min(float(n_dims - 1), end)
+
+
+def rope_angles(scale: dict[str, Any], n_dims: int, pair: int, pos: int,
+                theta: float) -> tuple[float, float]:
+    """cos/sin for one rotary pair, with linear/YaRN scaling applied."""
+    extrap = theta ** (-2.0 * pair / n_dims)
+    angle_freq = scale["freq_scale"] * extrap
+    if scale["ext_factor"] != 0.0:
+        lo, hi = yarn_corr_dims(n_dims, scale["n_ctx_orig"], theta,
+                                scale["beta_fast"], scale["beta_slow"])
+        ramp = 1.0 - min(1.0, max(0.0, (pair - lo) / max(0.001, hi - lo)))
+        angle_freq = angle_freq * (1.0 - ramp * scale["ext_factor"]) + extrap * ramp * scale["ext_factor"]
+    angle = pos * angle_freq
+    return math.cos(angle) * scale["mscale"], math.sin(angle) * scale["mscale"]
+
+
 def rope_half(vec: list[float], head_dim: int, heads: int, pos: int,
-              rope_dim: int, theta: float) -> None:
+              rope_dim: int, theta: float,
+              scale: dict[str, Any] | None = None) -> None:
     """Rotates each head's vector in place over `rope_dim` dimensions.
 
     This is ggml's default (`GGML_ROPE_TYPE_NORM`) layout, the one llama.cpp
@@ -243,12 +318,12 @@ def rope_half(vec: list[float], head_dim: int, heads: int, pos: int,
     Verified against a real checkpoint: on tinyllama-15M the adjacent-pair
     layout produces fluent text and the half-pair layout produces word salad.
     """
+    if scale is None:
+        scale = {"kind": "none", "freq_scale": 1.0, "ext_factor": 0.0, "mscale": 1.0}
     for head in range(heads):
         base = head * head_dim
         for j in range(rope_dim // 2):
-            freq = 1.0 / (theta ** (2.0 * j / rope_dim))
-            angle = pos * freq
-            c, s = math.cos(angle), math.sin(angle)
+            c, s = rope_angles(scale, rope_dim, j, pos, theta)
             a = vec[base + 2 * j]
             b = vec[base + 2 * j + 1]
             vec[base + 2 * j] = a * c - b * s
@@ -256,19 +331,19 @@ def rope_half(vec: list[float], head_dim: int, heads: int, pos: int,
 
 
 def rope_mla(vec: list[float], heads: int, stride: int, offset: int, width: int,
-             pos: int, theta: float) -> list[float]:
+             pos: int, theta: float, scale: dict[str, Any] | None = None) -> list[float]:
     """Rotary position applied to one slice per head.
 
     MLA rotates only the rope part of each query head, and the shared k_pe
     vector on its own, so the slice geometry has to be explicit.
     """
+    if scale is None:
+        scale = {"kind": "none", "freq_scale": 1.0, "ext_factor": 0.0, "mscale": 1.0}
     out = list(vec)
     for head in range(heads):
         base = head * stride + offset
         for i in range(width // 2):
-            inv = theta ** (-(2.0 * i) / width)
-            angle = pos * inv
-            cs, sn = math.cos(angle), math.sin(angle)
+            cs, sn = rope_angles(scale, width, i, pos, theta)
             a0 = out[base + 2 * i]
             a1 = out[base + 2 * i + 1]
             out[base + 2 * i] = a0 * cs - a1 * sn
@@ -381,9 +456,9 @@ class Session:
                 # Rotary on the trailing rope slice of each query head, and on
                 # the shared k_pe.
                 q = rope_mla(q, heads, hd, hd - cfg["rope_dim"], cfg["rope_dim"], self.pos,
-                             cfg["theta"])
+                             cfg["theta"], cfg["rope_scale"])
                 kpe = rope_mla(kpe, 1, cfg["rope_dim"], 0, cfg["rope_dim"], self.pos,
-                               cfg["theta"])
+                               cfg["theta"], cfg["rope_scale"])
                 kb = self.tensor(p + "attn_k_b.weight")
                 vb = self.tensor(p + "attn_v_b.weight")
                 k_vec: list[float] = []
@@ -426,8 +501,10 @@ class Session:
                 if cfg["qk_norm"]:
                     q = head_rmsnorm(q, heads, self.tensor(p + "attn_q_norm.weight"), cfg["eps"])
                     k = head_rmsnorm(k, kv_heads, self.tensor(p + "attn_k_norm.weight"), cfg["eps"])
-                rope_half(q, hd, heads, self.pos, cfg["rope_dim"], cfg["theta"])
-                rope_half(k, hd, kv_heads, self.pos, cfg["rope_dim"], cfg["theta"])
+                rope_half(q, hd, heads, self.pos, cfg["rope_dim"], cfg["theta"],
+                          cfg["rope_scale"])
+                rope_half(k, hd, kv_heads, self.pos, cfg["rope_dim"], cfg["theta"],
+                          cfg["rope_scale"])
             if TRACE is not None:
                 TRACE["pos"] = self.pos
                 TRACE[f"q.L{layer}"] = list(q)

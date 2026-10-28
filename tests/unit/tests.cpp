@@ -4,8 +4,10 @@
 #include "fm/io.hpp"
 #include "fm/residency.hpp"
 #include "fm/quant.hpp"
+#include "fm/rope.hpp"
 #include "fm/support.hpp"
 #include "fm/tokenizer.hpp"
+#include "fm/unicode.hpp"
 #include "vnpu.h"
 
 #include <algorithm>
@@ -1447,13 +1449,29 @@ void test_cpu_kernels() {
     CHECK(resolve_kernel_isa(KernelIsa::Scalar) == KernelIsa::Scalar,
           "explicit scalar kernel request is honoured");
     const KernelIsa auto_isa = resolve_kernel_isa(KernelIsa::Auto);
-    CHECK(auto_isa == KernelIsa::Scalar || auto_isa == KernelIsa::Avx2Fma ||
-              auto_isa == KernelIsa::Avx512,
-          "auto kernel resolution returns a valid ISA");
+    CHECK(auto_isa == KernelIsa::Scalar || auto_isa == KernelIsa::Avx2Fma,
+          "auto kernel resolution stays on the deployment target's width");
+    // The target is Zen 3, which has no AVX-512. Auto must therefore never pick
+    // it, whatever this host supports, or every number recorded here describes a
+    // machine the software will not run on.
+    CHECK(auto_isa != KernelIsa::Avx512, "auto never selects AVX-512 kernels");
     if (!host_has_avx2_fma())
         CHECK(auto_isa == KernelIsa::Scalar, "no AVX2 means scalar fallback");
-    if (host_is_zen3())
-        CHECK(auto_isa != KernelIsa::Avx512, "Zen 3 never selects AVX-512 kernels");
+    // An explicit request is still honoured when the host can run it.
+    if (host_has_avx512() && !host_is_zen3())
+        CHECK(resolve_kernel_isa(KernelIsa::Avx512) == KernelIsa::Avx512,
+              "an explicit AVX-512 request is honoured on a host that has it");
+    CHECK(parse_kernel_isa("zen3") == KernelIsa::Avx2Fma,
+          "the zen3 profile means dual-width AVX2, not AVX-512");
+    CHECK(parse_kernel_isa("zen3-auto") == KernelIsa::Avx2Fma,
+          "the zen3 profile accepts the VNPU spelling too");
+    // The committed benchmark config has to pin the target width, or the
+    // recorded numbers describe whatever host ran them.
+    {
+        const std::string config = read_text_file("configs/benchmark.env");
+        CHECK(config.find("--kernels zen3") != std::string::npos,
+              "the benchmark config pins the Zen 3 kernel profile");
+    }
     CHECK(resolved_threads(KernelConfig{}) >= 1, "default thread count is at least one");
     CHECK(std::string(kernel_isa_name(KernelIsa::Avx2Fma)) == "avx2_fma",
           "kernel ISA names are stable");
@@ -1656,6 +1674,235 @@ void test_tokenizer_real_vocabularies() {
     }
 }
 
+// Byte-level BPE. The merge list is the point: an encoder that ignores it can
+// still round-trip, and still disagree with every other runtime about the ids.
+namespace bpe_fixture {
+
+// A miniature GPT-2 style vocabulary: the 256 byte-alphabet pieces plus a
+// handful of merged pieces, so merges have something to produce.
+inline std::string byte_piece(unsigned char byte) {
+    return fm::unicode::byte_to_utf8(byte);
+}
+
+inline GGUFDocument document(const std::string &pre, bool with_merges = true) {
+    GGUFDocument doc;
+    doc.metadata["tokenizer.ggml.model"] = make_string("gpt2");
+    doc.metadata["tokenizer.ggml.pre"] = make_string(pre);
+
+    MetadataValue tokens;
+    tokens.type = GGUFValueType::ARRAY;
+    // Byte pieces come first so the byte-fallback ids are easy to reason about.
+    std::vector<std::string> pieces;
+    for (int byte = 0; byte < 256; ++byte)
+        pieces.push_back(byte_piece(static_cast<unsigned char>(byte)));
+    // Merged pieces, addressed by name in the checks below.
+    pieces.push_back("ab");   // 256
+    pieces.push_back("bc");   // 257
+    pieces.push_back("the");  // 258
+    pieces.push_back("\xC4\xA0the"); // 259: "\u0120the", space + "the"
+    pieces.push_back("12");   // 260
+    pieces.push_back("'S");   // 261: reachable only through whole-word lookup
+    for (const std::string &piece : pieces) tokens.array.push_back(make_string(piece));
+    doc.metadata["tokenizer.ggml.tokens"] = tokens;
+
+    if (with_merges) {
+        MetadataValue merges;
+        merges.type = GGUFValueType::ARRAY;
+        // Rank order matters: "b c" merges before "a b", so "abc" becomes
+        // "a" + "bc" rather than "ab" + "c". A longest-match encoder gets the
+        // opposite answer, which is what this fixture exists to catch.
+        merges.array.push_back(make_string("b c"));
+        merges.array.push_back(make_string("a b"));
+        merges.array.push_back(make_string("t h"));
+        merges.array.push_back(make_string("th e"));
+        // "\u0120the" (space + "the"). The pair is "\u0120" + "the", not
+        // "\u0120t" + "he": "t h" has a lower rank than any \u0120 merge, so
+        // "the" is already assembled by the time the space is looked at.
+        merges.array.push_back(make_string("\xC4\xA0 the"));
+        merges.array.push_back(make_string("1 2"));
+        doc.metadata["tokenizer.ggml.merges"] = merges;
+    }
+    return doc;
+}
+
+} // namespace bpe_fixture
+
+void test_tokenizer_bpe_merges() {
+    using namespace bpe_fixture;
+    GGUFDocument doc = document("gpt-2");
+    const uint32_t vocab = static_cast<uint32_t>(
+        doc.metadata["tokenizer.ggml.tokens"].array.size());
+    const Tokenizer tokenizer = Tokenizer::from_gguf(doc, vocab);
+
+    CHECK(tokenizer.kind() == Tokenizer::Kind::Bpe, "a gpt2 table is a BPE tokenizer");
+    CHECK(tokenizer.pre_tokenizer() == Tokenizer::PreTokenizer::Gpt2,
+          "the pre-tokenizer name selects the splitting rule");
+    CHECK(tokenizer.complete(), "merges plus a byte alphabet make the BPE tokenizer complete");
+
+    // The regression this whole change exists for: rank order, not length.
+    const std::vector<int32_t> abc = tokenizer.encode("abc", 0, false);
+    CHECK(abc.size() == 2, "abc is two pieces, so the merge order was followed");
+    CHECK(abc[0] == 'a', "the left digit stays a single byte piece");
+    CHECK(abc[1] == 256 + 1, "the rank-0 merge wins: b+c is the second piece");
+    // Longest match would have produced 256 ("ab") + 'c'.
+    CHECK(!(abc[0] == 256), "a longest-match encoder would have picked 'ab' first");
+
+    // A merge chain: t+h then th+e.
+    const std::vector<int32_t> the = tokenizer.encode("the", 0, false);
+    CHECK(the.size() == 1 && the[0] == 258, "chained merges reconstruct the whole word");
+    // The space-attachment rule of the GPT-2 preg: " the" is one word.
+    const std::vector<int32_t> space_the = tokenizer.encode(" the", 0, false);
+    CHECK(space_the.size() == 1 && space_the[0] == 259,
+          "a leading space joins the word, so the space+the piece matches");
+    // Digits are one run under the GPT-2 rule.
+    const std::vector<int32_t> digits = tokenizer.encode("12", 0, false);
+    CHECK(digits.size() == 1 && digits[0] == 260, "digit runs merge under the gpt2 rule");
+    // Decoding reverses the byte alphabet, so text survives the round trip.
+    CHECK(tokenizer.decode(the, UINT32_MAX, UINT32_MAX) == "the",
+          "BPE pieces decode back through the byte alphabet");
+    CHECK(tokenizer.decode(space_the, UINT32_MAX, UINT32_MAX) == " the",
+          "an escaped space decodes as a real space");
+    CHECK(tokenizer.decode(tokenizer.encode("hello world", 0, false), UINT32_MAX, UINT32_MAX) ==
+              "hello world",
+          "unmerged text round-trips byte for byte");
+}
+
+void test_tokenizer_bpe_families() {
+    using namespace bpe_fixture;
+
+    // StarCoder: every digit is its own word, and a space in front of a digit
+    // becomes its own word rather than joining it.
+    {
+        GGUFDocument doc = document("starcoder");
+        const uint32_t vocab = static_cast<uint32_t>(
+            doc.metadata["tokenizer.ggml.tokens"].array.size());
+        const Tokenizer tokenizer = Tokenizer::from_gguf(doc, vocab);
+        CHECK(tokenizer.pre_tokenizer() == Tokenizer::PreTokenizer::Gpt2Digits,
+              "starcoder uses the digit-splitting rule");
+        const std::vector<int32_t> ids = tokenizer.encode("12", 0, false);
+        CHECK(ids.size() == 2 && ids[0] == '1' && ids[1] == '2',
+              "the digit rule splits before any merge can join them");
+    }
+
+    // llama-3: whole-word lookup first (ignore_merges), and an uppercase
+    // contraction is still a contraction.
+    {
+        GGUFDocument doc = document("llama-bpe");
+        const uint32_t vocab = static_cast<uint32_t>(
+            doc.metadata["tokenizer.ggml.tokens"].array.size());
+        const Tokenizer tokenizer = Tokenizer::from_gguf(doc, vocab);
+        CHECK(tokenizer.pre_tokenizer() == Tokenizer::PreTokenizer::Llama3,
+              "llama-bpe selects the llama-3 rule");
+        const std::vector<int32_t> ids = tokenizer.encode("'S", 0, false);
+        CHECK(ids.size() == 1, "a contraction is one word");
+        CHECK(tokenizer.decode(ids, UINT32_MAX, UINT32_MAX) == "'S",
+              "contractions decode exactly");
+    }
+
+    // Unknown and missing pre-tokenizers refuse instead of guessing.
+    {
+        GGUFDocument doc = document("deepseek-llm");
+        const uint32_t vocab = static_cast<uint32_t>(
+            doc.metadata["tokenizer.ggml.tokens"].array.size());
+        const Tokenizer tokenizer = Tokenizer::from_gguf(doc, vocab);
+        CHECK(tokenizer.pre_tokenizer() == Tokenizer::PreTokenizer::Unsupported,
+              "an unimplemented family is reported as such");
+        CHECK(!tokenizer.complete(), "an unimplemented family is not complete");
+        CHECK(throws_code(ErrorCode::NOT_IMPLEMENTED,
+                          [&]() { (void)tokenizer.encode("hi", 0, false); }),
+              "encoding with an unimplemented family refuses by name");
+    }
+    {
+        GGUFDocument doc = document("");
+        const uint32_t vocab = static_cast<uint32_t>(
+            doc.metadata["tokenizer.ggml.tokens"].array.size());
+        const Tokenizer tokenizer = Tokenizer::from_gguf(doc, vocab);
+        CHECK(throws_code(ErrorCode::NOT_IMPLEMENTED,
+                          [&]() { (void)tokenizer.encode("hi", 0, false); }),
+              "a BPE file with no pre-tokenizer is refused, not guessed");
+    }
+    // A missing merge list is still refused, and for its own reason.
+    {
+        GGUFDocument doc = document("gpt-2", /*with_merges=*/false);
+        const uint32_t vocab = static_cast<uint32_t>(
+            doc.metadata["tokenizer.ggml.tokens"].array.size());
+        const Tokenizer tokenizer = Tokenizer::from_gguf(doc, vocab);
+        CHECK(throws_code(ErrorCode::NOT_IMPLEMENTED,
+                          [&]() { (void)tokenizer.encode("hi", 0, false); }),
+              "BPE without merges refuses");
+    }
+
+    // The probe has to say the same thing before a run is attempted, so a
+    // checkpoint with an unknown splitting rule is never reported runnable.
+    {
+        GGUFDocument doc = document("deepseek-llm");
+        doc.metadata["general.architecture"] = make_string("gpt2");
+        const Json probe = probe_model(doc, "synthetic.gguf");
+        CHECK(probe.dump().find("TOKENIZER_PRE_NOT_IMPLEMENTED") != std::string::npos,
+              "the probe blocks an unimplemented pre-tokenizer by name");
+    }
+    {
+        GGUFDocument doc = document("");
+        doc.metadata["general.architecture"] = make_string("gpt2");
+        const Json probe = probe_model(doc, "synthetic.gguf");
+        CHECK(probe.dump().find("TOKENIZER_NO_PRE") != std::string::npos,
+              "the probe blocks a BPE file that does not say how to split words");
+    }
+}
+
+// The Unicode classes drive word boundaries, so they are checked directly. A
+// wrong class silently changes token ids, which no round-trip test can catch.
+void test_unicode_classes() {
+    using namespace fm::unicode;
+    const struct {
+        uint32_t cpt;
+        uint32_t expected;
+        const char *what;
+    } cases[] = {
+        {'A', kLetter, "ASCII letter"},
+        {'z', kLetter, "ASCII letter"},
+        {0x00E9, kLetter, "Latin-1 letter (e acute)"},
+        {0x1EC7, kLetter, "Vietnamese letter (e circumflex dot below)"},
+        {0x4E2D, kLetter, "CJK ideograph"},
+        {0x0645, kLetter, "Arabic letter"},
+        {'0', kNumber, "ASCII digit"},
+        {0x00BD, kNumber, "vulgar fraction is a number (No)"},
+        {0x0663, kNumber, "Arabic-Indic digit"},
+        {' ', kSpace, "space"},
+        {'\n', kSpace, "newline"},
+        {0x3000, kSpace, "ideographic space"},
+        {0x00A0, kSpace, "no-break space"},
+        {'!', kPunctuation, "ASCII punctuation"},
+        {'$', kSymbol, "ASCII symbol"},
+        {0x1F680, kSymbol, "emoji is a symbol, not a letter"},
+        {0x0301, kMark, "combining acute is a mark"},
+    };
+    for (const auto &c : cases) {
+        const uint32_t got = classes(c.cpt);
+        CHECK((got & c.expected) != 0, c.what);
+    }
+    CHECK(!is_letter(0x1F680), "an emoji is not a letter, so it cannot join a word");
+    CHECK(!is_number(UINT32_MAX), "out-of-range code points classify as nothing");
+
+    // UTF-8: every code point round-trips, and an invalid byte becomes U+FFFD
+    // rather than silently shifting the rest of the text.
+    for (uint32_t cpt : {0x41u, 0xE9u, 0x1EC7u, 0x4E2Du, 0x1F680u}) {
+        const std::vector<uint32_t> back = from_utf8(to_utf8(cpt));
+        CHECK(back.size() == 1 && back[0] == cpt, "UTF-8 round-trips");
+    }
+    const std::vector<uint32_t> broken = from_utf8(std::string("a\xFF" "b"));
+    CHECK(broken.size() == 3 && broken[1] == 0xFFFD, "an invalid byte becomes U+FFFD");
+
+    // The byte alphabet is a bijection over all 256 bytes, which is what makes
+    // byte-level fallback total.
+    for (int byte = 0; byte < 256; ++byte) {
+        const std::vector<uint32_t> cpts = from_utf8(byte_to_utf8(static_cast<unsigned char>(byte)));
+        CHECK(cpts.size() == 1, "each byte maps to exactly one code point");
+        if (cpts.size() == 1)
+            CHECK(utf8_to_byte(cpts[0]) == byte, "the byte alphabet reverses exactly");
+    }
+}
+
 // The canonical model map is what makes paging decisions auditable: every
 // tensor must report a source byte range that lies inside the data section and
 // a pageability answer consistent with its quantisation geometry.
@@ -1767,12 +2014,148 @@ ArchGolden read_arch_golden(const std::string &path) {
 // file for a named architecture, plus logits from an independent implementation
 // (tools/llama_oracle.py). The engine has to reproduce those logits: that is
 // what "the adapter for this architecture works" means here.
+// Rotary context extension. The arithmetic is subtle enough that "the model
+// still produces logits" is not evidence: a wrong ramp produces fluent text.
+// These checks pin the formulas against values computed from ggml's definitions
+// by hand, and then confirm the fixture's raw metadata reaches the config.
+void test_rope_scaling() {
+    // ggml's correction-dim solve for a 8-dim rotation over a 64-token context:
+    // start clamps to 0 (the fast knee is negative) and end rounds to 2, so
+    // pairs 0,1 extrapolate/blend and pairs 2,3 interpolate.
+    double dims[2] = {-1.0, -1.0};
+    rope_yarn_corr_dims(8, 64.0, 10000.0, 32.0, 1.0, dims);
+    CHECK(dims[0] == 0.0, "YaRN ramp start clamps to zero for a short context");
+    CHECK(dims[1] == 2.0, "YaRN ramp end is the slow knee, rounded up");
+
+    ModelConfig yarn;
+    yarn.context = 64;
+    yarn.rope_theta = 10000.0;
+    yarn.rope_scaling_type = "yarn";
+    yarn.rope_scaling_factor = 4.0;
+    yarn.rope_n_ctx_orig = 64.0;
+    resolve_rope_scaling(yarn);
+    CHECK(std::fabs(yarn.rope_freq_scale - 0.25) < 1e-12,
+          "a 4x YaRN factor becomes a 1/4 frequency scale");
+    CHECK(yarn.rope_ext_factor == 1.0, "YaRN enables extrapolation");
+    // 0.1*log(4) + 1, with no attn_factor in the file.
+    CHECK(std::fabs(yarn.rope_mscale - (1.0 + 0.1 * std::log(4.0))) < 1e-12,
+          "YaRN magnitude scale is 1 + 0.1*log(factor)");
+
+    RopePlan scaled;
+    scaled.init(yarn, 8);
+    CHECK(scaled.corr_low == 0.0 && scaled.corr_high == 2.0,
+          "the plan carries the ramp bounds");
+
+    RopePlan plain;
+    ModelConfig unscaled;
+    unscaled.context = 64;
+    unscaled.rope_theta = 10000.0;
+    unscaled.rope_n_ctx_orig = 64.0;
+    resolve_rope_scaling(unscaled);
+    CHECK(unscaled.rope_freq_scale == 1.0 && unscaled.rope_mscale == 1.0,
+          "a checkpoint without rope.scaling rotates unscaled");
+    plain.init(unscaled, 8);
+
+    // Pair 0 sits below the ramp: it keeps its exact angle (times the magnitude
+    // scale only). Pair 3 is above it: fully interpolated, i.e. position/4.
+    double c0 = 0.0, s0 = 0.0, c3 = 0.0, s3 = 0.0;
+    scaled.rotation(0, 3.0, c0, s0);
+    scaled.rotation(3, 3.0, c3, s3);
+    const double mscale = 1.0 + 0.1 * std::log(4.0);
+    const double freq0 = std::pow(10000.0, -2.0 * 0.0 / 8.0);
+    const double freq3 = std::pow(10000.0, -2.0 * 3.0 / 8.0);
+    CHECK(std::fabs(c0 - std::cos(3.0 * freq0) * mscale) < 1e-9,
+          "the fastest YaRN pair keeps its exact angle");
+    CHECK(std::fabs(s0 - std::sin(3.0 * freq0) * mscale) < 1e-9,
+          "the fastest YaRN pair keeps its exact sine");
+    CHECK(std::fabs(c3 - std::cos(3.0 * freq3 / 4.0) * mscale) < 1e-9,
+          "the slowest YaRN pair is interpolated by the factor");
+
+    double pc0 = 0.0, ps0 = 0.0, pc3 = 0.0, ps3 = 0.0;
+    plain.rotation(0, 3.0, pc0, ps0);
+    plain.rotation(3, 3.0, pc3, ps3);
+    CHECK(std::fabs(pc0 - std::cos(3.0 * freq0)) < 1e-12,
+          "unscaled rotation is the plain cos/sin of position times frequency");
+    CHECK(std::fabs(c3 - pc3) > 1e-3, "YaRN actually changes the slow pair's angle");
+
+    // linear: same interpolation, no ramp and no derived magnitude, so the
+    // file's attn_factor is the only multiplier.
+    ModelConfig linear;
+    linear.context = 64;
+    linear.rope_theta = 10000.0;
+    linear.rope_scaling_type = "linear";
+    linear.rope_scaling_factor = 2.0;
+    linear.rope_n_ctx_orig = 64.0;
+    linear.rope_scaling_attn_factor = 1.25;
+    resolve_rope_scaling(linear);
+    CHECK(linear.rope_freq_scale == 0.5 && linear.rope_ext_factor == 0.0,
+          "linear scaling only divides the frequency");
+    CHECK(std::fabs(linear.rope_mscale - 1.25) < 1e-12,
+          "linear scaling takes the magnitude straight from the file");
+    RopePlan lin;
+    lin.init(linear, 8);
+    double lc = 0.0, ls = 0.0;
+    lin.rotation(2, 5.0, lc, ls);
+    CHECK(std::fabs(lc - std::cos(5.0 * std::pow(10000.0, -2.0 * 2.0 / 8.0) / 2.0) * 1.25) < 1e-9,
+          "linear scaling divides every angle by the factor");
+
+    // The fixture's raw keys have to reach the config, or the engine would run
+    // exactly the unscaled arithmetic above and still look fine.
+    const std::string path = "tests/fixtures/llama-yarn-shape.gguf";
+    const GGUFDocument doc = parse_gguf_file(path);
+    const ModelManifest manifest = build_manifest(doc, path);
+    CHECK(manifest.config.rope_scaling_type == "yarn",
+          "the checkpoint's rope.scaling.type is read");
+    CHECK(std::fabs(manifest.config.rope_scaling_factor - 4.0) < 1e-9,
+          "the checkpoint's scaling factor is read");
+    CHECK(std::fabs(manifest.config.rope_freq_scale - 0.25) < 1e-9,
+          "the scaling factor reaches the derived frequency scale");
+    CHECK(std::fabs(manifest.config.rope_mscale - (1.0 + 0.1 * std::log(4.0))) < 1e-6,
+          "the derived magnitude scale survives the manifest build");
+
+    // longrope needs per-layer short/long factors that no checkpoint here uses;
+    // it must say so by name rather than fall back to unscaled rotation.
+    // The probe must report the same limitation before a run is attempted, and
+    // must name the mode it saw so the report is actionable.
+    {
+        const Json probe = probe_model(doc, path);
+        CHECK(probe.dump().find("\"rope_scaling\"") != std::string::npos,
+              "the probe reports the checkpoint's rope scaling");
+        CHECK(probe.dump().find("\"yarn\"") != std::string::npos,
+              "the probe names yarn rather than only 'supported'");
+        CHECK(probe.dump().find("ROPE_SCALING_NOT_IMPLEMENTED") == std::string::npos,
+              "implemented rope scaling is not a blocker");
+    }
+    {
+        GGUFDocument bad = doc;  // already a `llama` checkpoint
+        bad.metadata["llama.rope.scaling.type"] = make_string("longrope");
+        const Json probe = probe_model(bad, "synthetic.gguf");
+        CHECK(probe.dump().find("ROPE_SCALING_NOT_IMPLEMENTED") != std::string::npos,
+              "an unimplemented rope scaling mode is reported as a blocker");
+    }
+
+    ModelConfig longrope;
+    longrope.rope_scaling_type = "longrope";
+    longrope.rope_n_ctx_orig = 64.0;
+    CHECK(throws_code(ErrorCode::NOT_IMPLEMENTED,
+                      [&]() { resolve_rope_scaling(longrope); }),
+          "longrope is refused by name instead of silently ignored");
+    // A scaling factor with no anchor for the ramp is a metadata error.
+    ModelConfig no_anchor;
+    no_anchor.rope_scaling_type = "yarn";
+    no_anchor.rope_scaling_factor = 4.0;
+    CHECK(throws_code(ErrorCode::METADATA_MISMATCH,
+                      [&]() { resolve_rope_scaling(no_anchor); }),
+          "yarn without an original context is rejected");
+}
+
 void test_architecture_parity() {
     const std::vector<std::string> slugs = {"llama-gqa", "qwen2-bias", "qwen3-qknorm", "gemma",
                                            "gemma2", "phi3-fused", "minicpm", "qwen3moe",
                                            "glm4", "qwen2moe", "phi2-layernorm",
                                            "deepseek2-mla", "internlm2", "exaone", "orion",
-                                           "gptneox", "stablelm"};
+                                           "gptneox", "stablelm", "llama-yarn", "qwen2-linear",
+                                           "llama-yarn-mscale"};
     for (const std::string &slug : slugs) {
         const std::string model = "tests/fixtures/" + slug + "-shape.gguf";
         ArchGolden golden = read_arch_golden("tests/golden/" + slug + "_reference.txt");
@@ -2348,7 +2731,11 @@ int main(int argc, char **argv) {
     maybe_run("traces_and_replay_inputs", test_traces_and_replay_inputs);
     maybe_run("vnpu_reference_backend", test_vnpu_reference_backend);
     maybe_run("tokenizer_real_vocabularies", test_tokenizer_real_vocabularies);
+    maybe_run("tokenizer_bpe_merges", test_tokenizer_bpe_merges);
+    maybe_run("tokenizer_bpe_families", test_tokenizer_bpe_families);
+    maybe_run("unicode_classes", test_unicode_classes);
     maybe_run("model_map_and_tied_output", test_model_map_and_tied_output);
+    maybe_run("rope_scaling", test_rope_scaling);
     maybe_run("architecture_parity", test_architecture_parity);
     maybe_run("rotated_and_ternary_blockers", test_rotated_and_ternary_blockers);
     maybe_run("minicpm_scales", test_minicpm_scales);

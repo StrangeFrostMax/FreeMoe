@@ -270,6 +270,19 @@ def arch_metadata(spec: dict[str, Any]) -> dict[str, tuple[Any, ...]]:
         md[f"{arch}.residual_scale"] = ("f32", spec["residual_scale"])
     if spec.get("logit_scale") is not None:
         md[f"{arch}.logit_scale"] = ("f32", spec["logit_scale"])
+    if spec.get("rope_scaling"):
+        # Exactly the keys llama.cpp reads; the values are what a YaRN-extended
+        # checkpoint actually carries (see e.g. DeepSeek-V2-Lite's config).
+        scaling = spec["rope_scaling"]
+        md[f"{arch}.rope.scaling.type"] = ("string", scaling["type"])
+        md[f"{arch}.rope.scaling.factor"] = ("f32", scaling["factor"])
+        md[f"{arch}.rope.scaling.original_context_length"] = (
+            "u32", scaling["original_context_length"])
+        if scaling.get("attn_factor") is not None:
+            md[f"{arch}.rope.scaling.attn_factor"] = ("f32", scaling["attn_factor"])
+        if scaling.get("yarn_log_multiplier") is not None:
+            md[f"{arch}.rope.scaling.yarn_log_multiplier"] = (
+                "f32", scaling["yarn_log_multiplier"])
     if spec.get("attn_softcap"):
         md[f"{arch}.attn_logit_softcapping"] = ("f32", spec["attn_softcap"])
     if spec.get("final_softcap"):
@@ -508,9 +521,57 @@ SPECS: list[dict[str, Any]] = [
         "rope_dim": SHAPE["head_dim"],
         "qkv_bias": True,
     },
+    {
+        # YaRN context extension: the checkpoint was trained on 64 positions and
+        # stretches them by 4x. Both halves of the algorithm matter here -- the
+        # per-dimension ramp (high frequencies keep their exact angles, low ones
+        # interpolate) and the magnitude scale (1.0 + 0.1*log(4)). A fixture with
+        # only a factor would pass even if the ramp were ignored.
+        "slug": "llama-yarn",
+        "arch": "llama",
+        "name": "FreeMoe synthetic llama with YaRN context extension",
+        "kv_heads": 2,
+        "rope_dim": SHAPE["head_dim"],
+        "rope_scaling": {
+            "type": "yarn",
+            "factor": 4.0,
+            "original_context_length": SHAPE["context"],
+        },
+    },
+    {
+        # Linear (position-interpolation) extension with a magnitude multiplier
+        # from the file. Its rotation is the same `position/factor` every
+        # long-context qwen2 checkpoint uses, and it checks that `attn_factor` is
+        # applied on top of the mode's own scaling rather than instead of it.
+        "slug": "qwen2-linear",
+        "arch": "qwen2",
+        "name": "FreeMoe synthetic qwen2 with linear position interpolation",
+        "kv_heads": 2,
+        "rope_dim": SHAPE["head_dim"],
+        "rope_scaling": {
+            "type": "linear",
+            "factor": 2.0,
+            "original_context_length": SHAPE["context"],
+            "attn_factor": 1.25,
+        },
+    },
+    {
+        # deepseek2-style YaRN, which stores a mscale_all_dim other than 1 in
+        # `yarn_log_multiplier` and expects it in the numerator. llama.cpp
+        # special-cases exactly this, so the fixture pins the behaviour.
+        "slug": "llama-yarn-mscale",
+        "arch": "llama",
+        "name": "FreeMoe synthetic llama with YaRN mscale_all_dim",
+        "kv_heads": 2,
+        "rope_dim": SHAPE["head_dim"],
+        "rope_scaling": {
+            "type": "yarn",
+            "factor": 8.0,
+            "original_context_length": SHAPE["context"],
+            "yarn_log_multiplier": 1.5,
+        },
+    },
 ]
-
-
 
 
 def raw_tensor(name: str, dims: list[int], type_id: int) -> TensorSpec:

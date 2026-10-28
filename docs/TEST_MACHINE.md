@@ -10,7 +10,7 @@ profile** (Zen 3) whose exact machine is not yet specified.
 |---|---|
 | OS | Linux `e2b.local 6.1.158+ #1 SMP PREEMPT_DYNAMIC Mon May 11 18:48:24 UTC 2026 x86_64 GNU/Linux` |
 | CPU | Intel(R) Xeon(R) Processor @ 2.60GHz, 2 logical CPUs, KVM guest |
-| ISA flags used | AVX2 + FMA3 forced; AVX-512 disabled for FreeMoe backend tests |
+| ISA flags used | AVX2 + FMA3. `auto` never selects AVX-512 (the target is Zen 3), and `configs/benchmark.env` pins `--kernels zen3`; AVX-512 needs an explicit `--kernels avx512` |
 | RAM | 3.8 GiB total, about 3.6 GiB available at record time |
 | Compiler | `g++ (Debian 12.2.0-14+deb12u1) 12.2.0` |
 | Physical GPU | none present in sandbox; model/driver/VRAM **unknown (D1)** |

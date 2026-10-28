@@ -61,6 +61,11 @@ targets apply only to the synthetic D3 MoE fixture on the recorded sandbox:
 - 20/20 prompt correctness comparisons pass;
 - no invalid state transitions, checksum failures or unbounded allocations.
 
+The recorded profile is the deployment target's: `--kernels zen3`, i.e. dual
+256-bit AVX2 + FMA3. `auto` resolves to the same thing on every host, because
+AVX-512 requires an explicit request; a run that used it would not describe a
+Zen 3 machine.
+
 These are project inputs, not measured hardware claims. The exact target
 Zen 3 CPU model, RAM, storage, GPU/NPU SDK, driver and usable VRAM are **unknown
 (D1)**, so the performance-qualified release gate remains closed until a real

@@ -133,6 +133,9 @@ def llama_metadata(tensors: list[TensorSpec], *, name: str, quantised: bool,
         merges = [f"tok{i} tok{i + 1}" for i in range(1, VOCAB - 2)]
         meta["tokenizer.ggml.tokens"] = ("array_string", tokens)
         meta["tokenizer.ggml.merges"] = ("array_string", merges)
+        # A real BPE file says which pre-tokenizer it uses; without it the word
+        # boundaries are unknown and the runtime refuses to guess.
+        meta["tokenizer.ggml.pre"] = ("string", "llama-bpe")
         meta["tokenizer.chat_template"] = ("string", "{{ messages }}")
     return meta
 

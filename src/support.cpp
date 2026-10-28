@@ -17,6 +17,7 @@
 
 #include "fm/support.hpp"
 #include "fm/quant.hpp"
+#include "fm/tokenizer.hpp"
 
 #include <algorithm>
 #include <map>
@@ -295,6 +296,22 @@ Json probe_model(const GGUFDocument &doc, const std::string &source_path) {
     } else if ((tokenizer_model == "gpt2" || tokenizer_model == "bpe") && merges == nullptr) {
         block("TOKENIZER_NO_MERGES",
               "a BPE tokenizer without its merge list cannot segment text");
+    } else if (tokenizer_model == "gpt2" || tokenizer_model == "bpe") {
+        // Without a pre-tokeniser the word boundaries are unknown, and guessing
+        // them produces different token ids on ordinary text.
+        const MetadataValue *pre = find(doc, "tokenizer.ggml.pre");
+        const std::string pre_name =
+            (pre && pre->type == GGUFValueType::STRING) ? pre->s : std::string();
+        const Tokenizer::PreTokenizer family = Tokenizer::pre_tokenizer_from_name(pre_name);
+        if (family == Tokenizer::PreTokenizer::Unspecified) {
+            block("TOKENIZER_NO_PRE",
+                  "the file carries no tokenizer.ggml.pre, so its word-splitting rule is unknown");
+        } else if (family == Tokenizer::PreTokenizer::Unsupported) {
+            block("TOKENIZER_PRE_NOT_IMPLEMENTED",
+                  "pre-tokenizer '" + pre_name +
+                      "' is not implemented; implemented families are gpt2, gpt2-digits, "
+                      "llama3 and qwen2");
+        }
     }
     // Grouped-query attention is implemented, so it is reported as a capability
     // rather than as a blocker.
@@ -439,6 +456,29 @@ Json probe_model(const GGUFDocument &doc, const std::string &source_path) {
         block("QKV_BIAS_INCONSISTENT",
               "attention bias tensors are present but attention.qkv_bias is false");
     out.set("attention_qkv_bias", declares_bias || has_bias_tensor);
+    // Context extension. `none`, `linear` and `yarn` are implemented; anything
+    // else changes the rotation in a way this build cannot reproduce, so it is a
+    // blocker rather than an approximation. Reported even when it is none, so a
+    // reader can see the file was actually checked.
+    {
+        const MetadataValue *scaling = find(doc, arch + ".rope.scaling.type");
+        std::string kind;
+        if (scaling && scaling->type == GGUFValueType::STRING) kind = scaling->s;
+        if (kind.empty()) kind = "none";
+        out.set("rope_scaling", kind);
+        if (kind != "none" && kind != "linear" && kind != "yarn")
+            block("ROPE_SCALING_NOT_IMPLEMENTED",
+                  "rope.scaling.type '" + kind +
+                      "' is not implemented; 'none', 'linear' and 'yarn' are");
+        // YaRN's ramp needs the context the model was trained on. Without it the
+        // model would still run, at the wrong frequencies, so this is a blocker.
+        if ((kind == "yarn" || kind == "linear") &&
+            find(doc, arch + ".rope.scaling.original_context_length") == nullptr &&
+            find(doc, arch + ".context_length") == nullptr)
+            block("ROPE_SCALING_NO_ANCHOR",
+                  "rope.scaling is set but neither original_context_length nor "
+                  "context_length anchors the correction ramp");
+    }
     // The block structure that the RMSNorm/SwiGLU assumption does not cover.
     // Each is read from the tensors or from the epsilon key, never guessed.
     {

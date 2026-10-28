@@ -1,6 +1,7 @@
 #include "fm/engine.hpp"
 #include "fm/kernels.hpp"
 #include "fm/quant.hpp"
+#include "fm/rope.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -355,7 +356,11 @@ void Engine::rope_half(std::vector<float> &q, uint32_t q_heads, std::vector<floa
     // Rotary dimensions come from the file when present, otherwise the whole
     // head. Rotating more than rope_dim would be wrong, not merely slower.
     const uint32_t rotate = std::min(c.rope_dim ? c.rope_dim : c.head_dim, c.head_dim);
-    const uint32_t pairs = rotate / 2;
+    const uint32_t pairs = rope_pairs(rotate);
+    // Ramp bounds and magnitude scale are position-independent, so they are
+    // derived once per call rather than once per pair.
+    RopePlan plan;
+    plan.init(c, rotate);
     // Query and key can have different head counts under grouped-query
     // attention, so each vector is walked independently.
     for (uint32_t h = 0; h < std::max(q_heads, k_heads); ++h) {
@@ -364,10 +369,9 @@ void Engine::rope_half(std::vector<float> &q, uint32_t q_heads, std::vector<floa
         if (!in_q && !in_k) break;
         size_t base = static_cast<size_t>(h) * c.head_dim;
         for (uint32_t i = 0; i < pairs; ++i) {
-            double inv = std::pow(c.rope_theta, -(2.0 * static_cast<double>(i)) / rotate);
-            double angle = static_cast<double>(position) * inv;
-            double cs = std::cos(angle);
-            double sn = std::sin(angle);
+            double cs = 0.0;
+            double sn = 0.0;
+            plan.rotation(i, static_cast<double>(position), cs, sn);
             for (std::vector<float> *vec : {in_q ? &q : nullptr, in_k ? &k : nullptr}) {
                 if (!vec) continue;
                 float a0 = (*vec)[base + 2 * i];
@@ -698,6 +702,11 @@ std::vector<float> Engine::forward_token(int32_t token, uint64_t position,
                             c.hidden, "attn_kv_a_mqa.L" + std::to_string(layer));
             std::vector<float> ckv(kvpe.begin(), kvpe.begin() + latent);
             std::vector<float> kpe(kvpe.begin() + latent, kvpe.end());
+            // MLA rotates the same `rope_dim` slice in both tensors, so one plan
+            // serves both. Context extension applies here too: V3 length-extended
+            // checkpoints carry YaRN.
+            RopePlan plan;
+            plan.init(c, c.rope_dim);
             auto rope_part = [&](std::vector<float> &vec, uint32_t heads, uint32_t stride,
                                  uint32_t offset, const std::string &name) {
                 // Rotary positions, applied to the rope slice only: the trailing
@@ -705,12 +714,10 @@ std::vector<float> Engine::forward_token(int32_t token, uint64_t position,
                 const uint32_t width = c.rope_dim;
                 for (uint32_t head = 0; head < heads; ++head) {
                     const size_t base = static_cast<size_t>(head) * stride + offset;
-                    for (uint32_t i = 0; i < width / 2; ++i) {
-                        const double inv =
-                            std::pow(c.rope_theta, -(2.0 * static_cast<double>(i)) / width);
-                        const double angle = static_cast<double>(position) * inv;
-                        const double cs = std::cos(angle);
-                        const double sn = std::sin(angle);
+                    for (uint32_t i = 0; i < rope_pairs(width); ++i) {
+                        double cs = 0.0;
+                        double sn = 0.0;
+                        plan.rotation(i, static_cast<double>(position), cs, sn);
                         const float a0 = vec[base + 2 * i];
                         const float a1 = vec[base + 2 * i + 1];
                         vec[base + 2 * i] = static_cast<float>(a0 * cs - a1 * sn);

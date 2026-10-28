@@ -39,6 +39,8 @@ each family, the tool records what a specific file contains.
 | Standard llama-family adapter (llama.cpp keys and tensor names) | WORKS |
 | Grouped-query attention (`head_count_kv < head_count`), KV cache sized per kv head | WORKS |
 | SentencePiece and BPE tokenizers, byte fallback, honest coverage report | WORKS |
+| Byte-level BPE with real merge resolution and four pre-tokenizer families (`gpt2`, `gpt2-digits`, `llama3`, `qwen2`) | WORKS — matches llama.cpp's own vectors on 6/6 vocabularies |
+| Other pre-tokenizer families (DeepSeek, Falcon, ChatGLM, Yi, …) | **MISSING**, refused by name; see "Tokenizer" below |
 | `qwen2`: q/k/v projection biases (split and fused) | WORKS |
 | `qwen3`: per-head RMSNorm on q and k before RoPE | WORKS |
 | `gemma`: embedding scale, zero-centred norm scales, GeGLU, tied output | WORKS |
@@ -50,6 +52,8 @@ each family, the tool records what a specific file contains.
 | `qwen2moe`: routed experts plus a dense shared expert, gated per token | WORKS |
 | `phi2`: LayerNorm with biases, gate-free GELU FFN, one shared residual | WORKS |
 | `deepseek2`: MLA (low-rank q, kv latent, per-head `k_b`/`v_b` expansion), dense-lead blocks, sigmoid/softmax/sqrt-softplus gating, selection bias, group-limited routing, shared expert without a scalar gate | WORKS |
+| Long context: `rope.scaling.type` `linear` and `yarn` (factor, original context, per-dimension ramp, magnitude scale incl. `yarn_log_multiplier`) | WORKS |
+| `rope.scaling.type = longrope` (per-layer short/long factors, phi-3-small) | **MISSING**, refused by name |
 | Generation stops at the checkpoint's own `eos_token_id` | WORKS |
 | Chat templates: a restricted Jinja interpreter over the checkpoint's own `tokenizer.chat_template` | WORKS (see below) |
 | Built-in templates for 11 marker families + evidence-based selection from the token table | WORKS |
@@ -208,6 +212,32 @@ Read from llama.cpp's `src/models/`, not guessed from the model names:
 | `phi2` | LayerNorm with a bias instead of RMSNorm; no `ffn_norm` at all, because the FFN runs on the attention's normalised input and both branches add to one residual; gate-free GELU FFN with biases; biases on the attention output and the logits |
 | `deepseek2` | multi-head latent attention (see below), `leading_dense_block_count` plain-FFN lead-in blocks, a router whose gating function is `expert_gating_func`, a selection-only `ffn_exp_probs_b.bias`, group-limited routing, and a shared expert that has no scalar gate |
 
+### Long context: what `rope.scaling` does here
+
+The rotary maths lives in `src/rope.cpp`, not inside the attention loop, because
+a wrong ramp does not crash -- it produces fluent text at the wrong positions.
+
+| `rope.scaling.type` | Behaviour |
+| --- | --- |
+| absent / `none` | plain rotation; the context-extension fields stay identity |
+| `linear` | every angle divided by `factor`; `rope.scaling.attn_factor` multiplies the result |
+| `yarn` | `factor` scales the frequency, and the correction ramp keeps low-index (fast) pairs exact while interpolating slow ones; magnitude `1 + 0.1*log(factor)`. `yarn_log_multiplier` supplies `mscale_all_dim`, with llama.cpp's deepseek2 numerator special case |
+| `longrope` | refused by name: it needs per-layer short/long factors keyed on the effective context, and no checkpoint we target uses it |
+
+The ramp bounds come from ggml's `ggml_rope_yarn_corr_dim`, solved from the
+original context length and `beta_fast`/`beta_slow`. llama.cpp folds a
+`1 + 0.1*log(1/freq_scale)` factor into the kernel and divides it back out in
+context setup; since there is no such hidden factor here, `rope_mscale` is the
+net value and must not be multiplied again.
+
+Evidence: three fixtures + oracle goldens (`llama-yarn`, `qwen2-linear`,
+`llama-yarn-mscale`). The YaRN one is chosen so the ramp actually bends --
+for an 8-wide rotation over 64 tokens the correction dims are {0, 2}, so pair 0
+keeps its exact angle, pair 1 blends, and pairs 2-3 interpolate. `rope_scaling`
+unit checks pin those numbers, then confirm the fixture's raw metadata reaches
+`ModelConfig` (a checkpoint that parsed but silently rotated unscaled would pass
+a logits-only test).
+
 `glm4` also parses `rope.dimension_sections` for multimodal RoPE; a text-only
 checkpoint omits it and uses standard RoPE, which is what is implemented.
 
@@ -304,7 +334,44 @@ default" are different claims about whether the prompt is right, so the CLI
 never blurs them. `--render-only` prints the exact bytes handed to the
 tokenizer, which is the only way a template is observable.
 
-### Breadth: the block is data, not code
+### Tokenizer: merge order, not longest match
+
+An encoder can round-trip perfectly and still disagree with every other runtime
+about the ids, which is the worst kind of bug: the model computes correct logits
+for the wrong prompt.
+
+Byte-level BPE is therefore implemented as BPE — the family pre-tokeniser cuts
+words, every byte goes through the GPT-2 alphabet, and merges are applied
+lowest-rank-first. Four splitting families cover the vocabularies in use:
+
+| Family | Selected by `tokenizer.ggml.pre` | Splitting rule |
+|---|---|---|
+| `llama3` | `llama3`, `llama-v3`, `llama-bpe`, `chatglm4`, `dbrx`, `smaug`, `falcon3`, `lfm2` | contractions, `[^\r\n\p{L}\p{N}]?\p{L}+`, `\p{N}{1,3}`, punctuation runs, CR/LF runs; whole-word lookup first (`ignore_merges`) |
+| `qwen2` | `qwen2`, `stablelm2`, `hunyuan`, `solar-open`, `deepseek-r1-qwen` | as `llama3` with one digit per word |
+| `gpt2` | `gpt-2`, `phi-2`, `mpt`, `olmo`, `jais`, `granite-docling`, `gigachat`, `mellum` | `'s\|'t\|…\| ?\p{L}+\| ?\p{N}+\| ?[^\s\p{L}\p{N}]+\|\s+(?!\S)` |
+| `gpt2-digits` | `starcoder`, `refact`, `command-r`, `smollm`, `codeshell`, `exaone`, `minerva`, `mellum2` | as `gpt2` with each digit split off first |
+
+Verification is against **llama.cpp's own expected token ids** for the
+vocabularies it ships (`models/ggml-vocab-*.gguf` + `.inp`/`.out`):
+
+```sh
+python3 tools/tokenizer_parity.py --vocab-dir /path/to/llama.cpp/models
+```
+
+Last run: `gpt-2`, `llama-bpe`, `qwen2`, `starcoder`, `refact`, `command-r` all
+match on **46/46** cases each. `mpt` matches 39/46 — every mismatch is a
+whitespace-only string whose reference vector uses the raw-space token while the
+rest of the same file uses the GPT-2 escaped form; the code path is the one that
+passes `gpt-2` outright, so the vectors are inconsistent rather than the encoder.
+`llama-spm` and `phi-3` match 29/46: those are SentencePiece files, and
+SentencePiece segmentation here is still greedy longest-match rather than
+score-based.
+
+Unicode categories come from tables generated from Python's `unicodedata`
+(`tools/gen_unicode_tables.py`), because a wrong category silently moves a word
+boundary. `make test` fails if the committed table is stale.
+
+## Breadth: the block is data, not code
 
 Five further adapters landed with no new forward-pass code: `internlm2`,
 `exaone`, `orion`, `gptneox` and `stablelm`. Each differs from the existing
