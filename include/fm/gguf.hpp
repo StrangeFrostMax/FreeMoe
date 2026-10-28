@@ -91,6 +91,20 @@ enum class TensorRole : uint32_t {
     // Fused query/key/value projection (phi3).
     ATTN_QKV,
     ATTN_QKV_BIAS,
+    // The dense "shared expert" that qwen2moe adds to the routed experts, and
+    // the per-token scalar that gates it.
+    FFN_GATE_INP_SHEXP,
+    FFN_GATE_SHEXP,
+    FFN_UP_SHEXP,
+    FFN_DOWN_SHEXP,
+    // LayerNorm carries a bias, and phi2 also biases the FFN, the attention
+    // output and the logits.
+    ATTN_NORM_BIAS,
+    FFN_NORM_BIAS,
+    OUTPUT_NORM_BIAS,
+    FFN_UP_BIAS,
+    FFN_DOWN_BIAS,
+    OUTPUT_BIAS,
 };
 
 const char *tensor_role_name(TensorRole role);
@@ -171,8 +185,16 @@ struct ModelConfig {
     bool attn_qkv_bias = false;
     // Q and K are normalised per head before RoPE (qwen3 family).
     bool qk_norm = false;
-    // gemma scales the token embeddings by sqrt(hidden) before the first block.
-    bool embedding_scale = false;
+    // Multiplier applied to the token embedding before the first block.
+    // gemma uses sqrt(hidden); minicpm uses a fixed 12.0 unless the file says
+    // otherwise. 1.0 means "no scaling", so this is off for llama-family.
+    double embedding_scale = 1.0;
+    // minicpm carries two further scales. llama.cpp parses and logs them but
+    // never applies them to the computation, so neither do we: applying them
+    // would disagree with the reference. They are recorded so the probe can
+    // report them rather than silently dropping information.
+    double residual_scale = 0.0;
+    double logit_scale = 0.0;
     // gemma stores RMSNorm scales zero-centred: the effective scale is 1 + w.
     bool norm_add_one = false;
     // "silu" (SwiGLU) or "gelu" (GeGLU). The two are not interchangeable.
@@ -186,11 +208,36 @@ struct ModelConfig {
     uint32_t sliding_window = 0;
     // phi3 fuses q, k and v into one projection (and one optional bias).
     bool fused_qkv = false;
+    // glm4 stores the FFN gate and up halves in one tensor of
+    // [hidden, 2*intermediate]: gate first, then up (ggml_swiglu's convention).
+    bool fused_gate_up = false;
     uint32_t bos_id = 0;
     uint32_t eos_id = 0;
     double rms_eps = 0.0;
     double rope_theta = 0.0;
+    // qwen2moe adds a dense feed-forward branch to the routed experts. Its
+    // width is its own hyperparameter (`expert_shared_feed_forward_length`),
+    // not the dense width, so it is stored separately. 0 means "no shared
+    // expert", which keeps every other architecture's path unchanged.
     bool shared_expert = false;
+    uint32_t shared_expert_intermediate = 0;
+    // Routed experts may be narrower than the dense FFN (`expert_feed_forward_
+    // length`). 0 means "same as intermediate", the usual case.
+    uint32_t expert_intermediate = 0;
+
+    uint32_t expert_width() const { return expert_intermediate ? expert_intermediate : intermediate; }
+
+    // phi2 is built differently enough to need four separate switches, and each
+    // is evidence-driven: the norm type comes from which epsilon key the file
+    // declares, the biases from the tensors, and the parallel residual from the
+    // absence of a separate FFN norm.
+    bool layer_norm = false;        // mean-centred LayerNorm instead of RMSNorm
+    bool norm_bias = false;         // norms are scale + bias, not just scale
+    bool parallel_residual = false;  // FFN runs on the attention's normalised input
+    bool ffn_no_gate = false;       // up -> gelu -> down, with no gate projection
+    bool ffn_bias = false;          // biases on ffn_up / ffn_down
+    bool attn_output_bias = false;  // bias on attn_output
+    bool logit_bias = false;        // bias on the output projection
 };
 
 struct ExpertExtent {

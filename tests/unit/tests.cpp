@@ -1769,7 +1769,8 @@ ArchGolden read_arch_golden(const std::string &path) {
 // what "the adapter for this architecture works" means here.
 void test_architecture_parity() {
     const std::vector<std::string> slugs = {"llama-gqa", "qwen2-bias", "qwen3-qknorm", "gemma",
-                                           "gemma2", "phi3-fused"};
+                                           "gemma2", "phi3-fused", "minicpm", "qwen3moe",
+                                           "glm4", "qwen2moe", "phi2-layernorm"};
     for (const std::string &slug : slugs) {
         const std::string model = "tests/fixtures/" + slug + "-shape.gguf";
         ArchGolden golden = read_arch_golden("tests/golden/" + slug + "_reference.txt");
@@ -1858,6 +1859,175 @@ void test_rotated_and_ternary_blockers() {
     }
 }
 
+
+// llama.cpp parses minicpm's residual_scale and logit_scale, logs them, and
+// never uses them in the graph. Applying them here would quietly disagree with
+// the reference on every logit, so this test pins the decision: they are
+// recorded, and they do not change the output.
+void test_minicpm_scales() {
+    const std::string path = "tests/fixtures/minicpm-shape.gguf";
+    RunConfig config;
+    config.model_path = path;
+    config.budget.total_hot_bytes = 64ull * 1024 * 1024;
+    Engine engine(config);
+    engine.initialize();
+
+    const ModelConfig &cfg = engine.manifest().config;
+    CHECK(cfg.architecture == "minicpm", "minicpm adapter is selected");
+    CHECK(std::fabs(cfg.embedding_scale - 12.0) < 1e-9,
+          "the embedding scale is read from the checkpoint");
+    CHECK(cfg.residual_scale > 0.0, "residual_scale is parsed from the checkpoint");
+    CHECK(cfg.logit_scale > 0.0, "logit_scale is parsed from the checkpoint");
+
+    // The golden was produced by an implementation that also ignores them, so
+    // matching it is exactly the assertion that we did not apply them.
+    ArchGolden golden = read_arch_golden("tests/golden/minicpm_reference.txt");
+    PromptResult result = engine.run_prompt(golden.prompt, 8);
+    CHECK(!golden.logits.empty(), "minicpm golden carries logits");
+    if (!golden.logits.empty() && result.prefill_logits.size() == golden.logits.size()) {
+        double worst = 0.0;
+        for (size_t i = 0; i < golden.logits.size(); ++i)
+            worst = std::max(worst, std::fabs(static_cast<double>(result.prefill_logits[i]) -
+                                              golden.logits[i]));
+        CHECK(worst <= 1e-4, "minicpm logits match the reference (worst " +
+                                 std::to_string(worst) + ")");
+    }
+    engine.release_runtime();
+
+    // The probe must say the same thing, so a reader of the report is not left
+    // to infer it from silence.
+    auto doc = parse_gguf_file(path);
+    const std::string dump = probe_model(doc, path).dump();
+    CHECK(dump.find("residual_scale and logit_scale are parsed but not applied") !=
+              std::string::npos,
+          "the probe explains why the two scales are not applied");
+}
+
+// qwen2moe adds a dense shared expert to the routed experts and scales it with
+// one scalar per token. Two things can go wrong silently here: the branch gets
+// skipped, or it reuses the dense FFN width for a tensor that has its own. Both
+// are checked against the operation log, which records the width actually used.
+void test_shared_expert() {
+    const std::string path = "tests/fixtures/qwen2moe-shape.gguf";
+    RunConfig config;
+    config.model_path = path;
+    config.budget.total_hot_bytes = 64ull * 1024 * 1024;
+    Engine engine(config);
+    engine.initialize();
+
+    const ModelConfig &cfg = engine.manifest().config;
+    CHECK(cfg.architecture == "qwen2moe", "qwen2moe adapter is selected");
+    CHECK(cfg.shared_expert, "the shared expert is detected from its tensors");
+    CHECK(cfg.shared_expert_intermediate == 40, "the shared expert keeps its own width");
+    // The fixture deliberately uses 48 for routed experts and 64 for the dense
+    // FFN, so using the wrong one cannot go unnoticed.
+    CHECK(cfg.expert_width() == 48, "routed experts keep their own width");
+    CHECK(cfg.intermediate == 64, "the dense width is distinct from both");
+
+    ArchGolden golden = read_arch_golden("tests/golden/qwen2moe_reference.txt");
+    PromptResult result = engine.run_prompt(golden.prompt, 8);
+    if (!golden.logits.empty() && result.prefill_logits.size() == golden.logits.size()) {
+        double worst = 0.0;
+        for (size_t i = 0; i < golden.logits.size(); ++i)
+            worst = std::max(worst, std::fabs(static_cast<double>(result.prefill_logits[i]) -
+                                              golden.logits[i]));
+        CHECK(worst <= 1e-4, "qwen2moe logits match the reference (worst " +
+                                 std::to_string(worst) + ")");
+    }
+
+    // The operation log is the evidence that the branch ran at all, and that
+    // each branch used its own width rather than the dense one.
+    bool saw_shexp_gate = false, saw_shexp_swiglu = false;
+    uint64_t expert_width_used = 0, shared_width_used = 0;
+    for (const OpRecord &op : engine.backend().operations()) {
+        if (op.name == "shexp_gate_inp.L0") saw_shexp_gate = true;
+        if (op.name == "shexp_swiglu.L0") {
+            saw_shexp_swiglu = true;
+            shared_width_used = op.output_bytes / sizeof(float);
+        }
+        if (op.name == "expert_swiglu.L0") expert_width_used = op.output_bytes / sizeof(float);
+    }
+    CHECK(saw_shexp_gate, "the shared expert's per-token gate is computed");
+    CHECK(saw_shexp_swiglu, "the shared expert's SwiGLU runs");
+    CHECK(shared_width_used == 40, "the shared expert executes at its declared width");
+    CHECK(expert_width_used == 48, "routed experts execute at their declared width");
+    engine.release_runtime();
+
+    // A reader of the probe should not have to infer the branch from silence.
+    auto doc = parse_gguf_file(path);
+    const std::string dump = probe_model(doc, path).dump();
+    CHECK(dump.find("\"shared_expert\":true") != std::string::npos,
+          "the probe reports the shared expert");
+    CHECK(dump.find("\"shared_expert_size\":40") != std::string::npos,
+          "the probe reports the shared expert's width");
+    CHECK(dump.find("\"expert_intermediate_size\":48") != std::string::npos,
+          "the probe reports the routed experts' width");
+}
+
+// phi2 breaks four assumptions the rest of the engine makes at once: it
+// normalises with a mean-centred LayerNorm that carries a bias, it has no FFN
+// norm at all (the FFN consumes the attention's normalised input), its FFN has
+// no gate, and it biases the attention output and the logits. Each of those
+// changes the numbers, so each is checked against the operation log rather than
+// assumed to have happened.
+void test_phi2_block() {
+    const std::string path = "tests/fixtures/phi2-layernorm-shape.gguf";
+    RunConfig config;
+    config.model_path = path;
+    config.budget.total_hot_bytes = 64ull * 1024 * 1024;
+    Engine engine(config);
+    engine.initialize();
+
+    const ModelConfig &cfg = engine.manifest().config;
+    CHECK(cfg.architecture == "phi2", "phi2 adapter is selected");
+    CHECK(cfg.layer_norm, "the norm type comes from the declared epsilon key");
+    CHECK(cfg.norm_bias, "the norms carry biases");
+    CHECK(cfg.parallel_residual, "the FFN reuses the attention norm");
+    CHECK(cfg.ffn_no_gate, "the FFN has no gate projection");
+    CHECK(cfg.activation == "gelu", "the gate-free FFN is GELU");
+    CHECK(cfg.ffn_bias, "the FFN carries biases");
+    CHECK(cfg.logit_bias, "the logits carry a bias");
+
+    ArchGolden golden = read_arch_golden("tests/golden/phi2-layernorm_reference.txt");
+    PromptResult result = engine.run_prompt(golden.prompt, 8);
+    if (!golden.logits.empty() && result.prefill_logits.size() == golden.logits.size()) {
+        double worst = 0.0;
+        for (size_t i = 0; i < golden.logits.size(); ++i)
+            worst = std::max(worst, std::fabs(static_cast<double>(result.prefill_logits[i]) -
+                                              golden.logits[i]));
+        CHECK(worst <= 1e-4, "phi2 logits match the reference (worst " + std::to_string(worst) + ")");
+    }
+
+    bool saw_attn_norm = false, saw_ffn_norm = false, saw_gelu = false, saw_swiglu = false;
+    bool saw_attn_out_bias = false, saw_logit_bias = false, saw_ffn_up_bias = false;
+    for (const OpRecord &op : engine.backend().operations()) {
+        if (op.name == "attn_norm.L0") saw_attn_norm = true;
+        if (op.name == "ffn_norm.L0") saw_ffn_norm = true;
+        if (op.name == "gelu.L0") saw_gelu = true;
+        if (op.name == "swiglu.L0") saw_swiglu = true;
+        if (op.name == "attn_output_bias.L0") saw_attn_out_bias = true;
+        if (op.name == "output_bias") saw_logit_bias = true;
+        if (op.name == "ffn_up_bias.L0") saw_ffn_up_bias = true;
+    }
+    CHECK(saw_attn_norm, "the attention is normalised");
+    CHECK(!saw_ffn_norm, "there is no separate FFN norm (the parallel residual reuses one)");
+    CHECK(saw_gelu, "the gate-free GELU FFN runs");
+    CHECK(!saw_swiglu, "the gated SwiGLU path is not taken");
+    CHECK(saw_attn_out_bias, "the attention output bias is added");
+    CHECK(saw_logit_bias, "the logit bias is added");
+    CHECK(saw_ffn_up_bias, "the FFN up bias is added");
+    engine.release_runtime();
+
+    auto doc = parse_gguf_file(path);
+    const std::string dump = probe_model(doc, path).dump();
+    CHECK(dump.find("\"norm_type\":\"layernorm\"") != std::string::npos,
+          "the probe reports the norm type");
+    CHECK(dump.find("\"parallel_residual\":true") != std::string::npos,
+          "the probe reports the parallel residual");
+    CHECK(dump.find("\"ffn_without_gate\":true") != std::string::npos,
+          "the probe reports the gate-free FFN");
+}
+
 void test_soak_sessions() {
     const uint32_t N_SOAK = 256;
     std::string prompt = first_prompt();
@@ -1908,6 +2078,9 @@ int main(int argc, char **argv) {
     maybe_run("model_map_and_tied_output", test_model_map_and_tied_output);
     maybe_run("architecture_parity", test_architecture_parity);
     maybe_run("rotated_and_ternary_blockers", test_rotated_and_ternary_blockers);
+    maybe_run("minicpm_scales", test_minicpm_scales);
+    maybe_run("shared_expert", test_shared_expert);
+    maybe_run("phi2_block", test_phi2_block);
     maybe_run("soak_sessions", test_soak_sessions);
     std::cout << g_checks << " checks, " << g_failures << " failures\n";
     return g_failures == 0 ? 0 : 1;

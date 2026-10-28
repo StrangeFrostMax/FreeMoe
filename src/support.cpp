@@ -56,11 +56,20 @@ const std::map<std::string, ArchFacts> &known_architectures() {
         // phi3: one fused q/k/v projection (with fused bias) and a rotary width
         // narrower than the head.
         {"phi3", {true, false}},
-        {"glm4", {false, true}},
+        // minicpm: the token embedding is scaled before the first block.
+        {"minicpm", {true, false}},
+        // qwen3moe: qwen3 semantics with a stacked-expert feed-forward.
+        {"qwen3moe", {true, false}},
+        // glm4: fused gate+up FFN with post-attention and post-FFN norms.
+        {"glm4", {true, false}},
+        // qwen2moe: routed experts plus a dense shared expert whose output is
+        // gated by one scalar per token.
+        {"qwen2moe", {true, false}},
+        // phi2: LayerNorm instead of RMSNorm, a gate-free GELU FFN, and one
+        // shared residual for the attention and FFN branches.
+        {"phi2", {true, false}},
         {"glm4moe", {false, true}},
         {"deepseek2", {false, true}},
-        {"qwen3moe", {false, true}},
-        {"minicpm", {false, true}},
         {"multimodal", {false, true}},
     };
     return table;
@@ -93,6 +102,8 @@ bool read_u64(const GGUFDocument &doc, const std::string &arch, const std::strin
         {"attention.key_length", "head_dim"},
         {"block_count", "num_hidden_layers"},
         {"expert_used_count", "expert_top_k"},
+        {"expert_feed_forward_length", "expert_intermediate_size"},
+        {"expert_shared_feed_forward_length", "shared_expert_size"},
     };
     auto alias = aliases.find(name);
     if (alias != aliases.end()) {
@@ -160,7 +171,9 @@ Json probe_model(const GGUFDocument &doc, const std::string &source_path) {
              {"attention.head_count_kv", "num_key_value_heads"},
              {"attention.key_length", "head_dim"},
              {"expert_count", "expert_count"},
-             {"expert_used_count", "expert_top_k"}}) {
+             {"expert_used_count", "expert_top_k"},
+             {"expert_feed_forward_length", "expert_intermediate_size"},
+             {"expert_shared_feed_forward_length", "shared_expert_size"}}) {
         uint64_t value = 0;
         if (read_u64(doc, arch, entry.first, &value))
             hyper.set(entry.second, static_cast<uint64_t>(value));
@@ -292,6 +305,36 @@ Json probe_model(const GGUFDocument &doc, const std::string &source_path) {
         has_expert_tensors = has_expert_tensors || tensor.name.find("_exps") != std::string::npos;
     if (has_expert_tensors && !has_adapter)
         block("EXPERT_TENSORS", "expert tensors are present but their layout is not mapped");
+    // minicpm declares three scales. Only the embedding scale is applied by the
+    // reference implementation; the other two are parsed and logged there and
+    // never used in the graph, so they are reported rather than silently
+    // dropped or silently applied.
+    {
+        const MetadataValue *emb = find(doc, arch + ".embedding_scale");
+        const MetadataValue *res = find(doc, arch + ".residual_scale");
+        const MetadataValue *logit = find(doc, arch + ".logit_scale");
+        if (emb || res || logit) {
+            Json scales = Json::object();
+            // Json has no double overload, so the values are rendered as strings
+            // with enough precision to be checkable.
+            auto fmt = [](double v) {
+                char buf[64];
+                std::snprintf(buf, sizeof(buf), "%.9g", v);
+                return std::string(buf);
+            };
+            scales.set("embedding_scale", fmt(emb ? emb->as_double() : 0.0));
+            scales.set("residual_scale", fmt(res ? res->as_double() : 0.0));
+            scales.set("logit_scale", fmt(logit ? logit->as_double() : 0.0));
+            scales.set("applied", Json::array());
+            out.set("declared_scales", std::move(scales));
+            if (res || logit)
+                out.set("scale_note",
+                        "residual_scale and logit_scale are parsed but not applied: "
+                        "llama.cpp reads and logs them without using them in the graph, "
+                        "so applying them here would disagree with the reference");
+        }
+    }
+
     // --- ternary family -----------------------------------------------------
     // PrismML's Bonsai 2 checkpoint stores its weights in a *rotated basis*: each
     // matrix is transformed by a blockwise Hadamard rotation before the ternary
@@ -361,6 +404,43 @@ Json probe_model(const GGUFDocument &doc, const std::string &source_path) {
         block("QKV_BIAS_INCONSISTENT",
               "attention bias tensors are present but attention.qkv_bias is false");
     out.set("attention_qkv_bias", declares_bias || has_bias_tensor);
+    // The block structure that the RMSNorm/SwiGLU assumption does not cover.
+    // Each is read from the tensors or from the epsilon key, never guessed.
+    {
+        const bool ln = find(doc, arch + ".attention.layer_norm_epsilon") != nullptr;
+        const bool rms = find(doc, arch + ".attention.layer_norm_rms_epsilon") != nullptr;
+        if (ln && rms)
+            block("AMBIGUOUS_NORM_TYPE",
+                  "both a LayerNorm and an RMSNorm epsilon are declared");
+        out.set("norm_type", ln ? "layernorm" : "rmsnorm");
+        const bool ffn_norm = doc.tensor_by_name.count("blk.0.ffn_norm.weight") != 0;
+        const bool gate = doc.tensor_by_name.count("blk.0.ffn_gate.weight") != 0;
+        if (!ffn_norm) {
+            if (doc.tensor_by_name.count("blk.0.attn_norm.weight") == 0)
+                block("NO_NORM_ON_FFN_INPUT",
+                      "no ffn_norm and no attn_norm: nothing normalises the FFN input");
+            out.set("parallel_residual", true);
+        }
+        if (!gate && doc.tensor_by_name.count("blk.0.ffn_up.weight") != 0)
+            out.set("ffn_without_gate", true);
+        if (doc.tensor_by_name.count("output.bias") != 0) out.set("output_bias", true);
+        if (doc.tensor_by_name.count("blk.0.ffn_up.bias") != 0) out.set("ffn_bias", true);
+    }
+    // qwen2moe's shared expert is a dense FFN added to the routed output. The
+    // tensors are the evidence, and a half-present branch is an error rather
+    // than something to skip.
+    {
+        const bool inp = doc.tensor_by_name.count("blk.0.ffn_gate_inp_shexp.weight") != 0;
+        const bool gate = doc.tensor_by_name.count("blk.0.ffn_gate_shexp.weight") != 0;
+        const bool up = doc.tensor_by_name.count("blk.0.ffn_up_shexp.weight") != 0;
+        const bool down = doc.tensor_by_name.count("blk.0.ffn_down_shexp.weight") != 0;
+        if (inp || gate || up || down) {
+            if (!(inp && gate && up && down))
+                block("SHARED_EXPERT_PARTIAL",
+                      "the shared expert is only partly present; all four tensors are required");
+            out.set("shared_expert", true);
+        }
+    }
     const MetadataValue *tied_flag = find(doc, arch + ".tie_word_embeddings");
     if (tied_flag && tied_flag->b && doc.tensor_by_name.count("output.weight") != 0) {
         block("AMBIGUOUS_TIED_OUTPUT",

@@ -85,6 +85,11 @@ def arch_tensors(spec: dict[str, Any]) -> list[TensorSpec]:
     for layer in range(layers):
         p = f"blk.{layer}."
         out += [tensor(p + "attn_norm.weight", [h], 0.0, norm=True)]
+        if spec.get("layernorm"):
+            out += [tensor(p + "attn_norm.bias", [h], 0.05)]
+        if spec.get("parallel_residual"):
+            # No ffn_norm at all: the FFN consumes the attention norm.
+            pass
         if spec.get("fused_qkv"):
             # q, then k, then v along the output axis of one projection.
             out += [tensor(p + "attn_qkv.weight", [h, h + 2 * kv_dim], 0.16)]
@@ -111,19 +116,67 @@ def arch_tensors(spec: dict[str, Any]) -> list[TensorSpec]:
                 tensor(p + "attn_v.bias", [kv_dim], 0.05),
             ]
         out += [tensor(p + "attn_output.weight", [h, h], 0.16)]
+        if spec.get("attn_output_bias"):
+            out += [tensor(p + "attn_output.bias", [h], 0.05)]
         if spec.get("post_norms"):
             out += [tensor(p + "attn_post_norm.weight", [h], 0.0, norm=True)]
-        out += [
-            tensor(p + "ffn_norm.weight", [h], 0.0, norm=True),
-            tensor(p + "ffn_gate.weight", [h, i], 0.16),
-            tensor(p + "ffn_up.weight", [h, i], 0.16),
-            tensor(p + "ffn_down.weight", [i, h], 0.16),
-        ]
+        if not spec.get("parallel_residual"):
+            out += [tensor(p + "ffn_norm.weight", [h], 0.0, norm=True)]
+            if spec.get("layernorm"):
+                out += [tensor(p + "ffn_norm.bias", [h], 0.05)]
+        if spec.get("ffn_no_gate"):
+            out += [
+                tensor(p + "ffn_up.weight", [h, i], 0.16),
+                tensor(p + "ffn_down.weight", [i, h], 0.16),
+            ]
+            if spec.get("ffn_bias"):
+                out += [
+                    tensor(p + "ffn_up.bias", [i], 0.05),
+                    tensor(p + "ffn_down.bias", [h], 0.05),
+                ]
+        elif spec.get("experts"):
+            # Stacked experts: one tensor holds every expert's slice, and the
+            # router projects hidden -> expert_count. Routed experts may be
+            # narrower than the dense FFN, so the width is its own setting.
+            experts = spec["experts"]
+            ew = spec.get("expert_width", i)
+            out += [
+                tensor(p + "ffn_gate_inp.weight", [h, experts], 0.12),
+                tensor(p + "ffn_gate_exps.weight", [h, ew, experts], 0.16),
+                tensor(p + "ffn_up_exps.weight", [h, ew, experts], 0.16),
+                tensor(p + "ffn_down_exps.weight", [ew, h, experts], 0.16),
+            ]
+            if spec.get("shared_expert"):
+                # A dense FFN beside the routed experts, plus the one-vector
+                # projection that produces its per-token scalar gate.
+                sw = spec.get("shared_width", i)
+                out += [
+                    tensor(p + "ffn_gate_inp_shexp.weight", [h], 0.30),
+                    tensor(p + "ffn_gate_shexp.weight", [h, sw], 0.16),
+                    tensor(p + "ffn_up_shexp.weight", [h, sw], 0.16),
+                    tensor(p + "ffn_down_shexp.weight", [sw, h], 0.16),
+                ]
+        elif spec.get("fused_gate_up"):
+            # One tensor holds both halves: gate first, then up.
+            out += [
+                tensor(p + "ffn_up.weight", [h, 2 * i], 0.16),
+                tensor(p + "ffn_down.weight", [i, h], 0.16),
+            ]
+        else:
+            out += [
+                tensor(p + "ffn_gate.weight", [h, i], 0.16),
+                tensor(p + "ffn_up.weight", [h, i], 0.16),
+                tensor(p + "ffn_down.weight", [i, h], 0.16),
+            ]
         if spec.get("post_norms"):
             out += [tensor(p + "ffn_post_norm.weight", [h], 0.0, norm=True)]
     out += [tensor("output_norm.weight", [h], 0.0, norm=True)]
+    if spec.get("layernorm"):
+        out += [tensor("output_norm.bias", [h], 0.05)]
     if not spec.get("tied_output"):
         out += [tensor("output.weight", [h, V], 0.25)]
+    if spec.get("logit_bias"):
+        out += [tensor("output.bias", [V], 0.05)]
     return out
 
 
@@ -143,7 +196,10 @@ def arch_metadata(spec: dict[str, Any]) -> dict[str, tuple[Any, ...]]:
         f"{arch}.attention.head_count_kv": ("u32", spec["kv_heads"]),
         f"{arch}.attention.key_length": ("u32", spec["head_dim"]),
         f"{arch}.attention.value_length": ("u32", spec["head_dim"]),
-        f"{arch}.attention.layer_norm_rms_epsilon": ("f32", 1e-5),
+        # LayerNorm files declare a different epsilon key, and that key is what
+        # the adapter uses as evidence for the norm type.
+        (f"{arch}.attention.layer_norm_epsilon" if spec.get("layernorm")
+         else f"{arch}.attention.layer_norm_rms_epsilon"): ("f32", 1e-5),
         f"{arch}.rope.dimension_count": ("u32", spec["rope_dim"]),
         f"{arch}.rope.freq_base": ("f32", 10000.0),
         f"{arch}.context_length": ("u32", spec["context"]),
@@ -153,8 +209,22 @@ def arch_metadata(spec: dict[str, Any]) -> dict[str, tuple[Any, ...]]:
         "tokenizer.ggml.eos_token_id": ("u32", EOS),
         "tokenizer.ggml.tokens": ("array_string", tokenizer_tokens()),
     }
+    if spec.get("experts"):
+        md[f"{arch}.expert_count"] = ("u32", spec["experts"])
+        md[f"{arch}.expert_used_count"] = ("u32", spec.get("expert_used", 2))
     if spec.get("qkv_bias"):
         md[f"{arch}.attention.qkv_bias"] = ("bool", True)
+    if spec.get("expert_width"):
+        md[f"{arch}.expert_feed_forward_length"] = ("u32", spec["expert_width"])
+    if spec.get("shared_expert"):
+        md[f"{arch}.expert_shared_feed_forward_length"] = (
+            "u32", spec.get("shared_width", spec["intermediate"]))
+    if spec.get("embedding_scale") is not None:
+        md[f"{arch}.embedding_scale"] = ("f32", spec["embedding_scale"])
+    if spec.get("residual_scale") is not None:
+        md[f"{arch}.residual_scale"] = ("f32", spec["residual_scale"])
+    if spec.get("logit_scale") is not None:
+        md[f"{arch}.logit_scale"] = ("f32", spec["logit_scale"])
     if spec.get("attn_softcap"):
         md[f"{arch}.attn_logit_softcapping"] = ("f32", spec["attn_softcap"])
     if spec.get("final_softcap"):
@@ -165,6 +235,77 @@ def arch_metadata(spec: dict[str, Any]) -> dict[str, tuple[Any, ...]]:
 
 
 SPECS: list[dict[str, Any]] = [
+    {
+        # glm4: fused gate+up FFN (gate first, then up), and post-attention /
+        # post-FFN norms applied before each residual add. No separate gate.
+        "slug": "glm4",
+        "arch": "glm4",
+        "name": "FreeMoe synthetic glm4 with fused gate-up and post norms",
+        "kv_heads": SHAPE["heads"],
+        "rope_dim": SHAPE["head_dim"],
+        "fused_gate_up": True,
+        "post_norms": True,
+    },
+    {
+        # minicpm: the token embedding is scaled before the first block. The file
+        # also declares residual_scale and logit_scale, which llama.cpp parses
+        # and never applies -- so the fixture below is the check that we do not
+        # apply them either.
+        "slug": "minicpm",
+        "arch": "minicpm",
+        "name": "FreeMoe synthetic minicpm",
+        "kv_heads": SHAPE["heads"],
+        "rope_dim": SHAPE["head_dim"],
+        "tied_output": True,
+        "embedding_scale": 12.0,
+        "residual_scale": 0.0989,
+        "logit_scale": 8.0,
+    },
+    {
+        # qwen3moe: qwen3 semantics (per-head q/k norm) with stacked-expert FFN
+        # and a router. Tests the combination rather than either half alone.
+        "slug": "qwen3moe",
+        "arch": "qwen3moe",
+        "name": "FreeMoe synthetic qwen3moe",
+        "kv_heads": 2,
+        "rope_dim": SHAPE["head_dim"],
+        "qk_norm": True,
+        "experts": 4,
+        "expert_used": 2,
+    },
+    {
+        # phi2: LayerNorm with a bias instead of RMSNorm, no ffn_norm at all (the
+        # FFN runs on the attention's normalised input and both branches are
+        # added to one residual), a gate-free GELU FFN with biases, and biases on
+        # the attention output and the logits.
+        "slug": "phi2-layernorm",
+        "arch": "phi2",
+        "name": "FreeMoe synthetic phi2 with LayerNorm and a parallel residual",
+        "kv_heads": SHAPE["heads"],
+        "rope_dim": SHAPE["head_dim"],
+        "layernorm": True,
+        "parallel_residual": True,
+        "ffn_no_gate": True,
+        "ffn_bias": True,
+        "attn_output_bias": True,
+        "logit_bias": True,
+    },
+    {
+        # qwen2moe: routed experts plus a dense shared expert, whose output is
+        # scaled by one scalar per token. The three feed-forward widths are all
+        # different (64 dense, 48 per routed expert, 40 shared) so a runtime that
+        # reuses one width for another cannot match the golden.
+        "slug": "qwen2moe",
+        "arch": "qwen2moe",
+        "name": "FreeMoe synthetic qwen2moe with a shared expert",
+        "kv_heads": 2,
+        "rope_dim": SHAPE["head_dim"],
+        "experts": 4,
+        "expert_used": 2,
+        "expert_width": 48,
+        "shared_expert": True,
+        "shared_width": 40,
+    },
     {
         # phi3: one fused q/k/v projection with a fused bias, and a rotary width
         # narrower than the head (half the head rotates, the rest passes through).

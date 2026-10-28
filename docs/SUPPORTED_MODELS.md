@@ -1,8 +1,16 @@
 # Supported models
 
+> **Scope.** This file records the `freemoe-tiny` *native* adapter — the one
+> FreeMoe's own converter emits — field by field, with the citation for each.
+> The llama.cpp-family adapters (`llama`, `qwen2`, `qwen3`, `gemma*`, `phi3`,
+> `glm4`, `minicpm`, `qwen3moe`, `qwen2moe`, …) are documented separately in
+> `docs/MODEL_SUPPORT.md`. Where the two files disagree about what is supported,
+> this one is describing the narrower native format and
+> `docs/MODEL_SUPPORT.md` has the current list.
+
 ## Supported family
 
-FreeMoe currently supports exactly one adapter:
+The native adapter, `freemoe-tiny`:
 
 | Field | Value | Citation |
 |---|---|---|
@@ -47,7 +55,9 @@ They contain no third-party weights and are safe to redistribute under MIT.
 - grouped-query attention, sliding-window attention, ALiBi, YaRN, multimodal
   towers, LoRA, speculative decoding, continuous batching or multi-GPU;
 - per-expert GGUF tensor names, fused gate-up experts, shared experts or
-  architecture-specific router scaling not documented above;
+  architecture-specific router scaling not documented above (the standard
+  adapters do implement a fused gate-up FFN and `qwen2moe`'s shared expert;
+  see `docs/MODEL_SUPPORT.md`);
 - chat templates other than raw prompt mode;
 - any model whose tensor semantics cannot be mapped without guessing.
 

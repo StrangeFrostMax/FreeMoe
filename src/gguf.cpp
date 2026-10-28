@@ -122,6 +122,16 @@ const char *tensor_role_name(TensorRole role) {
     case TensorRole::FFN_POST_NORM: return "FFN_POST_NORM";
     case TensorRole::ATTN_QKV: return "ATTN_QKV";
     case TensorRole::ATTN_QKV_BIAS: return "ATTN_QKV_BIAS";
+    case TensorRole::FFN_GATE_INP_SHEXP: return "FFN_GATE_INP_SHEXP";
+    case TensorRole::FFN_GATE_SHEXP: return "FFN_GATE_SHEXP";
+    case TensorRole::FFN_UP_SHEXP: return "FFN_UP_SHEXP";
+    case TensorRole::FFN_DOWN_SHEXP: return "FFN_DOWN_SHEXP";
+    case TensorRole::ATTN_NORM_BIAS: return "ATTN_NORM_BIAS";
+    case TensorRole::FFN_NORM_BIAS: return "FFN_NORM_BIAS";
+    case TensorRole::OUTPUT_NORM_BIAS: return "OUTPUT_NORM_BIAS";
+    case TensorRole::FFN_UP_BIAS: return "FFN_UP_BIAS";
+    case TensorRole::FFN_DOWN_BIAS: return "FFN_DOWN_BIAS";
+    case TensorRole::OUTPUT_BIAS: return "OUTPUT_BIAS";
     }
     return "UNKNOWN";
 }
@@ -337,7 +347,9 @@ TensorRole role_from_name(const std::string &name, uint32_t &layer) {
     layer = 0;
     if (name == "token_embd.weight") return TensorRole::TOKEN_EMBD;
     if (name == "output.weight") return TensorRole::OUTPUT;
+    if (name == "output.bias") return TensorRole::OUTPUT_BIAS;
     if (name == "output_norm.weight") return TensorRole::OUTPUT_NORM;
+    if (name == "output_norm.bias") return TensorRole::OUTPUT_NORM_BIAS;
     static const std::vector<std::pair<std::string, TensorRole>> suffixes = {
         {"attn_norm.weight", TensorRole::ATTN_NORM},
         {"attn_q.weight", TensorRole::ATTN_Q},
@@ -362,6 +374,16 @@ TensorRole role_from_name(const std::string &name, uint32_t &layer) {
         {"ffn_post_norm.weight", TensorRole::FFN_POST_NORM},
         {"attn_qkv.weight", TensorRole::ATTN_QKV},
         {"attn_qkv.bias", TensorRole::ATTN_QKV_BIAS},
+        // The shared expert keeps its own gate/projection names; `_shexp` is
+        // distinct from `_exps`, so these cannot collide with routed experts.
+        {"ffn_gate_inp_shexp.weight", TensorRole::FFN_GATE_INP_SHEXP},
+        {"ffn_gate_shexp.weight", TensorRole::FFN_GATE_SHEXP},
+        {"ffn_up_shexp.weight", TensorRole::FFN_UP_SHEXP},
+        {"ffn_down_shexp.weight", TensorRole::FFN_DOWN_SHEXP},
+        {"attn_norm.bias", TensorRole::ATTN_NORM_BIAS},
+        {"ffn_norm.bias", TensorRole::FFN_NORM_BIAS},
+        {"ffn_up.bias", TensorRole::FFN_UP_BIAS},
+        {"ffn_down.bias", TensorRole::FFN_DOWN_BIAS},
     };
     for (const auto &entry : suffixes)
         if (parse_layer_suffix(name, entry.first, layer)) return entry.second;
@@ -604,7 +626,8 @@ bool opt_string(const GGUFDocument &doc, const std::set<std::string> &keys, std:
 bool is_llama_family(const std::string &arch) {
     static const std::set<std::string> family = {
         "llama", "qwen2", "qwen3", "smollm", "smollm2", "tinyllama",
-        "gemma", "gemma2", "gemma3", "phi3",
+        "gemma", "gemma2", "gemma3", "phi3", "minicpm", "qwen3moe", "glm4",
+        "qwen2moe", "phi2",
     };
     return family.count(arch) != 0;
 }
@@ -720,8 +743,35 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
         if (!(cfg.expert_weights_scale > 0.0))
             fail(ErrorCode::METADATA_MISMATCH, "expert_weights_scale must be positive");
     }
-    uint64_t shared = 0;
-    if (opt_u64(doc, keys("expert_shared_count"), &shared)) cfg.shared_expert = shared > 0;
+    // Routed experts and the qwen2moe shared expert each have their own width.
+    // Both default to the dense width, which is what every other MoE family
+    // does; a checkpoint that narrows either one says so explicitly.
+    if (opt_u64(doc, keys("expert_feed_forward_length"), &value)) {
+        cfg.expert_intermediate = static_cast<uint32_t>(value);
+        if (cfg.expert_intermediate == 0)
+            fail(ErrorCode::METADATA_MISMATCH, "expert feed-forward length must be positive");
+    }
+    // The shared expert is detected from its tensors rather than from
+    // `expert_shared_count`: the tensors are what the forward pass reads, so
+    // they are the evidence. A file that declares a count without the tensors
+    // is caught by the missing-tensor check below.
+    {
+        const bool shexp_gate = doc.tensor_by_name.count(layer_name(0, "ffn_gate_shexp.weight")) != 0;
+        const bool shexp_up = doc.tensor_by_name.count(layer_name(0, "ffn_up_shexp.weight")) != 0;
+        const bool shexp_down = doc.tensor_by_name.count(layer_name(0, "ffn_down_shexp.weight")) != 0;
+        const bool shexp_inp = doc.tensor_by_name.count(layer_name(0, "ffn_gate_inp_shexp.weight")) != 0;
+        if (shexp_gate || shexp_up || shexp_down || shexp_inp) {
+            if (!(shexp_gate && shexp_up && shexp_down && shexp_inp))
+                fail(ErrorCode::MISSING_REQUIRED_TENSOR,
+                     "shared expert is only partly present: gate, up, down and its input gate "
+                     "must all be there or none");
+            cfg.shared_expert = true;
+            cfg.shared_expert_intermediate = 0;
+            if (opt_u64(doc, keys("expert_shared_feed_forward_length"), &value))
+                cfg.shared_expert_intermediate = static_cast<uint32_t>(value);
+            if (cfg.shared_expert_intermediate == 0) cfg.shared_expert_intermediate = cfg.intermediate;
+        }
+    }
     cfg.model_kind = cfg.expert_count > 0 ? "moe" : "dense";
 
     // --- family semantics ---------------------------------------------------
@@ -731,11 +781,25 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
     if (arch == "gemma" || arch == "gemma2" || arch == "gemma3") {
         // gemma scales embeddings by sqrt(n_embd), stores norm scales
         // zero-centred, and uses GeGLU instead of SwiGLU.
-        cfg.embedding_scale = true;
+        cfg.embedding_scale = std::sqrt(static_cast<double>(cfg.hidden));
         cfg.norm_add_one = true;
         cfg.activation = "gelu";
     }
     double number = 0.0;
+    if (arch == "minicpm") {
+        // MiniCPM scales the token embedding before the first block. Older GGUF
+        // exports omit the key, in which case the original model used 12.0;
+        // newer exports write it explicitly.
+        cfg.embedding_scale = 12.0;
+        if (opt_double(doc, keys("embedding_scale"), &number) && number > 0.0)
+            cfg.embedding_scale = number;
+        // These two are recorded, not applied. llama.cpp reads and logs them and
+        // never uses them in the graph, so a runtime that applied them would
+        // disagree with the reference on every logit.
+        if (opt_double(doc, keys("residual_scale"), &number)) cfg.residual_scale = number;
+        if (opt_double(doc, keys("logit_scale"), &number)) cfg.logit_scale = number;
+    }
+
     if (arch == "gemma2" || arch == "gemma3") {
         cfg.post_norms = true;
         if (opt_double(doc, keys("attn_logit_softcapping"), &number)) {
@@ -761,6 +825,77 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
 
     if (opt_double(doc, keys("attention.layer_norm_rms_epsilon"), &number)) cfg.rms_eps = number;
     else cfg.rms_eps = 1e-5;
+
+    // Norm type. RMSNorm files declare `attention.layer_norm_rms_epsilon`;
+    // LayerNorm files declare `attention.layer_norm_epsilon`. That key is the
+    // evidence, so the norm is chosen from it rather than from the arch name.
+    {
+        const bool has_ln = opt_metadata(doc, arch + ".attention.layer_norm_epsilon", nullptr);
+        const bool has_rms = opt_metadata(doc, arch + ".attention.layer_norm_rms_epsilon", nullptr);
+        if (has_ln && has_rms)
+            fail(ErrorCode::METADATA_MISMATCH,
+                 "the file declares both a LayerNorm and an RMSNorm epsilon; the norm type is "
+                 "ambiguous");
+        if (has_ln) {
+            cfg.layer_norm = true;
+            if (opt_double(doc, keys("attention.layer_norm_epsilon"), &number)) cfg.rms_eps = number;
+        }
+    }
+    // Biased norms, and the biases phi2 puts on the FFN, the attention output
+    // and the logits. All of them are read from the tensors.
+    {
+        const bool attn_nb = doc.tensor_by_name.count(layer_name(0, "attn_norm.bias")) != 0;
+        const bool out_nb = doc.tensor_by_name.count("output_norm.bias") != 0;
+        const bool ffn_present =
+            doc.tensor_by_name.count(layer_name(0, "ffn_norm.weight")) != 0;
+        const bool ffn_nb = doc.tensor_by_name.count(layer_name(0, "ffn_norm.bias")) != 0;
+        if ((attn_nb || out_nb || ffn_nb) && !(attn_nb && out_nb && (!ffn_present || ffn_nb)))
+            fail(ErrorCode::MISSING_REQUIRED_TENSOR,
+                 "norm biases must be present on every norm, or on none");
+        if (attn_nb != out_nb)
+            fail(ErrorCode::MISSING_REQUIRED_TENSOR,
+                 "the attention norm and the final norm disagree about carrying a bias");
+        cfg.norm_bias = attn_nb;
+        const bool up_b = doc.tensor_by_name.count(layer_name(0, "ffn_up.bias")) != 0;
+        const bool down_b = doc.tensor_by_name.count(layer_name(0, "ffn_down.bias")) != 0;
+        if (up_b != down_b)
+            fail(ErrorCode::MISSING_REQUIRED_TENSOR,
+                 "ffn_up and ffn_down must both carry a bias or neither");
+        cfg.ffn_bias = up_b;
+        cfg.attn_output_bias = doc.tensor_by_name.count(layer_name(0, "attn_output.bias")) != 0;
+        cfg.logit_bias = doc.tensor_by_name.count("output.bias") != 0;
+        // A block with no FFN norm can only work if the FFN reuses the
+        // attention's normalised input: that is phi2's parallel residual.
+        if (!ffn_present) {
+            if (doc.tensor_by_name.count(layer_name(0, "attn_norm.weight")) == 0)
+                fail(ErrorCode::MISSING_REQUIRED_TENSOR,
+                     "no ffn_norm and no attn_norm: nothing normalises the FFN input");
+            cfg.parallel_residual = true;
+        }
+        // A block with up/down but no gate has no gated activation at all. The
+        // activation itself is not representable in GGUF metadata, so it comes
+        // from the architecture table -- the only such decision in this file,
+        // and the reason each such architecture needs a parity fixture.
+        const bool has_gate = doc.tensor_by_name.count(layer_name(0, "ffn_gate.weight")) != 0;
+        // A [hidden, 2*intermediate] up tensor is glm4's fused gate+up, not a
+        // gate-free FFN, so the width decides between the two.
+        const auto up_it = doc.tensor_by_name.find(layer_name(0, "ffn_up.weight"));
+        const bool up_present = up_it != doc.tensor_by_name.end();
+        const bool fused_width =
+            up_present && doc.tensors[up_it->second].dims.size() == 2 &&
+            doc.tensors[up_it->second].dims[1] == static_cast<uint64_t>(cfg.intermediate) * 2;
+        if (!has_gate && up_present && cfg.expert_count == 0 && !fused_width)
+            cfg.ffn_no_gate = true;
+    }
+    if (cfg.ffn_no_gate) {
+        // Only the gate-free activations this build can reproduce are accepted.
+        const bool gelu_arch = arch == "phi2";
+        if (!gelu_arch)
+            fail(ErrorCode::NOT_IMPLEMENTED,
+                 "a gate-free feed-forward is only defined for phi2 here; refusing rather than "
+                 "guessing its activation");
+        cfg.activation = "gelu";
+    }
     if (opt_double(doc, keys("rope.freq_base"), &number)) cfg.rope_theta = number;
     else if (opt_double(doc, keys("rope_theta"), &number)) cfg.rope_theta = number;
     else cfg.rope_theta = 10000.0;
@@ -789,14 +924,25 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
              "attention head count times head dimension does not equal embedding length");
     if (cfg.rope_dim != 0 && (cfg.rope_dim % 2 != 0 || cfg.rope_dim > cfg.head_dim))
         fail(ErrorCode::SHAPE_MISMATCH, "rotary dimension is invalid");
-    if (cfg.shared_expert)
+    if (cfg.shared_expert && cfg.expert_count == 0)
         fail(ErrorCode::METADATA_MISMATCH,
-             "shared-expert checkpoints are not implemented; refusing rather than dropping it");
+             "a shared expert without routed experts has no defined semantics");
     auto reject = [&](const char *metadata_key, const char *what) {
         MetadataValue v;
         if (opt_metadata(doc, arch + "." + metadata_key, &v) && v.as_bool())
             fail(ErrorCode::NOT_IMPLEMENTED, std::string(what) + " is not implemented");
     };
+    // Post-attention / post-FFN norms: present in gemma2/3 and glm4. The tensors
+    // are the evidence, so this is read rather than assumed per architecture.
+    {
+        const bool attn_post = doc.tensor_by_name.count(layer_name(0, "attn_post_norm.weight")) != 0;
+        const bool ffn_post = doc.tensor_by_name.count(layer_name(0, "ffn_post_norm.weight")) != 0;
+        if (attn_post != ffn_post)
+            fail(ErrorCode::MISSING_REQUIRED_TENSOR,
+                 "post-attention and post-FFN norms must both be present or both absent");
+        if (attn_post) cfg.post_norms = true;
+    }
+
     // phi3 stores one fused q/k/v projection instead of three. Detect it from
     // the tensors, because the metadata does not say either way.
     {
@@ -849,6 +995,23 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
         (cfg.expert_count && cfg.expert_top_k > cfg.expert_count))
         fail(ErrorCode::SHAPE_MISMATCH, "model dimension exceeds adapter safety bounds");
 
+    // glm4 keeps the FFN gate and up halves in a single tensor. Detected from
+    // the shapes rather than the architecture name, because the same adapter
+    // serves both layouts.
+    if (cfg.expert_count == 0 && !cfg.ffn_no_gate) {
+        const TensorInfo *up = m.tensor(layer_name(0, "ffn_up.weight"));
+        const bool has_gate = doc.tensor_by_name.count(layer_name(0, "ffn_gate.weight")) != 0;
+        if (!up)
+            fail(ErrorCode::MISSING_REQUIRED_TENSOR, "missing required tensor blk.0.ffn_up.weight");
+        if (!has_gate) {
+            if (up->dims.size() != 2 || up->dims[1] != static_cast<uint64_t>(cfg.intermediate) * 2)
+                fail(ErrorCode::SHAPE_MISMATCH,
+                     "ffn_gate is absent, so ffn_up must be [hidden, 2*intermediate] holding "
+                     "both halves");
+            cfg.fused_gate_up = true;
+        }
+    }
+
     // --- canonical tensor map ------------------------------------------------
     // `name` keeps the bytes' real identity; `canonical` is what the engine
     // addresses. Only the router is renamed, because llama.cpp stores the
@@ -863,9 +1026,19 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
     const bool tied_output = m.doc.tensor_by_name.count("output.weight") == 0;
     if (tied_output) m.alias["output.weight"] = "token_embd.weight";
     else expect("output.weight");
+    if (cfg.norm_bias) expect("output_norm.bias");
+    if (cfg.logit_bias) expect("output.bias");
     for (uint32_t l = 0; l < cfg.layers; ++l) {
-        for (const char *suffix : {"attn_norm.weight", "attn_output.weight", "ffn_norm.weight"})
+        for (const char *suffix : {"attn_norm.weight", "attn_output.weight"})
             expect(layer_name(l, suffix));
+        if (!cfg.parallel_residual) expect(layer_name(l, "ffn_norm.weight"));
+        if (cfg.norm_bias) expect(layer_name(l, "attn_norm.bias"));
+        if (cfg.attn_output_bias) expect(layer_name(l, "attn_output.bias"));
+        if (cfg.ffn_bias) {
+            expect(layer_name(l, "ffn_up.bias"));
+            expect(layer_name(l, "ffn_down.bias"));
+        }
+        if (cfg.norm_bias && !cfg.parallel_residual) expect(layer_name(l, "ffn_norm.bias"));
         if (cfg.fused_qkv) {
             expect(layer_name(l, "attn_qkv.weight"));
         } else {
@@ -889,6 +1062,16 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
         if (cfg.expert_count) {
             for (const char *suffix : {"ffn_gate_inp.weight", "ffn_gate_exps.weight",
                                        "ffn_up_exps.weight", "ffn_down_exps.weight"})
+                expect(layer_name(l, suffix));
+            if (cfg.shared_expert)
+                for (const char *suffix : {"ffn_gate_inp_shexp.weight", "ffn_gate_shexp.weight",
+                                           "ffn_up_shexp.weight", "ffn_down_shexp.weight"})
+                    expect(layer_name(l, suffix));
+        } else if (cfg.fused_gate_up) {
+            for (const char *suffix : {"ffn_up.weight", "ffn_down.weight"})
+                expect(layer_name(l, suffix));
+        } else if (cfg.ffn_no_gate) {
+            for (const char *suffix : {"ffn_up.weight", "ffn_down.weight"})
                 expect(layer_name(l, suffix));
         } else {
             for (const char *suffix : {"ffn_gate.weight", "ffn_up.weight", "ffn_down.weight"})
@@ -915,7 +1098,9 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
             fail(ErrorCode::UNKNOWN_TENSOR, "cannot map tensor role for " + tensor.name);
         tensor.role = role;
         const bool global_role = role == TensorRole::TOKEN_EMBD || role == TensorRole::OUTPUT ||
-                                 role == TensorRole::OUTPUT_NORM;
+                                 role == TensorRole::OUTPUT_NORM ||
+                                 role == TensorRole::OUTPUT_BIAS ||
+                                 role == TensorRole::OUTPUT_NORM_BIAS;
         tensor.layer = global_role ? -1 : static_cast<int>(layer);
         tensor.canonical = role == TensorRole::FFN_ROUTER
                                ? layer_name(layer, "ffn_router.weight")
@@ -945,9 +1130,21 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
     if (const TensorInfo *t = m.tensor("output.weight"))
         expect_dims(*t, {cfg.hidden, cfg.vocab});
     expect_dims(*m.tensor("output_norm.weight"), {cfg.hidden});
+    if (cfg.norm_bias) expect_dims(*m.tensor("output_norm.bias"), {cfg.hidden});
+    if (cfg.logit_bias) expect_dims(*m.tensor("output.bias"), {cfg.vocab});
     for (uint32_t l = 0; l < cfg.layers; ++l) {
         expect_dims(*m.tensor(layer_name(l, "attn_norm.weight")), {cfg.hidden});
-        expect_dims(*m.tensor(layer_name(l, "ffn_norm.weight")), {cfg.hidden});
+        if (!cfg.parallel_residual)
+            expect_dims(*m.tensor(layer_name(l, "ffn_norm.weight")), {cfg.hidden});
+        if (cfg.norm_bias) expect_dims(*m.tensor(layer_name(l, "attn_norm.bias")), {cfg.hidden});
+        if (cfg.attn_output_bias)
+            expect_dims(*m.tensor(layer_name(l, "attn_output.bias")), {cfg.hidden});
+        if (cfg.ffn_bias) {
+            expect_dims(*m.tensor(layer_name(l, "ffn_up.bias")), {cfg.intermediate});
+            expect_dims(*m.tensor(layer_name(l, "ffn_down.bias")), {cfg.hidden});
+        }
+        if (cfg.norm_bias && !cfg.parallel_residual)
+            expect_dims(*m.tensor(layer_name(l, "ffn_norm.bias")), {cfg.hidden});
         if (cfg.fused_qkv) {
             // The fused projection holds q, then k, then v along its output axis.
             expect_dims(*m.tensor(layer_name(l, "attn_qkv.weight")),
@@ -977,13 +1174,30 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
             }
         }
         if (cfg.expert_count) {
+            const uint32_t ewidth = cfg.expert_width();
             expect_dims(*m.tensor(layer_name(l, "ffn_gate_inp.weight")),
                         {cfg.hidden, cfg.expert_count});
             for (const char *suffix : {"ffn_gate_exps.weight", "ffn_up_exps.weight"})
                 expect_dims(*m.tensor(layer_name(l, suffix)),
-                            {cfg.hidden, cfg.intermediate, cfg.expert_count});
+                            {cfg.hidden, ewidth, cfg.expert_count});
             expect_dims(*m.tensor(layer_name(l, "ffn_down_exps.weight")),
-                        {cfg.intermediate, cfg.hidden, cfg.expert_count});
+                        {ewidth, cfg.hidden, cfg.expert_count});
+            if (cfg.shared_expert) {
+                const uint32_t swidth = cfg.shared_expert_intermediate;
+                // One scalar per token, so the gate is a hidden-vector.
+                expect_dims(*m.tensor(layer_name(l, "ffn_gate_inp_shexp.weight")), {cfg.hidden});
+                for (const char *suffix : {"ffn_gate_shexp.weight", "ffn_up_shexp.weight"})
+                    expect_dims(*m.tensor(layer_name(l, suffix)), {cfg.hidden, swidth});
+                expect_dims(*m.tensor(layer_name(l, "ffn_down_shexp.weight")),
+                            {swidth, cfg.hidden});
+            }
+        } else if (cfg.ffn_no_gate) {
+            expect_dims(*m.tensor(layer_name(l, "ffn_up.weight")), {cfg.hidden, cfg.intermediate});
+            expect_dims(*m.tensor(layer_name(l, "ffn_down.weight")),
+                        {cfg.intermediate, cfg.hidden});
+        } else if (cfg.fused_gate_up) {
+            expect_dims(*m.tensor(layer_name(l, "ffn_up.weight")),
+                        {cfg.hidden, static_cast<uint64_t>(cfg.intermediate) * 2});
         } else {
             for (const char *suffix : {"ffn_gate.weight", "ffn_up.weight"})
                 expect_dims(*m.tensor(layer_name(l, suffix)), {cfg.hidden, cfg.intermediate});
