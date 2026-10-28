@@ -15,8 +15,11 @@ enum class KernelIsa { Auto = 0, Scalar, Avx2Fma, Avx512 };
 const char *kernel_isa_name(KernelIsa isa);
 KernelIsa parse_kernel_isa(const std::string &name);
 
-// Resolved ISA for this host given a request. `Auto` never selects AVX-512 on a
-// host detected as Zen 3, matching the repository-wide Zen 3 policy.
+// Resolved ISA for this host given a request.
+//
+// `Auto` never selects AVX-512: the deployment target is Zen 3, which has none,
+// so an auto run must exercise the path that ships rather than whatever the
+// development host happens to support. AVX-512 requires an explicit request.
 KernelIsa resolve_kernel_isa(KernelIsa requested);
 
 // CPU feature probes. Safe to call on any host.

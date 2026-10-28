@@ -83,6 +83,9 @@ KernelIsa parse_kernel_isa(const std::string &name) {
     if (name == "auto") return KernelIsa::Auto;
     if (name == "scalar") return KernelIsa::Scalar;
     if (name == "avx2" || name == "avx2_fma") return KernelIsa::Avx2Fma;
+    // `zen3` is the deployment target's width, spelled the way the VNPU profile
+    // spells it, so both backends can be pinned with the same word.
+    if (name == "zen3" || name == "zen3-auto" || name == "zen3_auto") return KernelIsa::Avx2Fma;
     if (name == "avx512") return KernelIsa::Avx512;
     fail(ErrorCode::INVALID_ARGUMENT, "unknown kernel ISA profile: " + name);
 }
@@ -99,9 +102,10 @@ KernelIsa resolve_kernel_isa(KernelIsa requested) {
     if (requested == KernelIsa::Avx2Fma) {
         return host_has_avx2_fma() ? KernelIsa::Avx2Fma : KernelIsa::Scalar;
     }
-    // Auto
-    if (zen3) return host_has_avx2_fma() ? KernelIsa::Avx2Fma : KernelIsa::Scalar;
-    if (host_has_avx512()) return KernelIsa::Avx512;
+    // Auto. The deployment target is Zen 3, which has no AVX-512, so auto never
+    // selects it: a number measured on a wider host would not describe the
+    // target, and a correctness run would not exercise the path that ships.
+    // AVX-512 stays reachable through an explicit `--kernels avx512`.
     if (host_has_avx2_fma()) return KernelIsa::Avx2Fma;
     return KernelIsa::Scalar;
 }

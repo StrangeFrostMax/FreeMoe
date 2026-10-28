@@ -1448,13 +1448,29 @@ void test_cpu_kernels() {
     CHECK(resolve_kernel_isa(KernelIsa::Scalar) == KernelIsa::Scalar,
           "explicit scalar kernel request is honoured");
     const KernelIsa auto_isa = resolve_kernel_isa(KernelIsa::Auto);
-    CHECK(auto_isa == KernelIsa::Scalar || auto_isa == KernelIsa::Avx2Fma ||
-              auto_isa == KernelIsa::Avx512,
-          "auto kernel resolution returns a valid ISA");
+    CHECK(auto_isa == KernelIsa::Scalar || auto_isa == KernelIsa::Avx2Fma,
+          "auto kernel resolution stays on the deployment target's width");
+    // The target is Zen 3, which has no AVX-512. Auto must therefore never pick
+    // it, whatever this host supports, or every number recorded here describes a
+    // machine the software will not run on.
+    CHECK(auto_isa != KernelIsa::Avx512, "auto never selects AVX-512 kernels");
     if (!host_has_avx2_fma())
         CHECK(auto_isa == KernelIsa::Scalar, "no AVX2 means scalar fallback");
-    if (host_is_zen3())
-        CHECK(auto_isa != KernelIsa::Avx512, "Zen 3 never selects AVX-512 kernels");
+    // An explicit request is still honoured when the host can run it.
+    if (host_has_avx512() && !host_is_zen3())
+        CHECK(resolve_kernel_isa(KernelIsa::Avx512) == KernelIsa::Avx512,
+              "an explicit AVX-512 request is honoured on a host that has it");
+    CHECK(parse_kernel_isa("zen3") == KernelIsa::Avx2Fma,
+          "the zen3 profile means dual-width AVX2, not AVX-512");
+    CHECK(parse_kernel_isa("zen3-auto") == KernelIsa::Avx2Fma,
+          "the zen3 profile accepts the VNPU spelling too");
+    // The committed benchmark config has to pin the target width, or the
+    // recorded numbers describe whatever host ran them.
+    {
+        const std::string config = read_text_file("configs/benchmark.env");
+        CHECK(config.find("--kernels zen3") != std::string::npos,
+              "the benchmark config pins the Zen 3 kernel profile");
+    }
     CHECK(resolved_threads(KernelConfig{}) >= 1, "default thread count is at least one");
     CHECK(std::string(kernel_isa_name(KernelIsa::Avx2Fma)) == "avx2_fma",
           "kernel ISA names are stable");
