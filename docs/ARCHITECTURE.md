@@ -53,6 +53,7 @@ CLI / run recorder
 | EXISTS | `src/kernels.cpp` | Vectorised GEMV (F32 and block-quantised), runtime ISA resolution with Zen 3 policy, thread pool, kernel benchmark harness. |
 | EXISTS | `src/tokenizer.cpp` | Real tokenizers for published checkpoints: SentencePiece-style piece tables with byte fallback and GPT-2 style BPE, with an honest coverage report instead of silent byte loss. |
 | EXISTS | `src/support.cpp` | Architecture-agnostic support probe: reads any GGUF and reports architecture, hyperparameters, tensor types, tokenizer and every concrete blocker before claiming a model is runnable. |
+| EXISTS | `src/rope.cpp` | Rotary position embedding, including llama.cpp's `rope.scaling.*` modes: linear interpolation and YaRN (per-dimension correction ramp plus magnitude scale). Separate from the attention loop because a wrong ramp produces fluent text rather than a crash. |
 | EXISTS | `src/quant.cpp` | Scalar reference block decoders for every supported GGUF tensor type, plus block geometry. The oracle that the vectorised quantised kernels are checked against. |
 | EXISTS | `src/engine.cpp` | Llama-like forward pass, MoE routing/execution, reference comparison and reports. |
 | EXISTS | `src/unicode.cpp` | Category lookups over generated range tables, UTF-8 code point iteration with U+FFFD on invalid bytes, byte-level alphabet in both directions. |

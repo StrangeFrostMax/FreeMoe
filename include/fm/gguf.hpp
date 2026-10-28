@@ -230,6 +230,30 @@ struct ModelConfig {
     uint32_t eos_id = 0;
     double rms_eps = 0.0;
     double rope_theta = 0.0;
+    // Context extension, straight from `rope.scaling.*`. "none" is the identity
+    // and is what every checkpoint without those keys gets.
+    std::string rope_scaling_type = "none";
+    // `rope.scaling.factor`: the position divisor. 0 means "unspecified", which
+    // llama.cpp treats as 1.0 (no stretching).
+    double rope_scaling_factor = 0.0;
+    // `rope.scaling.original_context_length`: the trained context, which anchors
+    // the YaRN correction ramp. Defaults to `context_length`.
+    double rope_n_ctx_orig = 0.0;
+    // `rope.scaling.attn_factor`: a magnitude multiplier the checkpoint itself
+    // asks for, applied on top of whatever the scaling mode derives.
+    double rope_scaling_attn_factor = 1.0;
+    // `rope.scaling.yarn_log_multiplier`: YaRN's `mscale_all_dim`.
+    double rope_yarn_log_mul = 0.0;
+    // YaRN ramp knees. llama.cpp hard-codes these two as its defaults and never
+    // reads the keys, so the defaults are what a real checkpoint runs with.
+    double rope_yarn_beta_fast = 32.0;
+    double rope_yarn_beta_slow = 1.0;
+    // Derived by `resolve_rope_scaling()` in src/rope.cpp; never read from the
+    // file. `rope_freq_scale` keeps llama.cpp's direction (1/factor) so the two
+    // implementations can be compared line by line.
+    double rope_freq_scale = 1.0;
+    double rope_ext_factor = 0.0;
+    double rope_mscale = 1.0;
     // qwen2moe adds a dense feed-forward branch to the routed experts. Its
     // width is its own hyperparameter (`expert_shared_feed_forward_length`),
     // not the dense width, so it is stored separately. 0 means "no shared

@@ -19,6 +19,7 @@ OUR_LIB_SRCS := \
   src/backend.cpp \
   src/kernels.cpp \
   src/quant.cpp \
+  src/rope.cpp \
   src/support.cpp \
   src/tokenizer.cpp \
   src/unicode.cpp \
@@ -56,7 +57,7 @@ $(BUILD)/vnpu-selftest: $(SELFTEST_OBJS) $(VNPU_OBJS)
 	@mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) $^ -o $@ $(LDFLAGS)
 
-$(BUILD)/fuzz_gguf: $(FUZZ_MAIN) src/common.cpp src/gguf.cpp src/quant.cpp src/kernels.cpp src/backend.cpp $(VNPU_SRCS)
+$(BUILD)/fuzz_gguf: $(FUZZ_MAIN) src/common.cpp src/gguf.cpp src/quant.cpp src/rope.cpp src/kernels.cpp src/backend.cpp $(VNPU_SRCS)
 	@mkdir -p $(dir $@)
 	$(CXX) $(FUZZ_FLAGS) $(CPPFLAGS) $^ -o $@ $(LDFLAGS)
 
@@ -90,6 +91,7 @@ test: all $(BUILD)/tests $(BUILD)/vnpu-selftest $(BUILD)/fuzz_gguf
 	python3 scripts/check_architecture.py
 	python3 scripts/check_dependencies.py
 	python3 tools/gen_unicode_tables.py --check
+	python3 tools/make_arch_fixtures.py --check
 
 zen3-fallback: all $(BUILD)/tests $(BUILD)/vnpu-selftest
 	python3 scripts/zen3_fallback_check.py

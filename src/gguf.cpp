@@ -1,5 +1,6 @@
 #include "fm/gguf.hpp"
 #include "fm/quant.hpp"
+#include "fm/rope.hpp"
 
 #include <algorithm>
 #include <cerrno>
@@ -1026,6 +1027,30 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
     else if (opt_double(doc, keys("rope_theta"), &number)) cfg.rope_theta = number;
     else cfg.rope_theta = 10000.0;
 
+    // Context extension. The keys are read verbatim and the arithmetic is
+    // derived in src/rope.cpp, so the derived values cannot drift from the file.
+    std::string scaling_type;
+    if (opt_string(doc, keys("rope.scaling.type"), &scaling_type) && !scaling_type.empty())
+        cfg.rope_scaling_type = scaling_type;
+    double scaling_number = 0.0;
+    if (opt_double(doc, keys("rope.scaling.factor"), &scaling_number))
+        cfg.rope_scaling_factor = scaling_number;
+    else if (opt_double(doc, keys("rope.scale_linear"), &scaling_number))
+        cfg.rope_scaling_factor = scaling_number;  // pre-2024 key name
+    if (opt_double(doc, keys("rope.scaling.original_context_length"), &scaling_number))
+        cfg.rope_n_ctx_orig = scaling_number;
+    else
+        cfg.rope_n_ctx_orig = static_cast<double>(cfg.context);
+    if (opt_double(doc, keys("rope.scaling.attn_factor"), &scaling_number))
+        cfg.rope_scaling_attn_factor = scaling_number;
+    if (opt_double(doc, keys("rope.scaling.yarn_log_multiplier"), &scaling_number))
+        cfg.rope_yarn_log_mul = scaling_number;
+    if (opt_double(doc, keys("rope.scaling.yarn_beta_fast"), &scaling_number))
+        cfg.rope_yarn_beta_fast = scaling_number;
+    if (opt_double(doc, keys("rope.scaling.yarn_beta_slow"), &scaling_number))
+        cfg.rope_yarn_beta_slow = scaling_number;
+    resolve_rope_scaling(cfg);
+
     cfg.bos_id = 1;
     cfg.eos_id = 2;
     if (opt_u64(doc, {"tokenizer.ggml.bos_token_id"}, &value))
@@ -1521,6 +1546,11 @@ ModelManifest build_manifest(const GGUFDocument &doc, const std::string &source_
     cfg.rms_eps = require_double(doc, "freemoe.rms_norm_epsilon");
     cfg.rope_theta = require_double(doc, "freemoe.rope_theta");
     cfg.shared_expert = require_bool(doc, "freemoe.shared_expert");
+    // The reference fixture predates `rope.scaling.*` and defines unscaled
+    // rotation; resolving keeps the derived fields defined rather than defaulted
+    // by luck.
+    cfg.rope_n_ctx_orig = static_cast<double>(cfg.context);
+    resolve_rope_scaling(cfg);
 
     if (cfg.architecture != "freemoe-tiny" || cfg.adapter != "freemoe-tiny-v1")
         fail(ErrorCode::UNSUPPORTED_ARCHITECTURE, "unsupported architecture/adapter: " + cfg.architecture + "/" + cfg.adapter);
@@ -1741,6 +1771,9 @@ Json metadata_summary_json(const ModelManifest &manifest) {
             {"attention.value_length", "value_length"},
             {"rope.dimension_count", "rope_dimension_count"},
             {"rope.freq_base", "rope_freq_base"},
+            {"rope.scaling.type", "rope_scaling"},
+            {"rope.scaling.factor", "rope_scaling_factor"},
+            {"rope.scaling.original_context_length", "rope_original_context_length"},
             {"attention.layer_norm_rms_epsilon", "rms_epsilon"},
             {"context_length", "context_length"},
             {"expert_count", "expert_count"},

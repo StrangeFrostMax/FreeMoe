@@ -4,6 +4,7 @@
 #include "fm/io.hpp"
 #include "fm/residency.hpp"
 #include "fm/quant.hpp"
+#include "fm/rope.hpp"
 #include "fm/support.hpp"
 #include "fm/tokenizer.hpp"
 #include "fm/unicode.hpp"
@@ -2013,12 +2014,148 @@ ArchGolden read_arch_golden(const std::string &path) {
 // file for a named architecture, plus logits from an independent implementation
 // (tools/llama_oracle.py). The engine has to reproduce those logits: that is
 // what "the adapter for this architecture works" means here.
+// Rotary context extension. The arithmetic is subtle enough that "the model
+// still produces logits" is not evidence: a wrong ramp produces fluent text.
+// These checks pin the formulas against values computed from ggml's definitions
+// by hand, and then confirm the fixture's raw metadata reaches the config.
+void test_rope_scaling() {
+    // ggml's correction-dim solve for a 8-dim rotation over a 64-token context:
+    // start clamps to 0 (the fast knee is negative) and end rounds to 2, so
+    // pairs 0,1 extrapolate/blend and pairs 2,3 interpolate.
+    double dims[2] = {-1.0, -1.0};
+    rope_yarn_corr_dims(8, 64.0, 10000.0, 32.0, 1.0, dims);
+    CHECK(dims[0] == 0.0, "YaRN ramp start clamps to zero for a short context");
+    CHECK(dims[1] == 2.0, "YaRN ramp end is the slow knee, rounded up");
+
+    ModelConfig yarn;
+    yarn.context = 64;
+    yarn.rope_theta = 10000.0;
+    yarn.rope_scaling_type = "yarn";
+    yarn.rope_scaling_factor = 4.0;
+    yarn.rope_n_ctx_orig = 64.0;
+    resolve_rope_scaling(yarn);
+    CHECK(std::fabs(yarn.rope_freq_scale - 0.25) < 1e-12,
+          "a 4x YaRN factor becomes a 1/4 frequency scale");
+    CHECK(yarn.rope_ext_factor == 1.0, "YaRN enables extrapolation");
+    // 0.1*log(4) + 1, with no attn_factor in the file.
+    CHECK(std::fabs(yarn.rope_mscale - (1.0 + 0.1 * std::log(4.0))) < 1e-12,
+          "YaRN magnitude scale is 1 + 0.1*log(factor)");
+
+    RopePlan scaled;
+    scaled.init(yarn, 8);
+    CHECK(scaled.corr_low == 0.0 && scaled.corr_high == 2.0,
+          "the plan carries the ramp bounds");
+
+    RopePlan plain;
+    ModelConfig unscaled;
+    unscaled.context = 64;
+    unscaled.rope_theta = 10000.0;
+    unscaled.rope_n_ctx_orig = 64.0;
+    resolve_rope_scaling(unscaled);
+    CHECK(unscaled.rope_freq_scale == 1.0 && unscaled.rope_mscale == 1.0,
+          "a checkpoint without rope.scaling rotates unscaled");
+    plain.init(unscaled, 8);
+
+    // Pair 0 sits below the ramp: it keeps its exact angle (times the magnitude
+    // scale only). Pair 3 is above it: fully interpolated, i.e. position/4.
+    double c0 = 0.0, s0 = 0.0, c3 = 0.0, s3 = 0.0;
+    scaled.rotation(0, 3.0, c0, s0);
+    scaled.rotation(3, 3.0, c3, s3);
+    const double mscale = 1.0 + 0.1 * std::log(4.0);
+    const double freq0 = std::pow(10000.0, -2.0 * 0.0 / 8.0);
+    const double freq3 = std::pow(10000.0, -2.0 * 3.0 / 8.0);
+    CHECK(std::fabs(c0 - std::cos(3.0 * freq0) * mscale) < 1e-9,
+          "the fastest YaRN pair keeps its exact angle");
+    CHECK(std::fabs(s0 - std::sin(3.0 * freq0) * mscale) < 1e-9,
+          "the fastest YaRN pair keeps its exact sine");
+    CHECK(std::fabs(c3 - std::cos(3.0 * freq3 / 4.0) * mscale) < 1e-9,
+          "the slowest YaRN pair is interpolated by the factor");
+
+    double pc0 = 0.0, ps0 = 0.0, pc3 = 0.0, ps3 = 0.0;
+    plain.rotation(0, 3.0, pc0, ps0);
+    plain.rotation(3, 3.0, pc3, ps3);
+    CHECK(std::fabs(pc0 - std::cos(3.0 * freq0)) < 1e-12,
+          "unscaled rotation is the plain cos/sin of position times frequency");
+    CHECK(std::fabs(c3 - pc3) > 1e-3, "YaRN actually changes the slow pair's angle");
+
+    // linear: same interpolation, no ramp and no derived magnitude, so the
+    // file's attn_factor is the only multiplier.
+    ModelConfig linear;
+    linear.context = 64;
+    linear.rope_theta = 10000.0;
+    linear.rope_scaling_type = "linear";
+    linear.rope_scaling_factor = 2.0;
+    linear.rope_n_ctx_orig = 64.0;
+    linear.rope_scaling_attn_factor = 1.25;
+    resolve_rope_scaling(linear);
+    CHECK(linear.rope_freq_scale == 0.5 && linear.rope_ext_factor == 0.0,
+          "linear scaling only divides the frequency");
+    CHECK(std::fabs(linear.rope_mscale - 1.25) < 1e-12,
+          "linear scaling takes the magnitude straight from the file");
+    RopePlan lin;
+    lin.init(linear, 8);
+    double lc = 0.0, ls = 0.0;
+    lin.rotation(2, 5.0, lc, ls);
+    CHECK(std::fabs(lc - std::cos(5.0 * std::pow(10000.0, -2.0 * 2.0 / 8.0) / 2.0) * 1.25) < 1e-9,
+          "linear scaling divides every angle by the factor");
+
+    // The fixture's raw keys have to reach the config, or the engine would run
+    // exactly the unscaled arithmetic above and still look fine.
+    const std::string path = "tests/fixtures/llama-yarn-shape.gguf";
+    const GGUFDocument doc = parse_gguf_file(path);
+    const ModelManifest manifest = build_manifest(doc, path);
+    CHECK(manifest.config.rope_scaling_type == "yarn",
+          "the checkpoint's rope.scaling.type is read");
+    CHECK(std::fabs(manifest.config.rope_scaling_factor - 4.0) < 1e-9,
+          "the checkpoint's scaling factor is read");
+    CHECK(std::fabs(manifest.config.rope_freq_scale - 0.25) < 1e-9,
+          "the scaling factor reaches the derived frequency scale");
+    CHECK(std::fabs(manifest.config.rope_mscale - (1.0 + 0.1 * std::log(4.0))) < 1e-6,
+          "the derived magnitude scale survives the manifest build");
+
+    // longrope needs per-layer short/long factors that no checkpoint here uses;
+    // it must say so by name rather than fall back to unscaled rotation.
+    // The probe must report the same limitation before a run is attempted, and
+    // must name the mode it saw so the report is actionable.
+    {
+        const Json probe = probe_model(doc, path);
+        CHECK(probe.dump().find("\"rope_scaling\"") != std::string::npos,
+              "the probe reports the checkpoint's rope scaling");
+        CHECK(probe.dump().find("\"yarn\"") != std::string::npos,
+              "the probe names yarn rather than only 'supported'");
+        CHECK(probe.dump().find("ROPE_SCALING_NOT_IMPLEMENTED") == std::string::npos,
+              "implemented rope scaling is not a blocker");
+    }
+    {
+        GGUFDocument bad = doc;  // already a `llama` checkpoint
+        bad.metadata["llama.rope.scaling.type"] = make_string("longrope");
+        const Json probe = probe_model(bad, "synthetic.gguf");
+        CHECK(probe.dump().find("ROPE_SCALING_NOT_IMPLEMENTED") != std::string::npos,
+              "an unimplemented rope scaling mode is reported as a blocker");
+    }
+
+    ModelConfig longrope;
+    longrope.rope_scaling_type = "longrope";
+    longrope.rope_n_ctx_orig = 64.0;
+    CHECK(throws_code(ErrorCode::NOT_IMPLEMENTED,
+                      [&]() { resolve_rope_scaling(longrope); }),
+          "longrope is refused by name instead of silently ignored");
+    // A scaling factor with no anchor for the ramp is a metadata error.
+    ModelConfig no_anchor;
+    no_anchor.rope_scaling_type = "yarn";
+    no_anchor.rope_scaling_factor = 4.0;
+    CHECK(throws_code(ErrorCode::METADATA_MISMATCH,
+                      [&]() { resolve_rope_scaling(no_anchor); }),
+          "yarn without an original context is rejected");
+}
+
 void test_architecture_parity() {
     const std::vector<std::string> slugs = {"llama-gqa", "qwen2-bias", "qwen3-qknorm", "gemma",
                                            "gemma2", "phi3-fused", "minicpm", "qwen3moe",
                                            "glm4", "qwen2moe", "phi2-layernorm",
                                            "deepseek2-mla", "internlm2", "exaone", "orion",
-                                           "gptneox", "stablelm"};
+                                           "gptneox", "stablelm", "llama-yarn", "qwen2-linear",
+                                           "llama-yarn-mscale"};
     for (const std::string &slug : slugs) {
         const std::string model = "tests/fixtures/" + slug + "-shape.gguf";
         ArchGolden golden = read_arch_golden("tests/golden/" + slug + "_reference.txt");
@@ -2598,6 +2735,7 @@ int main(int argc, char **argv) {
     maybe_run("tokenizer_bpe_families", test_tokenizer_bpe_families);
     maybe_run("unicode_classes", test_unicode_classes);
     maybe_run("model_map_and_tied_output", test_model_map_and_tied_output);
+    maybe_run("rope_scaling", test_rope_scaling);
     maybe_run("architecture_parity", test_architecture_parity);
     maybe_run("rotated_and_ternary_blockers", test_rotated_and_ternary_blockers);
     maybe_run("minicpm_scales", test_minicpm_scales);
