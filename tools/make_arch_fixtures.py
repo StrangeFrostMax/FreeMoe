@@ -539,6 +539,17 @@ SPECS: list[dict[str, Any]] = [
         "qkv_bias": True,
     },
     {
+        # SmolLM3: the standard llama block with every fourth layer's rotary step
+        # removed (NoPE). Four layers are used so the skip actually happens at
+        # layer 3 -- a two-layer fixture would never exercise it.
+        "slug": "smollm3-nope",
+        "arch": "smollm3",
+        "name": "FreeMoe synthetic SmolLM3 with NoPE layers",
+        "kv_heads": 2,
+        "rope_dim": SHAPE["head_dim"],
+        "layers": 4,
+    },
+    {
         # Per-pair rotary frequency divisors (`rope_freqs.weight`): the pairs that
         # carry them advance slower, which is how granite/llama4-style checkpoints
         # stretch context without YaRN.

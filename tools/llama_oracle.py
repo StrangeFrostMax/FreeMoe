@@ -154,6 +154,8 @@ def load_model(path: Path) -> dict[str, Any]:
         # and the value sum never reads. Detected from the tensor, like every
         # other structural fact.
         "attn_sinks": "blk.0.attn_sinks.weight" in tensors,
+        # SmolLM3 keeps every fourth layer unrotated.
+        "no_rope_step": 4 if arch == "smollm3" else 0,
         # Per-pair rotary frequency divisors; layer 0 is authoritative.
         "rope_freqs": ("blk.0.rope_freqs.weight" in tensors
                        and tensors["blk.0.rope_freqs.weight"][1]),
@@ -512,10 +514,12 @@ class Session:
                 if cfg["qk_norm"]:
                     q = head_rmsnorm(q, heads, self.tensor(p + "attn_q_norm.weight"), cfg["eps"])
                     k = head_rmsnorm(k, kv_heads, self.tensor(p + "attn_k_norm.weight"), cfg["eps"])
-                rope_half(q, hd, heads, self.pos, cfg["rope_dim"], cfg["theta"],
-                          cfg["rope_scale"], cfg["rope_freqs"])
-                rope_half(k, hd, kv_heads, self.pos, cfg["rope_dim"], cfg["theta"],
-                          cfg["rope_scale"], cfg["rope_freqs"])
+                step = cfg["no_rope_step"]
+                if step == 0 or (layer + 1) % step != 0:
+                    rope_half(q, hd, heads, self.pos, cfg["rope_dim"], cfg["theta"],
+                              cfg["rope_scale"], cfg["rope_freqs"])
+                    rope_half(k, hd, kv_heads, self.pos, cfg["rope_dim"], cfg["theta"],
+                              cfg["rope_scale"], cfg["rope_freqs"])
             if TRACE is not None:
                 TRACE["pos"] = self.pos
                 TRACE[f"q.L{layer}"] = list(q)

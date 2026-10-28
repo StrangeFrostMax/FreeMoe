@@ -2254,6 +2254,15 @@ void test_rope_scaling() {
               "a factor of 1 leaves that pair untouched");
     }
     {
+        // SmolLM3's NoPE rule is an architecture property upstream, not metadata.
+        const std::string nope_path = "tests/fixtures/smollm3-nope-shape.gguf";
+        const ModelManifest manifest = build_manifest(parse_gguf_file(nope_path), nope_path);
+        CHECK(manifest.config.architecture == "smollm3", "the smollm3 adapter is selected");
+        CHECK(manifest.config.no_rope_layer_step == 4,
+              "SmolLM3 sets the every-fourth-layer NoPE step");
+        CHECK(manifest.config.layers == 4, "the fixture has enough layers to exercise it");
+    }
+    {
         const std::string freq_path = "tests/fixtures/llama-ropfreqs-shape.gguf";
         const ModelManifest manifest =
             build_manifest(parse_gguf_file(freq_path), freq_path);
@@ -2345,7 +2354,7 @@ void test_architecture_parity() {
                                            "glm4", "qwen2moe", "phi2-layernorm",
                                            "deepseek2-mla", "internlm2", "exaone", "orion",
                                            "gptneox", "stablelm", "llama-yarn", "qwen2-linear",
-                                           "llama-yarn-mscale", "llama-sinks", "llama-ropfreqs"};
+                                           "llama-yarn-mscale", "llama-sinks", "llama-ropfreqs", "smollm3-nope"};
     for (const std::string &slug : slugs) {
         const std::string model = "tests/fixtures/" + slug + "-shape.gguf";
         ArchGolden golden = read_arch_golden("tests/golden/" + slug + "_reference.txt");

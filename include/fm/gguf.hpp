@@ -211,6 +211,10 @@ struct ModelConfig {
     // entries). llama.cpp only stores real data on layer 0 and duplicates it, so
     // one vector serves every layer.
     bool rope_freqs = false;
+    // Every n-th layer skips rotary position entirely (SmolLM3's NoPE layers:
+    // `n_no_rope_layer_step = 4`, i.e. layer 3, 7, …). 0 means "every layer
+    // rotates", which is what all but that family do.
+    uint32_t no_rope_layer_step = 0;
     // Multiplier applied to the token embedding before the first block.
     // gemma uses sqrt(hidden); minicpm uses a fixed 12.0 unless the file says
     // otherwise. 1.0 means "no scaling", so this is off for llama-family.

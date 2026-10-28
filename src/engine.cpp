@@ -830,7 +830,12 @@ std::vector<float> Engine::forward_token(int32_t token, uint64_t position,
             head_norm(q, c.heads, q_scale, "qk_norm.q.L" + std::to_string(layer));
             head_norm(k, c.kv_heads, k_scale, "qk_norm.k.L" + std::to_string(layer));
         }
-        if (!c.mla) rope_half(q, c.heads, k, c.kv_heads, position);
+        // NoPE layers (SmolLM3) skip the rotation entirely: their keys stay as the
+        // projection produced them, and the position information reaches the model
+        // through the layers that do rotate.
+        const bool rotate = c.no_rope_layer_step == 0 ||
+                            (layer + 1) % c.no_rope_layer_step != 0;
+        if (!c.mla && rotate) rope_half(q, c.heads, k, c.kv_heads, position);
 
         size_t current_base = (static_cast<size_t>(layer) * c.context + position) * kv_stride;
         std::memcpy(kv_ + current_base, k.data(), static_cast<size_t>(kv_dim) * sizeof(float));

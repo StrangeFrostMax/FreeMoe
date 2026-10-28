@@ -672,7 +672,7 @@ bool is_llama_family(const std::string &arch) {
         "llama", "qwen2", "qwen3", "smollm", "smollm2", "tinyllama",
         "gemma", "gemma2", "gemma3", "phi3", "minicpm", "qwen3moe", "glm4",
         "qwen2moe", "phi2", "deepseek2", "internlm2", "orion", "exaone", "gptneox",
-        "stablelm",
+        "stablelm", "smollm3",
     };
     return family.count(arch) != 0;
 }
@@ -1022,6 +1022,11 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
                      "must define them");
         cfg.attn_sinks = true;
     }
+    // SmolLM3 interleaves NoPE layers: llama.cpp sets `n_no_rope_layer_step = 4`
+    // for that architecture alone, so the rule is the architecture's, not the
+    // file's. Every fourth layer (1-based) keeps its keys unrotated.
+    if (arch == "smollm3") cfg.no_rope_layer_step = 4;
+
     // Per-pair rotary frequency divisors. Layer 0 carries them; later layers may
     // repeat them, so a file with the vector on layer 0 only is complete.
     if (doc.tensor_by_name.count(layer_name(0, "rope_freqs.weight")) != 0)
