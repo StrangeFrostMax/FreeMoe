@@ -271,6 +271,8 @@ config that pins `avx2`, then re-run `benchmarks/run_repeats.sh`.
 | `docs/ROADMAP_INFERENCE_AND_TRAINING.md:101` | "I0 … missing: separation between container parsing and architecture semantics" | Still true: `src/gguf.cpp` is a 2191-line file mixing container, capability and adapters |
 | `docs/SUPPORTED_MODELS.md:51` | "## Explicitly unsupported: arbitrary Llama, Mixtral, DeepSeek, Qwen, Gemma …" | Scope note exists but is weak; this section describes the *native* adapter only and reads as a global claim |
 | `docs/TEST_MACHINE.md:13` | "AVX-512 disabled for FreeMoe backend tests" | Not enforced (C10) |
+| `docs/ARCHITECTURE.md` module inventory | every file under `src/` is listed | Was **not** true after PR #10: `src/chat_template.cpp` was missing, so `scripts/check_architecture.py` — and therefore `make test` — failed on `main`. Fixed here; `make test` now exits 0. |
+| `docs/ARCHITECTURE.md:53` | `src/tokenizer.cpp` provides "GPT-2 style BPE" | It provides GPT-2 style *piece tables*; the merge algorithm is missing (C1) |
 
 ---
 
