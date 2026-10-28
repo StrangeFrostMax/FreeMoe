@@ -6,10 +6,17 @@
 [PASS] io_scheduler_and_readers
 [PASS] backends_and_gpu_placeholder
 [PASS] zen3_fallback
+[PASS] quant_reference_decode
+[PASS] quant_gemv
+[PASS] quant_model_parity
+[PASS] model_probe
+[PASS] cpu_kernels
+[PASS] generic_inspect_and_roundtrip
+[PASS] sampling_and_detokenize
 [PASS] residency_manager
 [PASS] dense_cpu_reference_and_operation_log
 [PASS] moe_readers_and_cache_sizes
 [PASS] traces_and_replay_inputs
 [PASS] vnpu_reference_backend
 [PASS] soak_sessions
-587 checks, 0 failures
+858 checks, 0 failures

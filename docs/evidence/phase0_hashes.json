@@ -6,14 +6,14 @@
       "output": "docs/evidence/phase0_build.log",
       "source_output": "build/phase0/build.log",
       "exists": true,
-      "sha256": "0fec9ae210b2b7bd530f55d81f8a5a59e033e929655cd32401a81c401f9d328f"
+      "sha256": "13f07709c4cedc9c8e155b95ffb93e8078a463780c6502d15a8dceec031fb9ab"
     },
     {
       "command": "./build/tests",
       "output": "docs/evidence/phase0_unit.log",
       "source_output": "build/phase0/unit.log",
       "exists": true,
-      "sha256": "3b52b198b3d3f0f5d9a8e7b277cd2d93186a6c571c50bb0e0f8281faee3d28af"
+      "sha256": "ab0745cf80c001e9cbe5bec0de4ebddf7a89825bc35b4571ddbe04e9ee04fa73"
     },
     {
       "command": "./build/freemoe inspect tests/fixtures/dense-fm.gguf --json",
@@ -48,7 +48,7 @@
       "output": "docs/evidence/phase0_architecture.json",
       "source_output": "build/phase0/architecture.json",
       "exists": true,
-      "sha256": "3da9caa6758cdc240b5688a68489ee79b7669d6fd89b1f10ad4614414e9b2870"
+      "sha256": "b258780f840c97a88132dcce18147288fcfac29ec53ac885c38dbd50b6818e44"
     },
     {
       "command": "python3 scripts/check_dependencies.py",
@@ -63,6 +63,13 @@
       "source_output": "build/phase0/zen3_fallback.json",
       "exists": true,
       "sha256": "69b967173f722eada794242e2c35b9fda96ec885457f861ce2f53dcf054c7790"
+    },
+    {
+      "command": "./build/freemoe bench --iterations 20 --out build/phase0/bench.json",
+      "output": "docs/evidence/phase0_bench.json",
+      "source_output": "build/phase0/bench.json",
+      "exists": true,
+      "sha256": "e4fe67d56187d56c207a411a9f7e318c078c74d0c625df2fe7c9800c84f23df6"
     }
   ],
   "nondeterministic_evidence": {

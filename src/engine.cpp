@@ -1,4 +1,6 @@
 #include "fm/engine.hpp"
+#include "fm/kernels.hpp"
+#include "fm/quant.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -112,6 +114,7 @@ Engine::Engine(RunConfig config) : config_(std::move(config)) {}
 Engine::~Engine() = default;
 
 void Engine::initialize() {
+    rng_.seed(config_.sampling.seed);
     if (initialized_) return;
     Timer load_timer;
     file_ = std::make_unique<MappedFile>(config_.model_path);
@@ -177,6 +180,15 @@ void Engine::load_fixed_weights() {
                     static_cast<size_t>(tensor.byte_size));
         offset += tensor.byte_size;
     }
+    // Decode any 1-D normalisation vector that is stored in a block format.
+    for (const auto &tensor : manifest_.doc.tensors) {
+        if (tensor.expert_tensor || tensor.type_id == 0) continue;
+        if (tensor.dims.size() != 1) continue;
+        std::vector<float> values(tensor.dims[0]);
+        dequantize_row(tensor.type_id, file_->data() + tensor.absolute_offset,
+                       values.data(), tensor.dims[0]);
+        decoded_norms_.emplace(tensor.name, std::move(values));
+    }
     if (offset != manifest_.fixed_weight_bytes)
         fail(ErrorCode::INTERNAL_ERROR, "fixed weight size accounting mismatch");
     Fence fence = backend_->upload(*weights_buffer_, host_weights.data(), host_weights.size());
@@ -188,11 +200,50 @@ void Engine::load_fixed_weights() {
     trace_->event("weights_uploaded", std::move(fields));
 }
 
+const float *Engine::norm_weights(const std::string &name) const {
+    auto decoded = decoded_norms_.find(name);
+    if (decoded != decoded_norms_.end()) return decoded->second.data();
+    return weights(name);
+}
+
 const float *Engine::weights(const std::string &name) const {
     auto it = weight_offsets_.find(name);
     if (it == weight_offsets_.end())
         fail(ErrorCode::MISSING_REQUIRED_TENSOR, "tensor is not resident in fixed weight buffer: " + name);
     return reinterpret_cast<const float *>(static_cast<const uint8_t *>(weights_buffer_->data) + it->second);
+}
+
+Engine::TensorView Engine::tensor_view(const std::string &name) const {
+    auto it = weight_offsets_.find(name);
+    if (it == weight_offsets_.end())
+        fail(ErrorCode::MISSING_REQUIRED_TENSOR,
+             "tensor is not resident in fixed weight buffer: " + name);
+    const TensorInfo *info = manifest_.tensor(name);
+    if (!info) fail(ErrorCode::MISSING_REQUIRED_TENSOR, "tensor is not in the manifest: " + name);
+    TensorView view;
+    view.data = static_cast<const uint8_t *>(weights_buffer_->data) + it->second;
+    view.type_id = info->type_id;
+    return view;
+}
+
+std::vector<float> Engine::matvec_view(const TensorView &view, const std::vector<float> &x,
+                                       uint32_t out_dim, uint32_t in_dim,
+                                       const std::string &op) {
+    std::vector<float> y(out_dim, 0.0f);
+    if (view.type_id == 0) {
+        backend_->matvec(reinterpret_cast<const float *>(view.data), x.data(), y.data(),
+                         out_dim, in_dim, op);
+    } else {
+        KernelConfig kernels;
+        kernels.requested = config_.backend.kernel_isa;
+        kernels.threads = config_.backend.kernel_threads;
+        gemv_quant(kernels, view.type_id, view.data, x.data(), y.data(), out_dim, in_dim);
+        backend_->record_control(op, in_dim * static_cast<uint64_t>(out_dim) *
+                                          quant_geometry(view.type_id).block_bytes /
+                                          quant_geometry(view.type_id).block_size,
+                                 out_dim * sizeof(float), "cpu-quant");
+    }
+    return y;
 }
 
 std::vector<float> Engine::matvec(const float *w, const std::vector<float> &x,
@@ -265,6 +316,101 @@ void Engine::rope_half(std::vector<float> &q, std::vector<float> &k, uint64_t po
                              (q.size() + k.size()) * sizeof(float));
 }
 
+
+uint32_t Engine::sample(const std::vector<float> &logits) {
+    return sample_from_logits(logits, config_.sampling, rng_);
+}
+
+uint32_t sample_from_logits(const std::vector<float> &logits, const SamplingConfig &sampling,
+                            std::mt19937_64 &rng) {
+    if (logits.empty()) fail(ErrorCode::INVALID_ARGUMENT, "cannot sample from empty logits");
+    if (sampling.greedy()) {
+        // Greedy inside the sampler: highest logit, lowest id on ties.
+        uint32_t best = 0;
+        for (uint32_t i = 1; i < logits.size(); ++i)
+            if (logits[i] > logits[best]) best = i;
+        return best;
+    }
+    const double temperature = sampling.temperature;
+
+    std::vector<std::pair<double, uint32_t>> scored;
+    scored.reserve(logits.size());
+    for (uint32_t i = 0; i < logits.size(); ++i) {
+        const float v = logits[i];
+        if (!std::isfinite(v))
+            fail(ErrorCode::INVALID_ARGUMENT, "non-finite logit during sampling");
+        scored.emplace_back(static_cast<double>(v) / temperature, i);
+    }
+    // Stable ordering: higher score first, lower token id wins ties.
+    std::stable_sort(scored.begin(), scored.end(),
+                     [](const std::pair<double, uint32_t> &a,
+                        const std::pair<double, uint32_t> &b) {
+                         if (a.first != b.first) return a.first > b.first;
+                         return a.second < b.second;
+                     });
+    if (sampling.top_k > 0 && scored.size() > sampling.top_k)
+        scored.resize(sampling.top_k);
+
+    // Softmax over the surviving candidates.
+    const double max_score = scored.empty() ? 0.0 : scored.front().first;
+    double total = 0.0;
+    std::vector<double> probs(scored.size(), 0.0);
+    for (size_t i = 0; i < scored.size(); ++i) {
+        probs[i] = std::exp(scored[i].first - max_score);
+        total += probs[i];
+    }
+    if (!(total > 0.0)) fail(ErrorCode::INTERNAL_ERROR, "sampling probability underflow");
+    for (double &p : probs) p /= total;
+
+    // Nucleus truncation, keeping at least one candidate.
+    if (sampling.top_p > 0.0 && sampling.top_p < 1.0) {
+        double cumulative = 0.0;
+        size_t keep = 0;
+        for (; keep < probs.size(); ++keep) {
+            cumulative += probs[keep];
+            if (cumulative >= sampling.top_p) {
+                ++keep;
+                break;
+            }
+        }
+        keep = std::max<size_t>(1, std::min(keep, probs.size()));
+        scored.resize(keep);
+        probs.resize(keep);
+        total = 0.0;
+        for (double p : probs) total += p;
+        for (double &p : probs) p /= total;
+    }
+
+    std::uniform_real_distribution<double> uniform(0.0, 1.0);
+    const double target = uniform(rng);
+    double cumulative = 0.0;
+    for (size_t i = 0; i < probs.size(); ++i) {
+        cumulative += probs[i];
+        if (target <= cumulative || i + 1 == probs.size()) return scored[i].second;
+    }
+    return scored.back().second;
+}
+
+std::string Engine::detokenize(const std::vector<int32_t> &ids) const {
+    const ModelConfig &c = manifest_.config;
+    std::string out;
+    out.reserve(ids.size());
+    for (int32_t id : ids) {
+        if (id < 0) fail(ErrorCode::INVALID_ARGUMENT, "negative token id in detokenize");
+        if (static_cast<uint32_t>(id) == c.bos_id || static_cast<uint32_t>(id) == c.eos_id)
+            continue;
+        if (static_cast<uint32_t>(id) < 256) {
+            out.push_back(static_cast<char>(id));
+            continue;
+        }
+        // Token ids above the byte range have no text mapping in this
+        // tokenizer; fail rather than emitting a guessed character.
+        fail(ErrorCode::INVALID_TOKENIZER,
+             "token id " + std::to_string(id) + " has no byte mapping");
+    }
+    return out;
+}
+
 std::vector<int32_t> Engine::tokenize(const std::string &prompt) const {
     const ModelConfig &c = manifest_.config;
     if (prompt.empty() || prompt.size() + 2 > c.context)
@@ -314,20 +460,38 @@ std::vector<float> Engine::forward_token(int32_t token, uint64_t position,
     };
 
     std::vector<float> x(c.hidden);
-    const float *embedding = weights("token_embd.weight");
-    std::memcpy(x.data(), embedding + static_cast<size_t>(token) * c.hidden,
-                static_cast<size_t>(c.hidden) * sizeof(float));
+    {
+        // Embedding lookup must respect the stored block type: a quantised
+        // token table cannot be read as raw floats.
+        const TensorView emb = tensor_view("token_embd.weight");
+        if (emb.type_id == 0) {
+            std::memcpy(x.data(),
+                        reinterpret_cast<const float *>(emb.data) +
+                            static_cast<size_t>(token) * c.hidden,
+                        static_cast<size_t>(c.hidden) * sizeof(float));
+        } else {
+            const QuantGeometry &geo = quant_geometry(emb.type_id);
+            if (c.hidden % geo.block_size != 0)
+                fail(ErrorCode::SHAPE_MISMATCH, "embedding row is not whole quantisation blocks");
+            const uint64_t row_bytes = (c.hidden / geo.block_size) * geo.block_bytes;
+            const uint8_t *row = emb.data + static_cast<uint64_t>(token) * row_bytes;
+            for (uint32_t k = 0; k < c.hidden; k += geo.block_size) {
+                const uint32_t block_index = k / geo.block_size;
+                dequantize_block(emb.type_id, row + block_index * geo.block_bytes, x.data() + k);
+            }
+        }
+    }
 
     for (uint32_t layer = 0; layer < c.layers; ++layer) {
         const std::string prefix = "blk." + std::to_string(layer) + ".";
-        std::vector<float> h = rmsnorm(x, weights(prefix + "attn_norm.weight"),
+        std::vector<float> h = rmsnorm(x, norm_weights(prefix + "attn_norm.weight"),
                                        "rmsnorm.attn.L" + std::to_string(layer));
-        std::vector<float> q = matvec(weights(prefix + "attn_q.weight"), h, c.hidden, c.hidden,
-                                      "attn_q.L" + std::to_string(layer));
-        std::vector<float> k = matvec(weights(prefix + "attn_k.weight"), h, c.hidden, c.hidden,
-                                      "attn_k.L" + std::to_string(layer));
-        std::vector<float> v = matvec(weights(prefix + "attn_v.weight"), h, c.hidden, c.hidden,
-                                      "attn_v.L" + std::to_string(layer));
+        std::vector<float> q = matvec_view(tensor_view(prefix + "attn_q.weight"), h, c.hidden,
+                                           c.hidden, "attn_q.L" + std::to_string(layer));
+        std::vector<float> k = matvec_view(tensor_view(prefix + "attn_k.weight"), h, c.hidden,
+                                           c.hidden, "attn_k.L" + std::to_string(layer));
+        std::vector<float> v = matvec_view(tensor_view(prefix + "attn_v.weight"), h, c.hidden,
+                                           c.hidden, "attn_v.L" + std::to_string(layer));
         rope_half(q, k, position);
 
         size_t current_base = (static_cast<size_t>(layer) * c.context + position) * 2 * c.hidden;
@@ -363,27 +527,32 @@ std::vector<float> Engine::forward_token(int32_t token, uint64_t position,
         backend_->record_control("attention.L" + std::to_string(layer),
                                  (position + 1) * c.hidden * 2 * sizeof(float),
                                  c.hidden * sizeof(float));
-        std::vector<float> attn_out = matvec(weights(prefix + "attn_output.weight"), attention,
-                                             c.hidden, c.hidden, "attn_output.L" + std::to_string(layer));
+        std::vector<float> attn_out =
+            matvec_view(tensor_view(prefix + "attn_output.weight"), attention, c.hidden, c.hidden,
+                        "attn_output.L" + std::to_string(layer));
         residual_add(x, attn_out, "residual.attn.L" + std::to_string(layer));
 
-        h = rmsnorm(x, weights(prefix + "ffn_norm.weight"), "rmsnorm.ffn.L" + std::to_string(layer));
+        h = rmsnorm(x, norm_weights(prefix + "ffn_norm.weight"),
+                    "rmsnorm.ffn.L" + std::to_string(layer));
         std::vector<float> ffn(c.hidden, 0.0f);
         if (c.model_kind == "dense") {
-            std::vector<float> gate = matvec(weights(prefix + "ffn_gate.weight"), h,
-                                             c.intermediate, c.hidden, "ffn_gate.L" + std::to_string(layer));
-            std::vector<float> up = matvec(weights(prefix + "ffn_up.weight"), h,
-                                           c.intermediate, c.hidden, "ffn_up.L" + std::to_string(layer));
+            std::vector<float> gate = matvec_view(tensor_view(prefix + "ffn_gate.weight"), h,
+                                                  c.intermediate, c.hidden,
+                                                  "ffn_gate.L" + std::to_string(layer));
+            std::vector<float> up = matvec_view(tensor_view(prefix + "ffn_up.weight"), h,
+                                                c.intermediate, c.hidden,
+                                                "ffn_up.L" + std::to_string(layer));
             std::vector<float> act(c.intermediate);
             for (uint32_t i = 0; i < c.intermediate; ++i) act[i] = silu(gate[i]) * up[i];
             backend_->record_control("swiglu.L" + std::to_string(layer),
                                      (gate.size() + up.size()) * sizeof(float),
                                      act.size() * sizeof(float));
-            ffn = matvec(weights(prefix + "ffn_down.weight"), act,
-                         c.hidden, c.intermediate, "ffn_down.L" + std::to_string(layer));
+            ffn = matvec_view(tensor_view(prefix + "ffn_down.weight"), act, c.hidden,
+                              c.intermediate, "ffn_down.L" + std::to_string(layer));
         } else {
-            std::vector<float> scores = matvec(weights(prefix + "ffn_router.weight"), h,
-                                               c.expert_count, c.hidden, "router.L" + std::to_string(layer));
+            std::vector<float> scores =
+                matvec_view(tensor_view(prefix + "ffn_router.weight"), h, c.expert_count, c.hidden,
+                            "router.L" + std::to_string(layer));
             std::vector<uint32_t> ids = topk(scores, c.expert_top_k);
             std::vector<float> selected_scores(c.expert_top_k);
             for (uint32_t i = 0; i < c.expert_top_k; ++i) selected_scores[i] = scores[ids[i]];
@@ -399,20 +568,34 @@ std::vector<float> Engine::forward_token(int32_t token, uint64_t position,
             for (uint32_t i = 0; i < ids.size(); ++i) {
                 float weight = selected_weights[i];
                 uint32_t expert = ids[i];
+                // Expert payloads keep their stored block type; each projection
+                // is a contiguous slice inside the expert record.
+                const TensorInfo *gate_info = manifest_.tensor(prefix + "ffn_gate_exps.weight");
+                const TensorInfo *up_info = manifest_.tensor(prefix + "ffn_up_exps.weight");
+                const TensorInfo *down_info = manifest_.tensor(prefix + "ffn_down_exps.weight");
+                if (!gate_info || !up_info || !down_info)
+                    fail(ErrorCode::MISSING_REQUIRED_TENSOR, "expert tensors are missing");
+                const uint64_t gate_bytes = gate_info->byte_size / c.expert_count;
+                const uint64_t up_bytes = up_info->byte_size / c.expert_count;
                 residency_->with_expert(layer, expert, position, [&](const float *expert_data) {
-                    std::vector<float> gate = matvec(expert_data, h, c.intermediate, c.hidden,
-                                                      "expert_gate.L" + std::to_string(layer) + ".E" + std::to_string(expert));
-                    std::vector<float> up = matvec(expert_data + static_cast<size_t>(c.intermediate) * c.hidden,
-                                                   h, c.intermediate, c.hidden,
-                                                   "expert_up.L" + std::to_string(layer) + ".E" + std::to_string(expert));
+                    const uint8_t *base = reinterpret_cast<const uint8_t *>(expert_data);
+                    TensorView gate_view{base, gate_info->type_id};
+                    TensorView up_view{base + gate_bytes, up_info->type_id};
+                    TensorView down_view{base + gate_bytes + up_bytes, down_info->type_id};
+                    std::vector<float> gate = matvec_view(
+                        gate_view, h, c.intermediate, c.hidden,
+                        "expert_gate.L" + std::to_string(layer) + ".E" + std::to_string(expert));
+                    std::vector<float> up = matvec_view(
+                        up_view, h, c.intermediate, c.hidden,
+                        "expert_up.L" + std::to_string(layer) + ".E" + std::to_string(expert));
                     std::vector<float> act(c.intermediate);
                     for (uint32_t j = 0; j < c.intermediate; ++j) act[j] = silu(gate[j]) * up[j];
                     backend_->record_control("expert_swiglu.L" + std::to_string(layer),
                                              (gate.size() + up.size()) * sizeof(float),
                                              act.size() * sizeof(float));
-                    std::vector<float> down = matvec(expert_data + 2ull * c.intermediate * c.hidden,
-                                                     act, c.hidden, c.intermediate,
-                                                     "expert_down.L" + std::to_string(layer) + ".E" + std::to_string(expert));
+                    std::vector<float> down = matvec_view(
+                        down_view, act, c.hidden, c.intermediate,
+                        "expert_down.L" + std::to_string(layer) + ".E" + std::to_string(expert));
                     for (uint32_t j = 0; j < c.hidden; ++j) ffn[j] += weight * down[j];
                 });
             }
@@ -424,9 +607,9 @@ std::vector<float> Engine::forward_token(int32_t token, uint64_t position,
         residual_add(x, ffn, "residual.ffn.L" + std::to_string(layer));
     }
 
-    std::vector<float> final_norm = rmsnorm(x, weights("output_norm.weight"), "rmsnorm.final");
-    std::vector<float> logits = matvec(weights("output.weight"), final_norm,
-                                       c.vocab, c.hidden, "output_head");
+    std::vector<float> final_norm = rmsnorm(x, norm_weights("output_norm.weight"), "rmsnorm.final");
+    std::vector<float> logits = matvec_view(tensor_view("output.weight"), final_norm, c.vocab,
+                                            c.hidden, "output_head");
     return logits;
 }
 
@@ -453,9 +636,10 @@ PromptResult Engine::run_prompt(const std::string &prompt, uint32_t generated_to
     Timer decode_timer;
     for (uint32_t i = 0; i < generated_tokens; ++i) {
         Timer step_timer;
-        int32_t token = static_cast<int32_t>(greedy(logits));
+        int32_t token = static_cast<int32_t>(sample(logits));
         result.generated_ids.push_back(token);
-        backend_->record_control("greedy_sampling", logits.size() * sizeof(float), sizeof(int32_t));
+        backend_->record_control(config_.sampling.greedy() ? "greedy_sampling" : "sampled_sampling",
+                                 logits.size() * sizeof(float), sizeof(int32_t));
         logits = forward_token(token, position, "decode", &result.routing);
         ++position;
         result.inter_token_ms.push_back(step_timer.elapsed_ms());

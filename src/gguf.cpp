@@ -1,4 +1,5 @@
 #include "fm/gguf.hpp"
+#include "fm/quant.hpp"
 
 #include <algorithm>
 #include <cerrno>
@@ -360,6 +361,7 @@ GGUFDocument parse_gguf(const uint8_t *data, size_t size) {
                          static_cast<unsigned long long>(i), key.c_str(), type, c.pos);
         if (doc.metadata.count(key))
             fail(ErrorCode::MALFORMED_GGUF, "duplicate metadata key " + key);
+        doc.metadata_order.push_back(key);
         doc.metadata.emplace(std::move(key), std::move(value));
     }
 
@@ -586,8 +588,24 @@ ModelManifest build_manifest(const GGUFDocument &doc, const std::string &source_
         tensor.layer = global_role ? -1 : static_cast<int>(layer);
         if (tensor.role == TensorRole::UNKNOWN)
             fail(ErrorCode::UNKNOWN_TENSOR, "cannot map tensor role for " + tensor.name);
-        if (tensor.type_id != 0)
-            fail(ErrorCode::UNSUPPORTED_QUANTISATION, "adapter supports F32 only: " + tensor.name);
+        // Execution requires a kernel for this type. Parsing alone is never
+        // enough to run a model, so this fails closed with the type named.
+        {
+            const auto &qtable = quantisation_table();
+            auto qit = qtable.find(tensor.type_id);
+            const bool known = qit != qtable.end();
+            const bool k_block = known && quant_is_k_block(tensor.type_id);
+            const bool implemented =
+                known && (tensor.type_id == 0 || tensor.type_id == 1 || tensor.type_id == 30 ||
+                          tensor.type_id == 2 || tensor.type_id == 3 || tensor.type_id == 6 ||
+                          tensor.type_id == 7 || tensor.type_id == 8 || tensor.type_id == 9 ||
+                          k_block);
+            if (!implemented)
+                fail(ErrorCode::UNSUPPORTED_QUANTISATION,
+                     "no execution kernel for tensor type " +
+                         (known ? qit->second.name : std::to_string(tensor.type_id)) +
+                         " in " + tensor.name);
+        }
         tensor.expert_tensor = tensor.role == TensorRole::FFN_GATE_EXPS ||
                                tensor.role == TensorRole::FFN_UP_EXPS ||
                                tensor.role == TensorRole::FFN_DOWN_EXPS;
@@ -632,10 +650,11 @@ ModelManifest build_manifest(const GGUFDocument &doc, const std::string &source_
             uint64_t expert_stride = 0;
             for (int r = 0; r < 3; ++r) {
                 const TensorInfo &tensor = t(layer_name(l, extent_suffixes[r]));
-                uint64_t stride = checked_mul(tensor.dims[0], tensor.dims[1], "expert stride");
-                stride = checked_mul(stride, tensor.block_bytes / tensor.block_size, "expert bytes");
-                if (stride % tensor.block_bytes != 0)
+                uint64_t elements = checked_mul(tensor.dims[0], tensor.dims[1], "expert stride");
+                if (elements % tensor.block_size != 0)
                     fail(ErrorCode::SHAPE_MISMATCH, "expert slice is not whole quantisation blocks");
+                uint64_t stride =
+                    checked_mul(elements / tensor.block_size, tensor.block_bytes, "expert bytes");
                 if (r == 0) expert_stride = stride;
                 else if (stride != expert_stride)
                     fail(ErrorCode::SHAPE_MISMATCH, "expert projections have different byte strides");
@@ -776,6 +795,277 @@ Json inspect_json(const ModelManifest &manifest, const std::string &source_path)
     validation.set("errors", Json::array());
     validation.set("warnings", Json::array());
     out.set("validation", std::move(validation));
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// Tensor type capabilities, dequantisation and generic GGUF inspection
+// ---------------------------------------------------------------------------
+
+namespace {
+const char *value_type_name(GGUFValueType type) {
+    switch (type) {
+    case GGUFValueType::UINT8: return "u8";
+    case GGUFValueType::INT8: return "i8";
+    case GGUFValueType::UINT16: return "u16";
+    case GGUFValueType::INT16: return "i16";
+    case GGUFValueType::UINT32: return "u32";
+    case GGUFValueType::INT32: return "i32";
+    case GGUFValueType::FLOAT32: return "f32";
+    case GGUFValueType::BOOL: return "bool";
+    case GGUFValueType::STRING: return "string";
+    case GGUFValueType::ARRAY: return "array";
+    case GGUFValueType::UINT64: return "u64";
+    case GGUFValueType::INT64: return "i64";
+    case GGUFValueType::FLOAT64: return "f64";
+    }
+    return "unknown";
+}
+} // namespace
+
+TensorCapability tensor_capability(uint32_t type_id) {
+    TensorCapability cap;
+    auto it = quantisation_table().find(type_id);
+    if (it == quantisation_table().end()) {
+        cap.note = "unknown tensor type";
+        return cap;
+    }
+    // Any type whose geometry is known can be bounded and skipped safely.
+    cap.parse = true;
+    switch (type_id) {
+    case 0: // F32
+        cap.dequantize = true;
+        cap.execute = true;
+        cap.note = "native F32 kernel";
+        break;
+    case 1: case 30: // F16, BF16
+    case 2: case 3: case 6: case 7:  // Q4_0, Q4_1, Q5_0, Q5_1
+    case 8: case 9:                  // Q8_0, Q8_1
+    case 10: case 11: case 12: case 13: case 14: case 15: // Q2_K..Q8_K
+        cap.dequantize = true;
+        cap.execute = true;
+        cap.note = "block decoder plus quantised GEMV kernel";
+        break;
+    default:
+        cap.note = "parsed geometry only; block decoder not implemented";
+        break;
+    }
+    return cap;
+}
+
+void dequantize_row(uint32_t type_id, const uint8_t *src, float *dst, uint64_t count) {
+    dequantize_tensor_region(type_id, src, dst, count);
+}
+
+Json generic_inspect_json(const GGUFDocument &doc, const std::string &source_path) {
+    Json out = Json::object();
+    out.set("schema", "freemoe.generic-inspect.v1");
+    out.set("status", "parsed");
+    out.set("source_path", source_path);
+    out.set("file_size", doc.file_size);
+    out.set("gguf_version", static_cast<int64_t>(doc.version));
+    out.set("alignment", static_cast<int64_t>(doc.alignment));
+    out.set("metadata_count", doc.metadata_count);
+    out.set("tensor_count", doc.tensor_count);
+    out.set("data_offset", doc.data_offset);
+    out.set("source_fingerprint", hex64(doc.source_fingerprint));
+
+    // Architecture is reported when present, but its absence is not an error:
+    // this view never requires an adapter.
+    auto arch = doc.metadata.find("general.architecture");
+    out.set("architecture",
+            arch == doc.metadata.end() ? std::string("<none>") : arch->second.display());
+    auto name = doc.metadata.find("general.name");
+    out.set("name", name == doc.metadata.end() ? std::string("<none>") : name->second.display());
+
+    Json metadata = Json::array();
+    for (const std::string &key : doc.metadata_order) {
+        auto it = doc.metadata.find(key);
+        if (it == doc.metadata.end()) continue;
+        Json row = Json::object();
+        row.set("key", key);
+        row.set("type", value_type_name(it->second.type));
+        row.set("value", it->second.display());
+        metadata.push(std::move(row));
+    }
+    out.set("metadata", std::move(metadata));
+
+    Json tensors = Json::array();
+    std::map<std::string, uint64_t> bytes_by_type;
+    uint64_t total_bytes = 0;
+    for (const TensorInfo &tensor : doc.tensors) {
+        Json row = Json::object();
+        row.set("name", tensor.name);
+        Json dims = Json::array();
+        for (uint64_t d : tensor.dims) dims.push(Json::integer(static_cast<int64_t>(d)));
+        row.set("dims", std::move(dims));
+        row.set("type", tensor.type_name);
+        row.set("type_id", static_cast<int64_t>(tensor.type_id));
+        row.set("block_size", static_cast<int64_t>(tensor.block_size));
+        row.set("block_bytes", static_cast<int64_t>(tensor.block_bytes));
+        row.set("byte_size", tensor.byte_size);
+        row.set("absolute_offset", tensor.absolute_offset);
+        TensorCapability cap = tensor_capability(tensor.type_id);
+        row.set("parse", cap.parse);
+        row.set("dequantize", cap.dequantize);
+        row.set("execute", cap.execute);
+        tensors.push(std::move(row));
+        bytes_by_type[tensor.type_name] += tensor.byte_size;
+        total_bytes += tensor.byte_size;
+    }
+    out.set("tensors", std::move(tensors));
+    out.set("tensor_bytes", total_bytes);
+
+    Json by_type = Json::array();
+    for (const auto &entry : bytes_by_type) {
+        Json row = Json::object();
+        row.set("type", entry.first);
+        row.set("bytes", entry.second);
+        by_type.push(std::move(row));
+    }
+    out.set("bytes_by_type", std::move(by_type));
+
+    // Support classification is deliberately conservative: parsing a container
+    // is never reported as architecture or execution support.
+    bool all_executable = !doc.tensors.empty();
+    bool all_dequantizable = !doc.tensors.empty();
+    for (const TensorInfo &tensor : doc.tensors) {
+        TensorCapability cap = tensor_capability(tensor.type_id);
+        all_executable = all_executable && cap.execute;
+        all_dequantizable = all_dequantizable && cap.dequantize;
+    }
+    std::string classification = "inspect-only";
+    if (arch != doc.metadata.end() && arch->second.display() == "freemoe-tiny" && all_executable)
+        classification = "execute-cpu";
+    else if (!doc.tensors.empty() && all_dequantizable && !all_executable)
+        classification = "dequantize-only";
+    out.set("container_support", "parse");
+    out.set("tensor_support", all_executable ? "execute" : (all_dequantizable ? "dequantize" : "parse"));
+    out.set("classification", classification);
+    out.set("adapter_available", arch != doc.metadata.end() &&
+                                    arch->second.display() == "freemoe-tiny");
+    return out;
+}
+
+namespace {
+
+void put_u32(std::vector<uint8_t> &out, uint32_t v) {
+    for (int i = 0; i < 4; ++i) out.push_back(static_cast<uint8_t>((v >> (8 * i)) & 0xFF));
+}
+
+void put_u64(std::vector<uint8_t> &out, uint64_t v) {
+    for (int i = 0; i < 8; ++i) out.push_back(static_cast<uint8_t>((v >> (8 * i)) & 0xFF));
+}
+
+void put_string(std::vector<uint8_t> &out, const std::string &s) {
+    put_u64(out, s.size());
+    out.insert(out.end(), s.begin(), s.end());
+}
+
+void put_value(std::vector<uint8_t> &out, const MetadataValue &value);
+
+void put_array(std::vector<uint8_t> &out, const std::vector<MetadataValue> &items,
+               GGUFValueType element_type) {
+    put_u32(out, static_cast<uint32_t>(element_type));
+    put_u64(out, items.size());
+    for (const MetadataValue &item : items) put_value(out, item);
+}
+
+void put_value(std::vector<uint8_t> &out, const MetadataValue &value) {
+    switch (value.type) {
+    case GGUFValueType::UINT8: out.push_back(static_cast<uint8_t>(value.u)); break;
+    case GGUFValueType::INT8: out.push_back(static_cast<uint8_t>(value.i)); break;
+    case GGUFValueType::UINT16: {
+        uint16_t v = static_cast<uint16_t>(value.u);
+        out.push_back(static_cast<uint8_t>(v & 0xFF));
+        out.push_back(static_cast<uint8_t>((v >> 8) & 0xFF));
+        break;
+    }
+    case GGUFValueType::INT16: {
+        uint16_t v = static_cast<uint16_t>(value.i);
+        out.push_back(static_cast<uint8_t>(v & 0xFF));
+        out.push_back(static_cast<uint8_t>((v >> 8) & 0xFF));
+        break;
+    }
+    case GGUFValueType::UINT32: put_u32(out, static_cast<uint32_t>(value.u)); break;
+    case GGUFValueType::INT32: put_u32(out, static_cast<uint32_t>(value.i)); break;
+    case GGUFValueType::FLOAT32: {
+        float v = static_cast<float>(value.f);
+        uint32_t bits;
+        std::memcpy(&bits, &v, sizeof(bits));
+        put_u32(out, bits);
+        break;
+    }
+    case GGUFValueType::BOOL: out.push_back(value.b ? 1 : 0); break;
+    case GGUFValueType::STRING: put_string(out, value.s); break;
+    case GGUFValueType::ARRAY: put_array(out, value.array, value.element_type); break;
+    case GGUFValueType::UINT64: put_u64(out, value.u); break;
+    case GGUFValueType::INT64: put_u64(out, static_cast<uint64_t>(value.i)); break;
+    case GGUFValueType::FLOAT64: {
+        double v = value.f;
+        uint64_t bits;
+        std::memcpy(&bits, &v, sizeof(bits));
+        put_u64(out, bits);
+        break;
+    }
+    }
+}
+
+} // namespace
+
+std::vector<uint8_t> write_gguf(const GGUFDocument &doc, const uint8_t *source,
+                                size_t source_size) {
+    if (!source) fail(ErrorCode::INVALID_ARGUMENT, "write_gguf requires the source buffer");
+    const uint64_t alignment = doc.alignment ? doc.alignment : 32;
+    if ((alignment & (alignment - 1)) != 0)
+        fail(ErrorCode::INVALID_ARGUMENT, "write_gguf alignment must be a power of two");
+
+    std::vector<uint8_t> out;
+    out.reserve(static_cast<size_t>(doc.file_size) + alignment);
+    out.insert(out.end(), {'G', 'G', 'U', 'F'});
+    put_u32(out, doc.version);
+    put_u64(out, doc.tensor_count);
+    put_u64(out, doc.metadata_count);
+
+    for (const std::string &key : doc.metadata_order) {
+        auto it = doc.metadata.find(key);
+        if (it == doc.metadata.end())
+            fail(ErrorCode::INTERNAL_ERROR, "metadata order references a missing key");
+        put_string(out, key);
+        put_u32(out, static_cast<uint32_t>(it->second.type));
+        put_value(out, it->second);
+    }
+    if (doc.metadata_order.size() != doc.metadata.size())
+        fail(ErrorCode::INTERNAL_ERROR, "metadata order is incomplete");
+
+    // Tensor payloads are laid out from the data section, in directory order.
+    std::vector<uint64_t> relative;
+    uint64_t cursor = 0;
+    for (const TensorInfo &tensor : doc.tensors) {
+        cursor = align_up(cursor, alignment);
+        relative.push_back(cursor);
+        cursor += tensor.byte_size;
+    }
+    for (size_t i = 0; i < doc.tensors.size(); ++i) {
+        const TensorInfo &tensor = doc.tensors[i];
+        put_string(out, tensor.name);
+        put_u32(out, static_cast<uint32_t>(tensor.dims.size()));
+        for (uint64_t d : tensor.dims) put_u64(out, d);
+        put_u32(out, tensor.type_id);
+        put_u64(out, relative[i]);
+    }
+
+    const uint64_t data_offset = align_up(out.size(), alignment);
+    out.resize(static_cast<size_t>(data_offset), 0);
+    for (size_t i = 0; i < doc.tensors.size(); ++i) {
+        const TensorInfo &tensor = doc.tensors[i];
+        if (tensor.absolute_offset + tensor.byte_size > source_size)
+            fail(ErrorCode::SHAPE_MISMATCH, "tensor payload outside the source buffer: " + tensor.name);
+        const size_t at = static_cast<size_t>(data_offset + relative[i]);
+        if (out.size() < at) out.resize(at, 0);
+        out.insert(out.end(), source + tensor.absolute_offset,
+                   source + tensor.absolute_offset + tensor.byte_size);
+    }
     return out;
 }
 

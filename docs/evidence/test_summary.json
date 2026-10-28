@@ -1,11 +1,14 @@
 {
-  "unit_checks": 587,
+  "unit_checks": 858,
   "unit_failures": 0,
   "vendor_selftest_tests": 19,
   "vendor_selftest_failures": 0,
   "make_test_exit_recorded": true,
   "zen3_fallback": true,
   "zen3_fallback_report": "docs/evidence/zen3_fallback.json",
+  "kernel_benchmark": true,
+  "kernel_benchmark_report": "docs/evidence/kernels_bench.json",
+  "resolved_kernel_isa": "avx512",
   "soak_passed": true,
   "fuzz": {
     "iterations": 72000,

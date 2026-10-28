@@ -6,7 +6,7 @@
   "prompts_token_match": 20,
   "prompts_routing_match": 20,
   "max_abs_diff": "0.000000238",
-  "max_rel_diff": "0.000394176",
+  "max_rel_diff": "0.000931352",
   "selected_experts": 22160,
   "experts_executed": 22160,
   "cache_hits": 0,
@@ -21,9 +21,9 @@
   "direct_fallbacks": 0,
   "source_changed_events": 0,
   "live_allocations": 0,
-  "peak_process_ram_bytes": 240529408,
-  "prefill_tokens_per_s": "651.471633",
-  "decode_tokens_per_s": "654.675132",
-  "p95_inter_token_ms": "1.745044",
+  "peak_process_ram_bytes": 240705536,
+  "prefill_tokens_per_s": "649.733836",
+  "decode_tokens_per_s": "644.064832",
+  "p95_inter_token_ms": "1.768016",
   "report_path": "results/final-moe-direct/report.json"
 }

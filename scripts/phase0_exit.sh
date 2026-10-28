@@ -65,6 +65,7 @@ must bash -c 'python3 tools/check_trace.py build/test-tmp/replay-trace.jsonl bui
 must bash -c 'python3 scripts/check_architecture.py > build/phase0/architecture.json'
 must bash -c 'python3 scripts/check_dependencies.py > build/phase0/dependencies.json'
 must bash -c 'python3 scripts/zen3_fallback_check.py > build/phase0/zen3_fallback.log 2>&1'
+must bash -c './build/freemoe bench --iterations 20 --out build/phase0/bench.json > /dev/null'
 
 if ! python3 scripts/collect_evidence.py > build/phase0/collect_evidence.json; then
     echo "FATAL: evidence collection reported a failed gate" >&2

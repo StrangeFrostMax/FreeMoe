@@ -282,13 +282,11 @@ public:
             fail(ErrorCode::DEVICE_LOSS, "injected device loss");
         if (!weights || !x || !y || out_dim == 0 || in_dim == 0)
             fail(ErrorCode::INVALID_ARGUMENT, "invalid matvec arguments");
-        for (uint32_t o = 0; o < out_dim; ++o) {
-            const float *row = weights + static_cast<size_t>(o) * in_dim;
-            float acc = 0.0f;
-            for (uint32_t k = 0; k < in_dim; ++k) acc += row[k] * x[k];
-            y[o] = acc;
-        }
-        record_operation({op_name, "scalar-cpu",
+        KernelConfig kernels;
+        kernels.requested = config_.kernel_isa;
+        kernels.threads = config_.kernel_threads;
+        gemv(kernels, weights, x, y, out_dim, in_dim);
+        record_operation({op_name, std::string("cpu-") + kernel_isa_name(resolved_isa(kernels)),
                           (static_cast<uint64_t>(out_dim) * in_dim + in_dim) * sizeof(float),
                           static_cast<uint64_t>(out_dim) * sizeof(float)});
     }

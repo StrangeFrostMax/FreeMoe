@@ -15,6 +15,7 @@ Status source: `docs/evidence/release_status.json` (generated, not hand-edited).
 | Malformed/fuzz tests pass fail-closed | PASS | `tests/malformed_models/manifest.tsv`, `docs/evidence/test_summary.json`, `docs/evidence/fuzz_72s.json` |
 | Reproducible build/test instructions | PASS | `README.md`, `Makefile`, `CMakeLists.txt`, `docs/PHASE0_EXIT.md` |
 | Zen 3 detection falls back to dual AVX2/FMA3 with visible diagnostics | PASS | `docs/evidence/zen3_fallback.json`, `docs/evidence/zen3_fallback.log`, `docs/BACKEND_SUPPORT.md` |
+| CPU kernels dispatch by ISA and match the scalar oracle | PASS | `docs/evidence/kernels_bench.json`, `docs/KERNELS.md`, `cpu_kernels` unit test |
 
 ## Paged MoE prototype
 

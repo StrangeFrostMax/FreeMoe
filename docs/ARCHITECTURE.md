@@ -41,12 +41,16 @@ CLI / run recorder
 | EXISTS | `include/fm/io.hpp` | Extents, readers, coalescing, bounded async scheduler, I/O metrics. |
 | EXISTS | `include/fm/backend.hpp` | Device buffers, allocation tags/tracker, fences, operation log, backend interface. |
 | EXISTS | `include/fm/residency.hpp` | Slot state machine, budget, replacement, residency manager, prefetch host cache. |
+| EXISTS | `include/fm/kernels.hpp` | CPU kernel dispatch (scalar/AVX2-FMA/AVX-512), persistent worker pool, GEMV benchmark. |
 | EXISTS | `include/fm/engine.hpp` | Run configuration, tokenizer, forward pass, reference comparison, run metrics. |
 | EXISTS | `src/common.cpp` | Error names/exit codes, file identity with sparse content probe, process snapshot, file helpers. |
 | EXISTS | `src/gguf.cpp` | Bounded GGUF v3 parser, strict adapter, golden inspect JSON. |
 | EXISTS | `src/io.cpp` | Buffered/mmap/direct readers, coalescing, async prefetch, source-change detection. |
 | EXISTS | `src/backend.cpp` | Scalar CPU, patched Virtual NPU and explicit GPU placeholder backends. |
 | EXISTS | `src/residency.cpp` | Budget calculator, authoritative state table, safe eviction, checksums, fault handling. |
+| EXISTS | `src/kernels.cpp` | Vectorised GEMV (F32 and block-quantised), runtime ISA resolution with Zen 3 policy, thread pool, kernel benchmark harness. |
+| EXISTS | `src/support.cpp` | Architecture-agnostic support probe: reads any GGUF and reports architecture, hyperparameters, tensor types, tokenizer and every concrete blocker before claiming a model is runnable. |
+| EXISTS | `src/quant.cpp` | Scalar reference block decoders for every supported GGUF tensor type, plus block geometry. The oracle that the vectorised quantised kernels are checked against. |
 | EXISTS | `src/engine.cpp` | Llama-like forward pass, MoE routing/execution, reference comparison and reports. |
 | EXISTS | `src/main.cpp` | `inspect`/`WAKE_UP`, `device-info`, `run`, `compare` and `version` commands. |
 | EXISTS | `tests/unit/tests.cpp` | Unit, malformed-input, integration, correctness and soak tests. |

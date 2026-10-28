@@ -21,9 +21,9 @@
   "direct_fallbacks": 0,
   "source_changed_events": 0,
   "live_allocations": 0,
-  "peak_process_ram_bytes": 240312320,
-  "prefill_tokens_per_s": "424.897689",
-  "decode_tokens_per_s": "418.463716",
-  "p95_inter_token_ms": "2.939812",
+  "peak_process_ram_bytes": 240279552,
+  "prefill_tokens_per_s": "447.442505",
+  "decode_tokens_per_s": "443.774338",
+  "p95_inter_token_ms": "2.670124",
   "report_path": "results/final-moe-vnpu/report.json"
 }

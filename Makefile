@@ -17,6 +17,9 @@ OUR_LIB_SRCS := \
   src/gguf.cpp \
   src/io.cpp \
   src/backend.cpp \
+  src/kernels.cpp \
+  src/quant.cpp \
+  src/support.cpp \
   src/residency.cpp \
   src/engine.cpp
 APP_MAIN := src/main.cpp
@@ -34,7 +37,7 @@ FUZZ_SECONDS ?= 72
 DEPS := $(OUR_OBJS:.o=.d) $(MAIN_OBJ:.o=.d) $(TEST_OBJ:.o=.d) \
         $(VNPU_OBJS:.o=.d) $(SELFTEST_OBJS:.o=.d)
 
-.PHONY: all test zen3-fallback fuzz soak benchmark fixtures clean distclean help
+.PHONY: all test zen3-fallback fuzz soak bench benchmark fixtures clean distclean help
 
 all: $(BUILD)/freemoe
 
@@ -50,7 +53,7 @@ $(BUILD)/vnpu-selftest: $(SELFTEST_OBJS) $(VNPU_OBJS)
 	@mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) $^ -o $@ $(LDFLAGS)
 
-$(BUILD)/fuzz_gguf: $(FUZZ_MAIN) src/common.cpp src/gguf.cpp
+$(BUILD)/fuzz_gguf: $(FUZZ_MAIN) src/common.cpp src/gguf.cpp src/quant.cpp src/kernels.cpp src/backend.cpp $(VNPU_SRCS)
 	@mkdir -p $(dir $@)
 	$(CXX) $(FUZZ_FLAGS) $(CPPFLAGS) $^ -o $@ $(LDFLAGS)
 
@@ -93,6 +96,11 @@ fuzz: $(BUILD)/fuzz_gguf
 
 soak: all
 	bash scripts/soak.sh
+
+bench: all
+	@mkdir -p docs/evidence
+	$(BUILD)/freemoe bench --iterations 20 --out docs/evidence/kernels_bench.json > /dev/null
+	@python3 -c "import json;d=json.load(open('docs/evidence/kernels_bench.json'));print('kernel bench: isa=%s threads=%d rows=%d' % (d['resolved_isa'], d['resolved_threads'], len(d['results'])))"
 
 benchmark: all
 	bash benchmarks/run_repeats.sh configs/benchmark.env

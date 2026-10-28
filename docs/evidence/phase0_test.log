@@ -1,9 +1,9 @@
 g++ -Iinclude -Ithird_party/vnpu/include -Ithird_party/vnpu/src -std=c++17 -O2 -pthread -ffp-contract=fast -Wall -Wextra -Werror -Wno-unused-parameter -Wno-missing-field-initializers -MMD -MP -c tests/unit/tests.cpp -o build/obj/tests.o
-g++ -std=c++17 -O2 -pthread -ffp-contract=fast -Wall -Wextra -Werror -Wno-unused-parameter -Wno-missing-field-initializers -MMD -MP build/obj/freemoe/common.o build/obj/freemoe/gguf.o build/obj/freemoe/io.o build/obj/freemoe/backend.o build/obj/freemoe/residency.o build/obj/freemoe/engine.o build/obj/tests.o build/obj/vnpu/cluster/cluster.o build/obj/vnpu/cluster/net.o build/obj/vnpu/cluster/node.o build/obj/vnpu/compat/compat.o build/obj/vnpu/core/autotune.o build/obj/vnpu/core/backend.o build/obj/vnpu/core/runtime.o build/obj/vnpu/core/scheduler.o build/obj/vnpu/kernels/kernels.o build/obj/vnpu/kernels/llm.o -o build/tests -pthread
+g++ -std=c++17 -O2 -pthread -ffp-contract=fast -Wall -Wextra -Werror -Wno-unused-parameter -Wno-missing-field-initializers -MMD -MP build/obj/freemoe/common.o build/obj/freemoe/gguf.o build/obj/freemoe/io.o build/obj/freemoe/backend.o build/obj/freemoe/kernels.o build/obj/freemoe/quant.o build/obj/freemoe/support.o build/obj/freemoe/residency.o build/obj/freemoe/engine.o build/obj/tests.o build/obj/vnpu/cluster/cluster.o build/obj/vnpu/cluster/net.o build/obj/vnpu/cluster/node.o build/obj/vnpu/compat/compat.o build/obj/vnpu/core/autotune.o build/obj/vnpu/core/backend.o build/obj/vnpu/core/runtime.o build/obj/vnpu/core/scheduler.o build/obj/vnpu/kernels/kernels.o build/obj/vnpu/kernels/llm.o -o build/tests -pthread
 g++ -Iinclude -Ithird_party/vnpu/include -Ithird_party/vnpu/src -std=c++17 -O2 -pthread -ffp-contract=fast -Wall -Wextra -Werror -Wno-unused-parameter -Wno-missing-field-initializers -MMD -MP -c third_party/vnpu/tools/selftest_main.cpp -o build/obj/vnpu-selftest-main.o
 g++ -Iinclude -Ithird_party/vnpu/include -Ithird_party/vnpu/src -std=c++17 -O2 -pthread -ffp-contract=fast -Wall -Wextra -Werror -Wno-unused-parameter -Wno-missing-field-initializers -MMD -MP -c third_party/vnpu/tools/selftest.cpp -o build/obj/vnpu-selftest.o
 g++ -std=c++17 -O2 -pthread -ffp-contract=fast -Wall -Wextra -Werror -Wno-unused-parameter -Wno-missing-field-initializers -MMD -MP build/obj/vnpu-selftest-main.o build/obj/vnpu-selftest.o build/obj/vnpu/cluster/cluster.o build/obj/vnpu/cluster/net.o build/obj/vnpu/cluster/node.o build/obj/vnpu/compat/compat.o build/obj/vnpu/core/autotune.o build/obj/vnpu/core/backend.o build/obj/vnpu/core/runtime.o build/obj/vnpu/core/scheduler.o build/obj/vnpu/kernels/kernels.o build/obj/vnpu/kernels/llm.o -o build/vnpu-selftest -pthread
-g++ -std=c++17 -O1 -g -pthread -fno-omit-frame-pointer -fsanitize=address,undefined -Wall -Wextra -Werror -Iinclude -Ithird_party/vnpu/include -Ithird_party/vnpu/src tests/fuzz_gguf.cpp src/common.cpp src/gguf.cpp -o build/fuzz_gguf -pthread
+g++ -std=c++17 -O1 -g -pthread -fno-omit-frame-pointer -fsanitize=address,undefined -Wall -Wextra -Werror -Iinclude -Ithird_party/vnpu/include -Ithird_party/vnpu/src tests/fuzz_gguf.cpp src/common.cpp src/gguf.cpp src/quant.cpp src/kernels.cpp src/backend.cpp third_party/vnpu/src/cluster/cluster.cpp third_party/vnpu/src/cluster/net.cpp third_party/vnpu/src/cluster/node.cpp third_party/vnpu/src/compat/compat.cpp third_party/vnpu/src/core/autotune.cpp third_party/vnpu/src/core/backend.cpp third_party/vnpu/src/core/runtime.cpp third_party/vnpu/src/core/scheduler.cpp third_party/vnpu/src/kernels/kernels.cpp third_party/vnpu/src/kernels/llm.cpp -o build/fuzz_gguf -pthread
 ./build/tests
 [fallback] explicit_fallback_test executed on scalar CPU (explicit --allow-cpu-fallback)
 [PASS] gguf_parser_and_golden
@@ -13,13 +13,20 @@ g++ -std=c++17 -O1 -g -pthread -fno-omit-frame-pointer -fsanitize=address,undefi
 [PASS] io_scheduler_and_readers
 [PASS] backends_and_gpu_placeholder
 [PASS] zen3_fallback
+[PASS] quant_reference_decode
+[PASS] quant_gemv
+[PASS] quant_model_parity
+[PASS] model_probe
+[PASS] cpu_kernels
+[PASS] generic_inspect_and_roundtrip
+[PASS] sampling_and_detokenize
 [PASS] residency_manager
 [PASS] dense_cpu_reference_and_operation_log
 [PASS] moe_readers_and_cache_sizes
 [PASS] traces_and_replay_inputs
 [PASS] vnpu_reference_backend
 [PASS] soak_sessions
-587 checks, 0 failures
+858 checks, 0 failures
 VNPU_FORCE_ISA=avx2_dual ./build/vnpu-selftest
 Virtual NPU selftest (vnpu 1.0.0)
 ==========================================
@@ -42,7 +49,7 @@ Virtual NPU selftest (vnpu 1.0.0)
 [PASS] rope_inplace
 [PASS] mtp_head
 [PASS] async_events_and_trace
-  autotune: unit=VOODOO tiles=64x64x64 0.061 ms 8.65 GFLOP/s 4.96x scalar
+  autotune: unit=WILDCAT tiles=32x64x64 0.048 ms 10.89 GFLOP/s 5.70x scalar
 [PASS] autotune_small
 [PASS] local_cluster
 [PASS] speculative_step
@@ -122,15 +129,18 @@ python3 tools/check_trace.py build/test-tmp/replay-trace.jsonl build/test-tmp/pr
 python3 scripts/check_architecture.py
 {
   "status": "pass",
-  "exists_rows": 18,
+  "exists_rows": 22,
   "src_files": [
     "src/backend.cpp",
     "src/common.cpp",
     "src/engine.cpp",
     "src/gguf.cpp",
     "src/io.cpp",
+    "src/kernels.cpp",
     "src/main.cpp",
-    "src/residency.cpp"
+    "src/quant.cpp",
+    "src/residency.cpp",
+    "src/support.cpp"
   ],
   "missing_paths": [],
   "src_files_not_listed": []
