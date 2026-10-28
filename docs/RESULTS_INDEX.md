@@ -11,5 +11,14 @@ are retained: do not delete a run directory because its result was bad.
 | `results/final-moe-direct` | pass | 0 | tests/fixtures/moe-fm.gguf | cpu | direct | `report.json` `metrics.json` `trace.jsonl` |
 | `results/final-moe-vnpu` | pass | 0 | tests/fixtures/moe-fm.gguf | vnpu | buffered | `report.json` `metrics.json` `trace.jsonl` |
 
+`benchmarks/run_repeats.sh` writes under `results/benchmark/<run-id>`; those
+rows are recorded here by hand because the generator only walks `results/*/`
+and, on a machine without the historical directories, regenerating would drop
+the rows above.
+
+| Run directory | Status | Exit | Model | Backend | Reader | Artefacts |
+|---|---|---:|---|---|---|---|
+| `results/benchmark/synthetic-moe-buffered` | pass | 0 | tests/fixtures/moe-fm.gguf | cpu (AVX-512) | buffered | 5 × `report.json`, `summary.json`, `protocol.txt` |
+
 All generated run data is ignored by Git. Archive a run deliberately by
 copying its directory and hashes into a release artefact if it must persist.
