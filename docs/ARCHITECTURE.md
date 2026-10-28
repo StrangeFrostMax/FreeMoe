@@ -43,6 +43,7 @@ CLI / run recorder
 | EXISTS | `include/fm/residency.hpp` | Slot state machine, budget, replacement, residency manager, prefetch host cache. |
 | EXISTS | `include/fm/kernels.hpp` | CPU kernel dispatch (scalar/AVX2-FMA/AVX-512), persistent worker pool, GEMV benchmark. |
 | EXISTS | `include/fm/engine.hpp` | Run configuration, tokenizer, forward pass, reference comparison, run metrics. |
+| EXISTS | `include/fm/chat_template.hpp` | Chat template interpreter interface, template registry by name and by architecture, render result. |
 | EXISTS | `src/common.cpp` | Error names/exit codes, file identity with sparse content probe, process snapshot, file helpers. |
 | EXISTS | `src/gguf.cpp` | Bounded GGUF v3 parser, strict adapter, golden inspect JSON. |
 | EXISTS | `src/io.cpp` | Buffered/mmap/direct readers, coalescing, async prefetch, source-change detection. |
@@ -53,6 +54,7 @@ CLI / run recorder
 | EXISTS | `src/support.cpp` | Architecture-agnostic support probe: reads any GGUF and reports architecture, hyperparameters, tensor types, tokenizer and every concrete blocker before claiming a model is runnable. |
 | EXISTS | `src/quant.cpp` | Scalar reference block decoders for every supported GGUF tensor type, plus block geometry. The oracle that the vectorised quantised kernels are checked against. |
 | EXISTS | `src/engine.cpp` | Llama-like forward pass, MoE routing/execution, reference comparison and reports. |
+| EXISTS | `src/chat_template.cpp` | Restricted Jinja interpreter (typed refusal on unsupported constructs), built-in templates selected by architecture name or checkpoint evidence, `messages` to prompt text. |
 | EXISTS | `src/main.cpp` | `inspect`/`WAKE_UP`, `device-info`, `run`, `compare` and `version` commands. |
 | EXISTS | `tests/unit/tests.cpp` | Unit, malformed-input, integration, correctness and soak tests. |
 | EXISTS | `tests/fuzz_gguf.cpp` | Duration-bounded deterministic GGUF mutation fuzz target. |
