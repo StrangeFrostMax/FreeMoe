@@ -6,6 +6,7 @@
 #include "fm/quant.hpp"
 #include "fm/support.hpp"
 #include "fm/tokenizer.hpp"
+#include "fm/unicode.hpp"
 #include "vnpu.h"
 
 #include <algorithm>
@@ -1656,6 +1657,235 @@ void test_tokenizer_real_vocabularies() {
     }
 }
 
+// Byte-level BPE. The merge list is the point: an encoder that ignores it can
+// still round-trip, and still disagree with every other runtime about the ids.
+namespace bpe_fixture {
+
+// A miniature GPT-2 style vocabulary: the 256 byte-alphabet pieces plus a
+// handful of merged pieces, so merges have something to produce.
+inline std::string byte_piece(unsigned char byte) {
+    return fm::unicode::byte_to_utf8(byte);
+}
+
+inline GGUFDocument document(const std::string &pre, bool with_merges = true) {
+    GGUFDocument doc;
+    doc.metadata["tokenizer.ggml.model"] = make_string("gpt2");
+    doc.metadata["tokenizer.ggml.pre"] = make_string(pre);
+
+    MetadataValue tokens;
+    tokens.type = GGUFValueType::ARRAY;
+    // Byte pieces come first so the byte-fallback ids are easy to reason about.
+    std::vector<std::string> pieces;
+    for (int byte = 0; byte < 256; ++byte)
+        pieces.push_back(byte_piece(static_cast<unsigned char>(byte)));
+    // Merged pieces, addressed by name in the checks below.
+    pieces.push_back("ab");   // 256
+    pieces.push_back("bc");   // 257
+    pieces.push_back("the");  // 258
+    pieces.push_back("\xC4\xA0the"); // 259: "\u0120the", space + "the"
+    pieces.push_back("12");   // 260
+    pieces.push_back("'S");   // 261: reachable only through whole-word lookup
+    for (const std::string &piece : pieces) tokens.array.push_back(make_string(piece));
+    doc.metadata["tokenizer.ggml.tokens"] = tokens;
+
+    if (with_merges) {
+        MetadataValue merges;
+        merges.type = GGUFValueType::ARRAY;
+        // Rank order matters: "b c" merges before "a b", so "abc" becomes
+        // "a" + "bc" rather than "ab" + "c". A longest-match encoder gets the
+        // opposite answer, which is what this fixture exists to catch.
+        merges.array.push_back(make_string("b c"));
+        merges.array.push_back(make_string("a b"));
+        merges.array.push_back(make_string("t h"));
+        merges.array.push_back(make_string("th e"));
+        // "\u0120the" (space + "the"). The pair is "\u0120" + "the", not
+        // "\u0120t" + "he": "t h" has a lower rank than any \u0120 merge, so
+        // "the" is already assembled by the time the space is looked at.
+        merges.array.push_back(make_string("\xC4\xA0 the"));
+        merges.array.push_back(make_string("1 2"));
+        doc.metadata["tokenizer.ggml.merges"] = merges;
+    }
+    return doc;
+}
+
+} // namespace bpe_fixture
+
+void test_tokenizer_bpe_merges() {
+    using namespace bpe_fixture;
+    GGUFDocument doc = document("gpt-2");
+    const uint32_t vocab = static_cast<uint32_t>(
+        doc.metadata["tokenizer.ggml.tokens"].array.size());
+    const Tokenizer tokenizer = Tokenizer::from_gguf(doc, vocab);
+
+    CHECK(tokenizer.kind() == Tokenizer::Kind::Bpe, "a gpt2 table is a BPE tokenizer");
+    CHECK(tokenizer.pre_tokenizer() == Tokenizer::PreTokenizer::Gpt2,
+          "the pre-tokenizer name selects the splitting rule");
+    CHECK(tokenizer.complete(), "merges plus a byte alphabet make the BPE tokenizer complete");
+
+    // The regression this whole change exists for: rank order, not length.
+    const std::vector<int32_t> abc = tokenizer.encode("abc", 0, false);
+    CHECK(abc.size() == 2, "abc is two pieces, so the merge order was followed");
+    CHECK(abc[0] == 'a', "the left digit stays a single byte piece");
+    CHECK(abc[1] == 256 + 1, "the rank-0 merge wins: b+c is the second piece");
+    // Longest match would have produced 256 ("ab") + 'c'.
+    CHECK(!(abc[0] == 256), "a longest-match encoder would have picked 'ab' first");
+
+    // A merge chain: t+h then th+e.
+    const std::vector<int32_t> the = tokenizer.encode("the", 0, false);
+    CHECK(the.size() == 1 && the[0] == 258, "chained merges reconstruct the whole word");
+    // The space-attachment rule of the GPT-2 preg: " the" is one word.
+    const std::vector<int32_t> space_the = tokenizer.encode(" the", 0, false);
+    CHECK(space_the.size() == 1 && space_the[0] == 259,
+          "a leading space joins the word, so the space+the piece matches");
+    // Digits are one run under the GPT-2 rule.
+    const std::vector<int32_t> digits = tokenizer.encode("12", 0, false);
+    CHECK(digits.size() == 1 && digits[0] == 260, "digit runs merge under the gpt2 rule");
+    // Decoding reverses the byte alphabet, so text survives the round trip.
+    CHECK(tokenizer.decode(the, UINT32_MAX, UINT32_MAX) == "the",
+          "BPE pieces decode back through the byte alphabet");
+    CHECK(tokenizer.decode(space_the, UINT32_MAX, UINT32_MAX) == " the",
+          "an escaped space decodes as a real space");
+    CHECK(tokenizer.decode(tokenizer.encode("hello world", 0, false), UINT32_MAX, UINT32_MAX) ==
+              "hello world",
+          "unmerged text round-trips byte for byte");
+}
+
+void test_tokenizer_bpe_families() {
+    using namespace bpe_fixture;
+
+    // StarCoder: every digit is its own word, and a space in front of a digit
+    // becomes its own word rather than joining it.
+    {
+        GGUFDocument doc = document("starcoder");
+        const uint32_t vocab = static_cast<uint32_t>(
+            doc.metadata["tokenizer.ggml.tokens"].array.size());
+        const Tokenizer tokenizer = Tokenizer::from_gguf(doc, vocab);
+        CHECK(tokenizer.pre_tokenizer() == Tokenizer::PreTokenizer::Gpt2Digits,
+              "starcoder uses the digit-splitting rule");
+        const std::vector<int32_t> ids = tokenizer.encode("12", 0, false);
+        CHECK(ids.size() == 2 && ids[0] == '1' && ids[1] == '2',
+              "the digit rule splits before any merge can join them");
+    }
+
+    // llama-3: whole-word lookup first (ignore_merges), and an uppercase
+    // contraction is still a contraction.
+    {
+        GGUFDocument doc = document("llama-bpe");
+        const uint32_t vocab = static_cast<uint32_t>(
+            doc.metadata["tokenizer.ggml.tokens"].array.size());
+        const Tokenizer tokenizer = Tokenizer::from_gguf(doc, vocab);
+        CHECK(tokenizer.pre_tokenizer() == Tokenizer::PreTokenizer::Llama3,
+              "llama-bpe selects the llama-3 rule");
+        const std::vector<int32_t> ids = tokenizer.encode("'S", 0, false);
+        CHECK(ids.size() == 1, "a contraction is one word");
+        CHECK(tokenizer.decode(ids, UINT32_MAX, UINT32_MAX) == "'S",
+              "contractions decode exactly");
+    }
+
+    // Unknown and missing pre-tokenizers refuse instead of guessing.
+    {
+        GGUFDocument doc = document("deepseek-llm");
+        const uint32_t vocab = static_cast<uint32_t>(
+            doc.metadata["tokenizer.ggml.tokens"].array.size());
+        const Tokenizer tokenizer = Tokenizer::from_gguf(doc, vocab);
+        CHECK(tokenizer.pre_tokenizer() == Tokenizer::PreTokenizer::Unsupported,
+              "an unimplemented family is reported as such");
+        CHECK(!tokenizer.complete(), "an unimplemented family is not complete");
+        CHECK(throws_code(ErrorCode::NOT_IMPLEMENTED,
+                          [&]() { (void)tokenizer.encode("hi", 0, false); }),
+              "encoding with an unimplemented family refuses by name");
+    }
+    {
+        GGUFDocument doc = document("");
+        const uint32_t vocab = static_cast<uint32_t>(
+            doc.metadata["tokenizer.ggml.tokens"].array.size());
+        const Tokenizer tokenizer = Tokenizer::from_gguf(doc, vocab);
+        CHECK(throws_code(ErrorCode::NOT_IMPLEMENTED,
+                          [&]() { (void)tokenizer.encode("hi", 0, false); }),
+              "a BPE file with no pre-tokenizer is refused, not guessed");
+    }
+    // A missing merge list is still refused, and for its own reason.
+    {
+        GGUFDocument doc = document("gpt-2", /*with_merges=*/false);
+        const uint32_t vocab = static_cast<uint32_t>(
+            doc.metadata["tokenizer.ggml.tokens"].array.size());
+        const Tokenizer tokenizer = Tokenizer::from_gguf(doc, vocab);
+        CHECK(throws_code(ErrorCode::NOT_IMPLEMENTED,
+                          [&]() { (void)tokenizer.encode("hi", 0, false); }),
+              "BPE without merges refuses");
+    }
+
+    // The probe has to say the same thing before a run is attempted, so a
+    // checkpoint with an unknown splitting rule is never reported runnable.
+    {
+        GGUFDocument doc = document("deepseek-llm");
+        doc.metadata["general.architecture"] = make_string("gpt2");
+        const Json probe = probe_model(doc, "synthetic.gguf");
+        CHECK(probe.dump().find("TOKENIZER_PRE_NOT_IMPLEMENTED") != std::string::npos,
+              "the probe blocks an unimplemented pre-tokenizer by name");
+    }
+    {
+        GGUFDocument doc = document("");
+        doc.metadata["general.architecture"] = make_string("gpt2");
+        const Json probe = probe_model(doc, "synthetic.gguf");
+        CHECK(probe.dump().find("TOKENIZER_NO_PRE") != std::string::npos,
+              "the probe blocks a BPE file that does not say how to split words");
+    }
+}
+
+// The Unicode classes drive word boundaries, so they are checked directly. A
+// wrong class silently changes token ids, which no round-trip test can catch.
+void test_unicode_classes() {
+    using namespace fm::unicode;
+    const struct {
+        uint32_t cpt;
+        uint32_t expected;
+        const char *what;
+    } cases[] = {
+        {'A', kLetter, "ASCII letter"},
+        {'z', kLetter, "ASCII letter"},
+        {0x00E9, kLetter, "Latin-1 letter (e acute)"},
+        {0x1EC7, kLetter, "Vietnamese letter (e circumflex dot below)"},
+        {0x4E2D, kLetter, "CJK ideograph"},
+        {0x0645, kLetter, "Arabic letter"},
+        {'0', kNumber, "ASCII digit"},
+        {0x00BD, kNumber, "vulgar fraction is a number (No)"},
+        {0x0663, kNumber, "Arabic-Indic digit"},
+        {' ', kSpace, "space"},
+        {'\n', kSpace, "newline"},
+        {0x3000, kSpace, "ideographic space"},
+        {0x00A0, kSpace, "no-break space"},
+        {'!', kPunctuation, "ASCII punctuation"},
+        {'$', kSymbol, "ASCII symbol"},
+        {0x1F680, kSymbol, "emoji is a symbol, not a letter"},
+        {0x0301, kMark, "combining acute is a mark"},
+    };
+    for (const auto &c : cases) {
+        const uint32_t got = classes(c.cpt);
+        CHECK((got & c.expected) != 0, c.what);
+    }
+    CHECK(!is_letter(0x1F680), "an emoji is not a letter, so it cannot join a word");
+    CHECK(!is_number(UINT32_MAX), "out-of-range code points classify as nothing");
+
+    // UTF-8: every code point round-trips, and an invalid byte becomes U+FFFD
+    // rather than silently shifting the rest of the text.
+    for (uint32_t cpt : {0x41u, 0xE9u, 0x1EC7u, 0x4E2Du, 0x1F680u}) {
+        const std::vector<uint32_t> back = from_utf8(to_utf8(cpt));
+        CHECK(back.size() == 1 && back[0] == cpt, "UTF-8 round-trips");
+    }
+    const std::vector<uint32_t> broken = from_utf8(std::string("a\xFF" "b"));
+    CHECK(broken.size() == 3 && broken[1] == 0xFFFD, "an invalid byte becomes U+FFFD");
+
+    // The byte alphabet is a bijection over all 256 bytes, which is what makes
+    // byte-level fallback total.
+    for (int byte = 0; byte < 256; ++byte) {
+        const std::vector<uint32_t> cpts = from_utf8(byte_to_utf8(static_cast<unsigned char>(byte)));
+        CHECK(cpts.size() == 1, "each byte maps to exactly one code point");
+        if (cpts.size() == 1)
+            CHECK(utf8_to_byte(cpts[0]) == byte, "the byte alphabet reverses exactly");
+    }
+}
+
 // The canonical model map is what makes paging decisions auditable: every
 // tensor must report a source byte range that lies inside the data section and
 // a pageability answer consistent with its quantisation geometry.
@@ -2348,6 +2578,9 @@ int main(int argc, char **argv) {
     maybe_run("traces_and_replay_inputs", test_traces_and_replay_inputs);
     maybe_run("vnpu_reference_backend", test_vnpu_reference_backend);
     maybe_run("tokenizer_real_vocabularies", test_tokenizer_real_vocabularies);
+    maybe_run("tokenizer_bpe_merges", test_tokenizer_bpe_merges);
+    maybe_run("tokenizer_bpe_families", test_tokenizer_bpe_families);
+    maybe_run("unicode_classes", test_unicode_classes);
     maybe_run("model_map_and_tied_output", test_model_map_and_tied_output);
     maybe_run("architecture_parity", test_architecture_parity);
     maybe_run("rotated_and_ternary_blockers", test_rotated_and_ternary_blockers);

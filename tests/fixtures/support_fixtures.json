@@ -4,13 +4,13 @@
   "synthetic": true,
   "outputs": {
     "llama-shape-q8_0.gguf": {
-      "sha256": "a4cfaf95f3ee785b3303d918704fd531e5e3c7963fb316e230bc63271af14e77",
-      "bytes": 50048,
+      "sha256": "402a65e5eb237208e38ed5941d7823e8500c383f289864219bece7c82f16176a",
+      "bytes": 50112,
       "purpose": "GQA + BPE tokenizer + Q8_0 blockers"
     },
     "llama-shape-f32.gguf": {
-      "sha256": "62608b66c30eac1b8e2859278adf1065282780cf40ef7cf23209888473c9bebc",
-      "bytes": 176384,
+      "sha256": "7f53b516987eb50f1e252d7590f2bc2dcb0aae3c6865a64f669d0326033769ac",
+      "bytes": 176448,
       "purpose": "architecture-only blocker set"
     }
   },

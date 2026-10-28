@@ -124,7 +124,9 @@ void print_usage() {
         "      NAME = chatml|llama2|llama3|gemma|phi3|deepseek2|zephyr|vicuna|raw\n"
         "  --no-generation-prompt --render-only --dump-prompt PATH\n"
         "\n"
-        "  freemoe probe --model FILE [FILE ...]  report what this build can do with a model\n";
+        "  freemoe probe --model FILE [FILE ...]  report what this build can do with a model\n"
+        "  freemoe tokenize --model FILE (--text TEXT | --prompt-file PATH) [--json]\n"
+        "      Encode text with the checkpoint's tokenizer and print the ids.\n";
 }
 
 std::string model_path(const Args &args) {
@@ -503,6 +505,41 @@ Json kernel_bench_json(uint32_t iterations) {
     return out;
 }
 
+// Tokenising without loading a model is what makes tokenizer parity testable:
+// llama.cpp ships vocab-only GGUFs with expected token ids, and comparing
+// against those is the only way to know this build segments text the same way
+// the reference does.
+int command_tokenize(const Args &args) {
+    const std::string path = model_path(args);
+    std::string text;
+    if (args.has("text")) text = args.get("text", "");
+    else if (args.has("prompt-file")) text = fm::read_text_file(args.get("prompt-file", ""));
+    else if (args.has("prompt")) text = args.get("prompt", "");
+    else fm::fail(fm::ErrorCode::INVALID_ARGUMENT, "tokenize needs --text or --prompt-file");
+
+    auto doc = fm::parse_gguf_file(path);
+    auto tokens = doc.metadata.find("tokenizer.ggml.tokens");
+    if (tokens == doc.metadata.end() || !tokens->second.is_array())
+        fm::fail(fm::ErrorCode::INVALID_TOKENIZER, "the file carries no token table");
+    const uint32_t vocab = static_cast<uint32_t>(tokens->second.array.size());
+    const fm::Tokenizer tokenizer = fm::Tokenizer::from_gguf(doc, vocab);
+    const std::vector<int32_t> ids = tokenizer.encode(text, 0, /*add_bos=*/false);
+    const std::string round_trip = tokenizer.decode(ids, UINT32_MAX, UINT32_MAX);
+
+    Json out = fm::Json::object();
+    out.set("status", "tokenized");
+    out.set("source_path", path);
+    out.set("kind", tokenizer.kind_name());
+    out.set("pre_tokenizer", tokenizer.pre_tokenizer_name());
+    out.set("pre_tokenizer_family", tokenizer.pre_tokenizer_family());
+    Json id_array = fm::Json::array();
+    for (int32_t id : ids) id_array.push(fm::Json::integer(id));
+    out.set("ids", std::move(id_array));
+    out.set("decoded", round_trip);
+    std::cout << out.dump() << "\n";
+    return 0;
+}
+
 int command_probe(const Args &args) {
     std::vector<std::string> paths;
     if (args.has("model")) paths.push_back(args.get("model"));
@@ -616,6 +653,7 @@ int main(int argc, char **argv) {
         }
         if (command == "compare") return command_compare(args);
         if (command == "bench") return command_bench(args);
+        if (command == "tokenize") return command_tokenize(args);
         if (command == "probe" || command == "support") return command_probe(args);
         if (command == "version") {
             std::cout << "FreeMoe 0.1.0 correctness prototype\n";

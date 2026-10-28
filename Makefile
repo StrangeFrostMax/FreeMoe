@@ -21,6 +21,7 @@ OUR_LIB_SRCS := \
   src/quant.cpp \
   src/support.cpp \
   src/tokenizer.cpp \
+  src/unicode.cpp \
   src/chat_template.cpp \
   src/residency.cpp \
   src/engine.cpp
@@ -88,6 +89,7 @@ test: all $(BUILD)/tests $(BUILD)/vnpu-selftest $(BUILD)/fuzz_gguf
 	python3 tools/check_trace.py $(BUILD)/test-tmp/replay-trace.jsonl $(BUILD)/test-tmp/prefetch-trace.jsonl $(BUILD)/test-tmp/cachehit-trace.jsonl
 	python3 scripts/check_architecture.py
 	python3 scripts/check_dependencies.py
+	python3 tools/gen_unicode_tables.py --check
 
 zen3-fallback: all $(BUILD)/tests $(BUILD)/vnpu-selftest
 	python3 scripts/zen3_fallback_check.py

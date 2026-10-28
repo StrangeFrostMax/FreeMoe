@@ -521,8 +521,12 @@ GGUFDocument parse_gguf(const uint8_t *data, size_t size) {
         doc.tensors.push_back(std::move(t));
     }
     doc.data_offset = align_up(c.pos, alignment);
-    if (doc.data_offset > size)
+    if (!doc.tensors.empty() && doc.data_offset > size)
         fail(ErrorCode::MALFORMED_GGUF, "data section starts beyond file end");
+    // A tokenizer-only file has no tensors, so its (empty) data section may be
+    // padding past the end of the file. Nothing can read from it, and llama.cpp
+    // ships its vocabularies in exactly this form.
+    if (doc.tensors.empty() && doc.data_offset > size) doc.data_offset = size;
 
     // Recover byte ranges for tensors whose type has no geometry. Offsets are
     // the only trustworthy source: they are authoritative in the container, so

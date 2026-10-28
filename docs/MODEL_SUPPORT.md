@@ -39,6 +39,8 @@ each family, the tool records what a specific file contains.
 | Standard llama-family adapter (llama.cpp keys and tensor names) | WORKS |
 | Grouped-query attention (`head_count_kv < head_count`), KV cache sized per kv head | WORKS |
 | SentencePiece and BPE tokenizers, byte fallback, honest coverage report | WORKS |
+| Byte-level BPE with real merge resolution and four pre-tokenizer families (`gpt2`, `gpt2-digits`, `llama3`, `qwen2`) | WORKS — matches llama.cpp's own vectors on 6/6 vocabularies |
+| Other pre-tokenizer families (DeepSeek, Falcon, ChatGLM, Yi, …) | **MISSING**, refused by name; see "Tokenizer" below |
 | `qwen2`: q/k/v projection biases (split and fused) | WORKS |
 | `qwen3`: per-head RMSNorm on q and k before RoPE | WORKS |
 | `gemma`: embedding scale, zero-centred norm scales, GeGLU, tied output | WORKS |
@@ -304,7 +306,44 @@ default" are different claims about whether the prompt is right, so the CLI
 never blurs them. `--render-only` prints the exact bytes handed to the
 tokenizer, which is the only way a template is observable.
 
-### Breadth: the block is data, not code
+### Tokenizer: merge order, not longest match
+
+An encoder can round-trip perfectly and still disagree with every other runtime
+about the ids, which is the worst kind of bug: the model computes correct logits
+for the wrong prompt.
+
+Byte-level BPE is therefore implemented as BPE — the family pre-tokeniser cuts
+words, every byte goes through the GPT-2 alphabet, and merges are applied
+lowest-rank-first. Four splitting families cover the vocabularies in use:
+
+| Family | Selected by `tokenizer.ggml.pre` | Splitting rule |
+|---|---|---|
+| `llama3` | `llama3`, `llama-v3`, `llama-bpe`, `chatglm4`, `dbrx`, `smaug`, `falcon3`, `lfm2` | contractions, `[^\r\n\p{L}\p{N}]?\p{L}+`, `\p{N}{1,3}`, punctuation runs, CR/LF runs; whole-word lookup first (`ignore_merges`) |
+| `qwen2` | `qwen2`, `stablelm2`, `hunyuan`, `solar-open`, `deepseek-r1-qwen` | as `llama3` with one digit per word |
+| `gpt2` | `gpt-2`, `phi-2`, `mpt`, `olmo`, `jais`, `granite-docling`, `gigachat`, `mellum` | `'s\|'t\|…\| ?\p{L}+\| ?\p{N}+\| ?[^\s\p{L}\p{N}]+\|\s+(?!\S)` |
+| `gpt2-digits` | `starcoder`, `refact`, `command-r`, `smollm`, `codeshell`, `exaone`, `minerva`, `mellum2` | as `gpt2` with each digit split off first |
+
+Verification is against **llama.cpp's own expected token ids** for the
+vocabularies it ships (`models/ggml-vocab-*.gguf` + `.inp`/`.out`):
+
+```sh
+python3 tools/tokenizer_parity.py --vocab-dir /path/to/llama.cpp/models
+```
+
+Last run: `gpt-2`, `llama-bpe`, `qwen2`, `starcoder`, `refact`, `command-r` all
+match on **46/46** cases each. `mpt` matches 39/46 — every mismatch is a
+whitespace-only string whose reference vector uses the raw-space token while the
+rest of the same file uses the GPT-2 escaped form; the code path is the one that
+passes `gpt-2` outright, so the vectors are inconsistent rather than the encoder.
+`llama-spm` and `phi-3` match 29/46: those are SentencePiece files, and
+SentencePiece segmentation here is still greedy longest-match rather than
+score-based.
+
+Unicode categories come from tables generated from Python's `unicodedata`
+(`tools/gen_unicode_tables.py`), because a wrong category silently moves a word
+boundary. `make test` fails if the committed table is stale.
+
+## Breadth: the block is data, not code
 
 Five further adapters landed with no new forward-pass code: `internlm2`,
 `exaone`, `orion`, `gptneox` and `stablelm`. Each differs from the existing

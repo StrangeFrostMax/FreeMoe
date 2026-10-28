@@ -17,6 +17,7 @@
 
 #include "fm/support.hpp"
 #include "fm/quant.hpp"
+#include "fm/tokenizer.hpp"
 
 #include <algorithm>
 #include <map>
@@ -295,6 +296,22 @@ Json probe_model(const GGUFDocument &doc, const std::string &source_path) {
     } else if ((tokenizer_model == "gpt2" || tokenizer_model == "bpe") && merges == nullptr) {
         block("TOKENIZER_NO_MERGES",
               "a BPE tokenizer without its merge list cannot segment text");
+    } else if (tokenizer_model == "gpt2" || tokenizer_model == "bpe") {
+        // Without a pre-tokeniser the word boundaries are unknown, and guessing
+        // them produces different token ids on ordinary text.
+        const MetadataValue *pre = find(doc, "tokenizer.ggml.pre");
+        const std::string pre_name =
+            (pre && pre->type == GGUFValueType::STRING) ? pre->s : std::string();
+        const Tokenizer::PreTokenizer family = Tokenizer::pre_tokenizer_from_name(pre_name);
+        if (family == Tokenizer::PreTokenizer::Unspecified) {
+            block("TOKENIZER_NO_PRE",
+                  "the file carries no tokenizer.ggml.pre, so its word-splitting rule is unknown");
+        } else if (family == Tokenizer::PreTokenizer::Unsupported) {
+            block("TOKENIZER_PRE_NOT_IMPLEMENTED",
+                  "pre-tokenizer '" + pre_name +
+                      "' is not implemented; implemented families are gpt2, gpt2-digits, "
+                      "llama3 and qwen2");
+        }
     }
     // Grouped-query attention is implemented, so it is reported as a capability
     // rather than as a blocker.
