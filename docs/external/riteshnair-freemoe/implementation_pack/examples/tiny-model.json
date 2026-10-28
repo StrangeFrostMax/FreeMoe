@@ -1,0 +1,79 @@
+{
+  "schema_version": "0.1",
+  "model_id": "freemoe-tiny-linear-v0",
+  "architecture": {
+    "family": "tiny_linear_regression",
+    "inputs": [
+      "x"
+    ],
+    "outputs": [
+      "y_hat"
+    ],
+    "config": {
+      "input_features": 1,
+      "output_features": 1
+    }
+  },
+  "tensors": [
+    {
+      "id": "weight",
+      "name": "linear.weight",
+      "shape": [
+        1,
+        1
+      ],
+      "dtype": "F32",
+      "trainable": true,
+      "initialisation": "constant_zero"
+    },
+    {
+      "id": "bias",
+      "name": "linear.bias",
+      "shape": [
+        1
+      ],
+      "dtype": "F32",
+      "trainable": true,
+      "initialisation": "constant_zero"
+    }
+  ],
+  "operations": [
+    {
+      "id": "linear_0",
+      "op": "linear",
+      "inputs": [
+        "x",
+        "weight",
+        "bias"
+      ],
+      "outputs": [
+        "y_hat"
+      ],
+      "attributes": {
+        "in_features": 1,
+        "out_features": 1
+      }
+    },
+    {
+      "id": "loss_0",
+      "op": "mse_loss",
+      "inputs": [
+        "y_hat",
+        "target"
+      ],
+      "outputs": [
+        "loss"
+      ],
+      "attributes": {}
+    }
+  ],
+  "training": {
+    "optimizer": "sgd",
+    "learning_rate": 0.01,
+    "batch_size": 1,
+    "seed": 1234
+  },
+  "metadata": {
+    "purpose": "illustrative schema fixture only; not a complete trainer"
+  }
+}

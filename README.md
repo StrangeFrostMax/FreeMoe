@@ -368,6 +368,7 @@ Common failures:
 - `docs/TEST_MACHINE.md` — D1 machine record and unknowns.
 - `docs/DECISIONS.md` — D1–D9 decision log.
 - `docs/RESULTS_INDEX.md` — generated run index, including failed runs.
+- `docs/EXTERNAL_DOCS_ANALYSIS.md` — analysis of externally supplied planning docs; extracted copies live in `docs/external/riteshnair-freemoe/`.
 - `docs/PHASE0_EXIT.md`, `docs/M1_EXIT.md`, `docs/MOE_M3_EXIT.md`,
   `docs/RELEASE_CHECKLIST.md` — generated phase gates and release criteria.
 
