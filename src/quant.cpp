@@ -350,6 +350,67 @@ void dequantize_block(uint32_t type_id, const uint8_t *src, float *dst) {
         dst[0] = static_cast<float>(v);
         return;
     }
+    case 34: { // TQ1_0: base-3 packed trits, 256 elements, fp16 scale last
+        // A byte holds five trits (3^5 = 243 < 256). Multiplication by a power
+        // of three modulo 256 moves a chosen trit into the top of the byte,
+        // where (q * 3) >> 8 recovers it. The layout is not uniform: the first
+        // 160 elements come from qs[0..31], the next 80 from qs[32..47], and the
+        // last 16 from qh.
+        const float d = fp16_to_fp32(read_u16(src + 52));
+        const uint8_t pow3[5] = {1, 3, 9, 27, 81};
+        const uint8_t *qs = src;
+        const uint8_t *qh = src + 48;
+        int out = 0;
+        auto emit = [&](uint8_t byte, uint8_t power) {
+            // The multiply is on uint8_t, so it wraps modulo 256 by design.
+            const uint8_t q = static_cast<uint8_t>(byte * power);
+            const int trit = (static_cast<uint16_t>(q) * 3) >> 8;
+            dst[out++] = static_cast<float>(trit - 1) * d;
+        };
+        for (size_t n = 0; n < 5; ++n)
+            for (size_t m = 0; m < 32; ++m) emit(qs[m], pow3[n]);
+        for (size_t n = 0; n < 5; ++n)
+            for (size_t m = 0; m < 16; ++m) emit(qs[32 + m], pow3[n]);
+        for (size_t n = 0; n < 4; ++n)
+            for (size_t h = 0; h < 4; ++h) emit(qh[h], pow3[n]);
+        return;
+    }
+    case 35: { // TQ2_0: two-bit trits, 256 elements, fp16 scale last
+        const float d = fp16_to_fp32(read_u16(src + 64));
+        const uint8_t *qs = src;
+        int out = 0;
+        for (size_t j = 0; j < 64; j += 32)
+            for (size_t l = 0; l < 4; ++l)
+                for (size_t m = 0; m < 32; ++m) {
+                    const int q = (qs[j + m] >> (l * 2)) & 3;
+                    dst[out++] = static_cast<float>(q - 1) * d;
+                }
+        return;
+    }
+    case 41: { // Q1_0: one sign bit per weight, 128 elements, fp16 scale first
+        const float d = fp16_to_fp32(read_u16(src));
+        const uint8_t *qs = src + 2;
+        for (int j = 0; j < 128; ++j) {
+            const uint8_t bit = (qs[j / 8] >> (j % 8)) & 1;
+            dst[j] = bit ? d : -d;
+        }
+        return;
+    }
+    case 42: { // Q2_0: two-bit codes, 64 elements, fp16 scale first
+        const float d = fp16_to_fp32(read_u16(src));
+        const uint8_t *qs = src + 2;
+        // 00=-1, 01=0, 10=+1, 11=+2
+        for (int j = 0; j < 64; ++j)
+            dst[j] = static_cast<float>(((qs[j / 4] >> ((j % 4) * 2)) & 3) - 1) * d;
+        return;
+    }
+    case 142: { // PQ2_0: the Q2_0 codec at group size 128
+        const float d = fp16_to_fp32(read_u16(src));
+        const uint8_t *qs = src + 2;
+        for (int j = 0; j < 128; ++j)
+            dst[j] = static_cast<float>(((qs[j / 4] >> ((j % 4) * 2)) & 3) - 1) * d;
+        return;
+    }
     case 15: { // Q8_K
         const float d = read_f32(src);
         const int8_t *qs = reinterpret_cast<const int8_t *>(src + 4);

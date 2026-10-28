@@ -76,6 +76,19 @@ const std::map<uint32_t, QuantGeometry> &quantisation_table() {
         {27, {1, 8, "I64"}},
         {28, {1, 8, "F64"}},
         {30, {1, 2, "BF16"}},
+        // Ternary family. Sizes follow the published block layouts:
+        //   34 TQ1_0  2 + 256/64 + (256 - 4*256/64)/5 = 54 bytes / 256
+        //   35 TQ2_0  2 + 256/4                      = 66 bytes / 256
+        //   41 Q1_0   2 + 128/8                      = 18 bytes / 128
+        //   42 Q2_0   2 +  64/4                      = 18 bytes /  64
+        //  142 PQ2_0  2 + 128/4                      = 34 bytes / 128
+        //  143 PTQ1_0 2 + 128/64 + (128 - 4*128/64)/5 = 28 bytes / 128
+        {34, {256, 54, "TQ1_0"}},
+        {35, {256, 66, "TQ2_0"}},
+        {41, {128, 18, "Q1_0"}},
+        {42, {64, 18, "Q2_0"}},
+        {142, {128, 34, "PQ2_0"}},
+        {143, {128, 28, "PTQ1_0"}},
     };
     return table;
 }
@@ -1531,6 +1544,21 @@ TensorCapability tensor_capability(uint32_t type_id) {
         cap.dequantize = true;
         cap.execute = true;
         cap.note = "integer/float element type, widened on read";
+        break;
+    case 34: case 35: case 41: case 42: case 142: // TQ1_0, TQ2_0, Q1_0, Q2_0, PQ2_0
+        cap.dequantize = true;
+        cap.execute = true;
+        cap.note = "ternary/low-bit block decoder plus quantised GEMV kernel";
+        break;
+    case 143: // PTQ1_0
+        // The layout is parsed so the file can be inspected and its expert
+        // ranges computed, but the element order is not decoded. PrismML's CPU
+        // reference and their Vulkan shader disagree about how many elements a
+        // 128-wide block holds, so any decoder written today would be a guess.
+        cap.dequantize = false;
+        cap.execute = false;
+        cap.note = "geometry only: the element layout is not verifiable from the "
+                   "published sources, so it is not decoded";
         break;
     default:
         cap.note = "parsed geometry only; block decoder not implemented";

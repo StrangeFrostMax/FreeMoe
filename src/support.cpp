@@ -292,6 +292,43 @@ Json probe_model(const GGUFDocument &doc, const std::string &source_path) {
         has_expert_tensors = has_expert_tensors || tensor.name.find("_exps") != std::string::npos;
     if (has_expert_tensors && !has_adapter)
         block("EXPERT_TENSORS", "expert tensors are present but their layout is not mapped");
+    // --- ternary family -----------------------------------------------------
+    // PrismML's Bonsai 2 checkpoint stores its weights in a *rotated basis*: each
+    // matrix is transformed by a blockwise Hadamard rotation before the ternary
+    // assignment, and the runtime must apply the matching transform to
+    // activations. Without it the weights decode to plausible-looking numbers
+    // and the model emits garbage, so this is a hard blocker rather than a
+    // warning. The checkpoint declares the rotation, which makes it checkable.
+    {
+        bool rotated = false;
+        bool linear_attention = false;
+        bool ternary = false;
+        for (const auto &key : doc.metadata)
+            if (key.first.rfind("prism.hadamard.", 0) == 0) rotated = true;
+        for (const auto &tensor : doc.tensors) {
+            const std::string &name = tensor.name;
+            if (name.rfind("ssm_", 0) == 0 || name.find(".ssm_") != std::string::npos ||
+                name.find("conv1d") != std::string::npos)
+                linear_attention = true;
+            if (tensor.type_id == 34 || tensor.type_id == 35 || tensor.type_id == 41 ||
+                tensor.type_id == 42 || tensor.type_id == 142 || tensor.type_id == 143)
+                ternary = true;
+        }
+        out.set("rotated_weight_basis", rotated);
+        out.set("linear_attention", linear_attention);
+        out.set("ternary_weights", ternary);
+        if (rotated)
+            block("ROTATED_WEIGHT_BASIS",
+                  "weights are stored in a Hadamard-rotated basis and the file declares "
+                  "prism.hadamard.* metadata; the runtime must apply the matching "
+                  "transform to activations, which is not implemented, so decoding the "
+                  "weights directly would produce garbage");
+        if (linear_attention)
+            block("LINEAR_ATTENTION",
+                  "the checkpoint contains linear-attention state (ssm_/conv) alongside "
+                  "full attention; only full attention is implemented");
+    }
+
     // Per-head q/k normalisation (qwen3) is implemented; report it as a
     // capability, and only complain when the pair is incomplete.
     {

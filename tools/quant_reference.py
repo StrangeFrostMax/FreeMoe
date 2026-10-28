@@ -40,6 +40,12 @@ GEOMETRY = {
     14: (256, 210),
     15: (256, 292),
     20: (32, 18),   # IQ4_NL: f16 scale + 16 nibble bytes
+    # Ternary family. 34/35 carry the fp16 scale last; 41/42/142 carry it first.
+    34: (256, 54),  # TQ1_0  base-3 trits, 5 per byte
+    35: (256, 66),  # TQ2_0  2-bit trits
+    41: (128, 18),  # Q1_0   one sign bit per weight
+    42: (64, 18),   # Q2_0   2-bit codes, group 64
+    142: (128, 34), # PQ2_0  2-bit codes, group 128
     # ggml treats these as element types, not blocked quants: one element per
     # block, so the block size is 1 and the block bytes are the element width.
     24: (1, 1),     # I8
@@ -293,10 +299,69 @@ def f64(b):
     return [struct.unpack_from("<d", b, 0)[0]]
 
 
+def _trit_from_byte(byte: int, power: int) -> int:
+    """Recovers one base-3 trit from a byte multiplied by a power of three.
+
+    The multiply wraps modulo 256, which is what brings the wanted trit into the
+    high bits; (v * 3) >> 8 then yields 0, 1 or 2.
+    """
+    v = (byte * power) & 0xFF
+    return (v * 3) >> 8
+
+
+def tq1_0(b):
+    """256 elements: 48 bytes of 5-trit packs, 4 bytes of 4-trit packs, fp16 d."""
+    d = rd_half(b, 52)
+    out = []
+    for n in range(5):
+        for m in range(32):
+            out.append((_trit_from_byte(b[m], 3 ** n) - 1) * d)
+    for n in range(5):
+        for m in range(16):
+            out.append((_trit_from_byte(b[32 + m], 3 ** n) - 1) * d)
+    for n in range(4):
+        for h in range(4):
+            out.append((_trit_from_byte(b[48 + h], 3 ** n) - 1) * d)
+    return out
+
+
+def tq2_0(b):
+    """256 elements: 64 bytes of 2-bit trits, then fp16 d."""
+    d = rd_half(b, 64)
+    out = []
+    for j in range(0, 64, 32):
+        for l in range(4):
+            for m in range(32):
+                out.append((((b[j + m] >> (l * 2)) & 3) - 1) * d)
+    return out
+
+
+def q1_0(b):
+    """128 elements: fp16 d then one sign bit per weight."""
+    d = rd_half(b, 0)
+    return [d if (b[2 + j // 8] >> (j % 8)) & 1 else -d for j in range(128)]
+
+
+def _two_bit(b, offset: int, count: int) -> list[float]:
+    d = rd_half(b, offset)
+    return [(((b[offset + 2 + j // 4] >> ((j % 4) * 2)) & 3) - 1) * d for j in range(count)]
+
+
+def q2_0(b):
+    """64 elements: fp16 d then 2-bit codes."""
+    return _two_bit(b, 0, 64)
+
+
+def pq2_0(b):
+    """128 elements: the same codec as Q2_0 over a wider group."""
+    return _two_bit(b, 0, 128)
+
+
 DECODERS = {
     30: bf16, 2: q4_0, 3: q4_1, 6: q5_0, 7: q5_1, 8: q8_0, 9: q8_1,
     10: q2_k, 11: q3_k, 12: q4_k, 13: q5_k, 14: q6_k, 15: q8_k,
     20: iq4_nl, 24: i8, 25: i16, 26: i32, 27: i64, 28: f64,
+    34: tq1_0, 35: tq2_0, 41: q1_0, 42: q2_0, 142: pq2_0,
 }
 
 
@@ -355,6 +420,12 @@ def make_block(type_id: int, rng_state: int) -> tuple[bytes, int]:
         raw[2:4] = encode_f16(-0.004)
     elif type_id == 14:  # Q6_K
         raw[208:210] = half_scale
+    elif type_id == 34:  # TQ1_0: scale last
+        raw[52:54] = half_scale
+    elif type_id == 35:  # TQ2_0: scale last
+        raw[64:66] = half_scale
+    elif type_id in (41, 42, 142):  # Q1_0 / Q2_0 / PQ2_0: scale first
+        raw[0:2] = half_scale
     if type_id == 24:  # I8
         struct.pack_into("<b", raw, 0, -73)
     elif type_id == 25:  # I16

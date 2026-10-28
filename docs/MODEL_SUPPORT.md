@@ -32,6 +32,8 @@ each family, the tool records what a specific file contains.
 | GGUF v3 container parse, any architecture | WORKS |
 | Generic inspect / tensor inventory / type census | WORKS |
 | Block decoders: F32, F16, BF16, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q8_1, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_K, IQ4_NL, I8, I16, I32, I64, F64 | WORKS |
+| Ternary decoders: `TQ1_0` (34), `TQ2_0` (35), `Q1_0` (41), `Q2_0` (42), `PQ2_0` (142) | WORKS |
+| `PTQ1_0` (143) geometry: parses, sizes and expert ranges exact, decode refused | **PARTIAL** |
 | Quantised GEMV (fused AVX2 + scalar), typed errors for unknown types | WORKS |
 | `freemoe-tiny-v1` adapter: MHA, RoPE, SwiGLU, top-2 MoE, byte tokenizer | WORKS |
 | Standard llama-family adapter (llama.cpp keys and tensor names) | WORKS |
@@ -43,6 +45,8 @@ each family, the tool records what a specific file contains.
 | `gemma2`/`gemma3`: post-attention/post-FFN norms, tanh softcapping, sliding window | WORKS |
 | `phi3`: fused q/k/v projection with fused bias, partial rotary | WORKS |
 | `glm4`, `minicpm`, `qwen3moe`-specific variants | **MISSING** |
+| PrismML rotated weight basis (`prism.hadamard.*`) and Hadamard activation transform | **MISSING**, hard blocker |
+| Hybrid linear attention (`ssm_*`, `conv1d` state) | **MISSING**, hard blocker |
 | Shared-expert MoE (`expert_shared_count`) | **MISSING**, refused rather than dropped |
 | Ternary block formats (`PTQ1_0`, `TQ1_0`, `TQ2_0`) | **MISSING** |
 | Vision towers (MiniCPM-V) | **MISSING**, and out of scope for a text engine |
@@ -85,8 +89,8 @@ file. "Format" is the storage format the probe will confirm.
 | 17 | Qwen3.8-4B-Q4_K_M | qwen3 | Q4_K | qwen3 semantics, tokenizer |
 | 18 | qwen3.8-flash-next-reap-288-Q4_K_M | qwen3 | Q4_K | qwen3 semantics, tokenizer |
 | 19 | smollm-135m-instruct-add-basics-q8_0 | llama | Q8_0 | adapter, tokenizer |
-| 20 | Ternary-Bonsai-2-27B-…-PTQ1_0-MTP-Q4_0 | ternary hybrid | PTQ1_0 + Q4_0 | ternary decoder, adapter, tokenizer |
-| 21 | Ternary-Bonsai-2-2B-PTQ1_0 | ternary | PTQ1_0 | ternary decoder, adapter, tokenizer |
+| 20 | Ternary-Bonsai-2-27B-…-PTQ1_0-MTP-Q4_0 | ternary hybrid | PTQ1_0 + Q4_0 | rotated basis, linear attention, PTQ1_0 layout |
+| 21 | Ternary-Bonsai-2-2B-PTQ1_0 | ternary | PTQ1_0 | rotated basis, linear attention, PTQ1_0 layout |
 | 22 | tiny-llama3-test-Q3_K_M | llama | Q3_K | adapter, tokenizer |
 | 23 | Tiny-LLM.Q4_K_M | llama-derived | Q4_K | adapter, tokenizer |
 | 24 | Tiny-Moe.Q4_K_M | llama + experts | Q4_K | adapter, MoE layout |
@@ -119,6 +123,43 @@ below.
 The "Blockers" column below is the **pre-adapter expectation** recorded when the
 list was written. It is stale for every family the capability table now lists as
 WORKS. `freemoe probe` on the actual file is the only authoritative answer.
+
+## The ternary models (Bonsai 2)
+
+`Ternary-Bonsai-2-2B-PTQ1_0.gguf` and the 27B MTP variant are the two entries in
+the requested list that use a format no mainline runtime reads. Researching them
+against the published sources (`ggml-org/llama.cpp`, `PrismML-Eng/llama.cpp`,
+the `prism-ml` model cards) established four things, all of which the code now
+reflects:
+
+1. **The type ids are outside upstream.** `PQ2_0` is 142 and `PTQ1_0` is 143;
+   upstream stops at 43. The four upstream ternary ids — `TQ1_0` 34, `TQ2_0` 35,
+   `Q1_0` 41, `Q2_0` 42 — *are* implemented here, with decoders verified against
+   an independent reference. `PQ2_0` is implemented too: it is exactly the
+   `Q2_0` codec at group size 128, so its layout is not in doubt.
+
+2. **`PTQ1_0` has no verifiable element layout.** PrismML's own CPU reference
+   and their Vulkan shader disagree about how many elements a 128-wide block
+   holds — the CPU path advances through 88 elements per block while the shader
+   maps all 128, and the CPU loop reads past the end of its 24-byte `qs` array.
+   Neither can be checked here because no `PTQ1_0` file is downloadable in this
+   environment (429 MB). A decoder written today would be a guess, so `PTQ1_0`
+   parses (geometry, sizes, pageability correct) and **refuses to decode**.
+
+3. **The weights are in a rotated basis.** Each matrix is transformed by a
+   blockwise Hadamard rotation before ternary assignment, and the runtime must
+   apply the matching transform to activations. The file declares this with
+   `prism.hadamard.*` metadata (`transform`, `block_size`, `sign_mode`,
+   `weight_names`, …). This is the dangerous case: the bytes decode to
+   plausible numbers and the model emits garbage, so the probe reports
+   `ROTATED_WEIGHT_BASIS` as a hard blocker the moment those keys appear.
+
+4. **The blocks are hybrid.** Roughly three quarters of the layers use linear
+   attention with `ssm_*` state and `conv1d`. The probe reports
+   `LINEAR_ATTENTION` for any checkpoint carrying that state.
+
+So a Bonsai file today yields `verdict: inspect-only` with every reason named,
+instead of either a parse failure or a confident wrong answer.
 
 ## How a new architecture is added
 

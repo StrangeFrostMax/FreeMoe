@@ -34,7 +34,21 @@ QUANT_TABLE = {
     13: (256, 176, "Q5_K"),
     14: (256, 210, "Q6_K"),
     15: (256, 292, "Q8_K"),
+    20: (32, 18, "IQ4_NL"),
+    24: (1, 1, "I8"),
+    25: (1, 2, "I16"),
+    26: (1, 4, "I32"),
+    27: (1, 8, "I64"),
+    28: (1, 8, "F64"),
     30: (1, 2, "BF16"),
+    # Ternary family, including the two PrismML-private ids so a Bonsai-shaped
+    # fixture can be written and inspected.
+    34: (256, 54, "TQ1_0"),
+    35: (256, 66, "TQ2_0"),
+    41: (128, 18, "Q1_0"),
+    42: (64, 18, "Q2_0"),
+    142: (128, 34, "PQ2_0"),
+    143: (128, 28, "PTQ1_0"),
 }
 
 TYPE_BY_NAME = {
