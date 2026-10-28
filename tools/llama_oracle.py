@@ -150,6 +150,10 @@ def load_model(path: Path) -> dict[str, Any]:
                                   for l in range(n_layer)),
         # Multi-head latent attention: the file carries the projection into the
         # latent and the per-head expansions, and no keys or values.
+        # Attention sinks: a per-head logit that the softmax denominator includes
+        # and the value sum never reads. Detected from the tensor, like every
+        # other structural fact.
+        "attn_sinks": "blk.0.attn_sinks.weight" in tensors,
         "mla": "blk.0.attn_kv_a_mqa.weight" in tensors,
         "q_lora_rank": int(key("attention.q_lora_rank", 0)),
         "kv_lora_rank": int(key("attention.kv_lora_rank", 0)),
@@ -529,6 +533,9 @@ class Session:
                     if cfg["attn_softcap"] > 0.0:
                         dot = cfg["attn_softcap"] * math.tanh(dot / cfg["attn_softcap"])
                     scores.append(dot)
+                if cfg["attn_sinks"]:
+                    # Append the sink logit, then ignore its probability.
+                    scores = scores + [self.tensor(p + "attn_sinks.weight")[head]]
                 probs = softmax(scores)
                 acc = [0.0] * head_v
                 for offset, t_index in enumerate(range(first, len(cache))):

@@ -85,6 +85,7 @@ enum class TensorRole : uint32_t {
     ATTN_OUTPUT_BIAS,
     // Per-head RMSNorm on q/k, which qwen3 applies before RoPE.
     ATTN_Q_NORM,
+    ATTN_SINKS,
     ATTN_K_NORM,
     ATTN_POST_NORM,
     FFN_POST_NORM,
@@ -200,6 +201,11 @@ struct ModelConfig {
     bool attn_qkv_bias = false;
     // Q and K are normalised per head before RoPE (qwen3 family).
     bool qk_norm = false;
+    // Attention sink: one extra learnable logit per head that the softmax
+    // denominator includes and the output never reads. ggml calls it
+    // `soft_max_ext(..., sinks)`. Presence of `blk.N.attn_sinks.weight` decides,
+    // because it is a per-tensor fact rather than an architecture rule.
+    bool attn_sinks = false;
     // Multiplier applied to the token embedding before the first block.
     // gemma uses sqrt(hidden); minicpm uses a fixed 12.0 unless the file says
     // otherwise. 1.0 means "no scaling", so this is off for llama-family.

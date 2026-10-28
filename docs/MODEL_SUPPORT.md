@@ -53,6 +53,7 @@ each family, the tool records what a specific file contains.
 | `phi2`: LayerNorm with biases, gate-free GELU FFN, one shared residual | WORKS |
 | `deepseek2`: MLA (low-rank q, kv latent, per-head `k_b`/`v_b` expansion), dense-lead blocks, sigmoid/softmax/sqrt-softplus gating, selection bias, group-limited routing, shared expert without a scalar gate | WORKS |
 | Long context: `rope.scaling.type` `linear` and `yarn` (factor, original context, per-dimension ramp, magnitude scale incl. `yarn_log_multiplier`) | WORKS |
+| Attention sinks (`blk.N.attn_sinks.weight`): one extra softmax logit per head, included in the denominator and never read | WORKS |
 | `rope.scaling.type = longrope` (per-layer short/long factors, phi-3-small) | **MISSING**, refused by name |
 | Generation stops at the checkpoint's own `eos_token_id` | WORKS |
 | Chat templates: a restricted Jinja interpreter over the checkpoint's own `tokenizer.chat_template` | WORKS (see below) |

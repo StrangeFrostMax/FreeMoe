@@ -862,6 +862,15 @@ std::vector<float> Engine::forward_token(int32_t token, uint64_t position,
                             std::tanh(value / c.attn_logit_softcap);
                 score_floats.push_back(static_cast<float>(value));
             }
+            // Attention sink: the reference appends one extra learnable logit per
+            // head to the softmax and then discards its probability, so the
+            // denominator includes exp(sink) and the head can attend to nothing.
+            // Appending it to the vector and dropping the last entry is exactly
+            // that -- no separate normalisation path to drift.
+            if (c.attn_sinks) {
+                const float *sinks = norm_weights(prefix + "attn_sinks.weight");
+                score_floats.push_back(sinks[head]);
+            }
             std::vector<float> probs = softmax(score_floats);
             std::vector<double> acc(c.head_v_dim(), 0.0);
             const size_t vb = static_cast<size_t>(head / group) * c.head_v_dim();

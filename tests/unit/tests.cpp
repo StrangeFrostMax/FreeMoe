@@ -2274,13 +2274,40 @@ void test_rope_scaling() {
           "yarn without an original context is rejected");
 }
 
+// Attention sinks: the softmax denominator gains one learnable logit per head and
+// the value sum never reads it. Parity alone would catch a missing sink, but not
+// a sink read from the wrong head or applied to the wrong head count, so the
+// dimensions and the all-layers rule are checked directly here.
+void test_attention_sinks() {
+    const std::string path = "tests/fixtures/llama-sinks-shape.gguf";
+    const GGUFDocument doc = parse_gguf_file(path);
+    const ModelManifest manifest = build_manifest(doc, path);
+    CHECK(manifest.config.attn_sinks, "a checkpoint with attn_sinks tensors enables sinks");
+    CHECK(manifest.tensor("blk.0.attn_sinks.weight") != nullptr,
+          "the sink tensor is mapped by the adapter");
+    if (manifest.tensor("blk.0.attn_sinks.weight"))
+        CHECK(manifest.tensor("blk.0.attn_sinks.weight")->role == TensorRole::ATTN_SINKS,
+              "the sink tensor gets its own role");
+    // A file with the tensor cut off one layer is a mapping error, not a variant:
+    // the layers would then use two different attention definitions.
+    GGUFDocument partial = doc;
+    partial.tensor_by_name.erase("blk.1.attn_sinks.weight");
+    CHECK(throws_code(ErrorCode::MISSING_REQUIRED_TENSOR,
+                      [&]() { (void)build_manifest(partial, path); }),
+          "a partially sunk checkpoint is refused rather than half-applied");
+    // The probe reports it, so a reader can see which attention definition runs.
+    const Json probe = probe_model(doc, path);
+    CHECK(probe.dump().find("attn_sinks") != std::string::npos,
+          "the probe reports attention sinks");
+}
+
 void test_architecture_parity() {
     const std::vector<std::string> slugs = {"llama-gqa", "qwen2-bias", "qwen3-qknorm", "gemma",
                                            "gemma2", "phi3-fused", "minicpm", "qwen3moe",
                                            "glm4", "qwen2moe", "phi2-layernorm",
                                            "deepseek2-mla", "internlm2", "exaone", "orion",
                                            "gptneox", "stablelm", "llama-yarn", "qwen2-linear",
-                                           "llama-yarn-mscale"};
+                                           "llama-yarn-mscale", "llama-sinks"};
     for (const std::string &slug : slugs) {
         const std::string model = "tests/fixtures/" + slug + "-shape.gguf";
         ArchGolden golden = read_arch_golden("tests/golden/" + slug + "_reference.txt");
@@ -2862,6 +2889,7 @@ int main(int argc, char **argv) {
     maybe_run("unicode_classes", test_unicode_classes);
     maybe_run("model_map_and_tied_output", test_model_map_and_tied_output);
     maybe_run("rope_scaling", test_rope_scaling);
+    maybe_run("attention_sinks", test_attention_sinks);
     maybe_run("architecture_parity", test_architecture_parity);
     maybe_run("rotated_and_ternary_blockers", test_rotated_and_ternary_blockers);
     maybe_run("minicpm_scales", test_minicpm_scales);

@@ -456,6 +456,7 @@ Json probe_model(const GGUFDocument &doc, const std::string &source_path) {
         block("QKV_BIAS_INCONSISTENT",
               "attention bias tensors are present but attention.qkv_bias is false");
     out.set("attention_qkv_bias", declares_bias || has_bias_tensor);
+    out.set("attn_sinks", doc.tensor_by_name.count("blk.0.attn_sinks.weight") != 0);
     // Context extension. `none`, `linear` and `yarn` are implemented; anything
     // else changes the rotation in a way this build cannot reproduce, so it is a
     // blocker rather than an approximation. Reported even when it is none, so a

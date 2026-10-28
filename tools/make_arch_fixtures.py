@@ -120,6 +120,11 @@ def arch_tensors(spec: dict[str, Any]) -> list[TensorSpec]:
                 tensor(p + "attn_k.weight", [h, kv_dim], 0.16),
                 tensor(p + "attn_v.weight", [h, kv_dim], 0.16),
             ]
+        if spec.get("attn_sinks"):
+            # One logit per query head. Deliberately non-zero and asymmetric, so a
+            # runtime that ignores the sink or reads the wrong head's value cannot
+            # match the golden.
+            out += [tensor(p + "attn_sinks.weight", [heads], 0.75)]
         if spec.get("qk_norm"):
             # One head's worth of scale, shared by every head.
             out += [
@@ -520,6 +525,17 @@ SPECS: list[dict[str, Any]] = [
         "kv_heads": 2,
         "rope_dim": SHAPE["head_dim"],
         "qkv_bias": True,
+    },
+    {
+        # Attention sinks (ggml `soft_max_ext(..., sinks)`): every head's softmax
+        # denominator carries one extra learnable logit. Families that need it
+        # include deepseek4/4.1, mimo2 and minimax-m2.
+        "slug": "llama-sinks",
+        "arch": "llama",
+        "name": "FreeMoe synthetic llama with attention sinks",
+        "kv_heads": 2,
+        "rope_dim": SHAPE["head_dim"],
+        "attn_sinks": True,
     },
     {
         # YaRN context extension: the checkpoint was trained on 64 positions and
