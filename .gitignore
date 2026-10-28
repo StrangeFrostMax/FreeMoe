@@ -29,3 +29,12 @@ __pycache__/
 *.dSYM/
 .vscode/
 .idea/
+
+# Downloaded model weights are never committed. Only the small synthetic
+# conformance fixtures are tracked; real checkpoints stay wherever you keep
+# them (including any Google Drive download directory).
+google_drive/
+models/
+*.gguf
+!tests/fixtures/*.gguf
+!tests/malformed_models/*.gguf
