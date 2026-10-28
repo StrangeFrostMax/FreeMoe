@@ -51,7 +51,9 @@ each family, the tool records what a specific file contains.
 | `phi2`: LayerNorm with biases, gate-free GELU FFN, one shared residual | WORKS |
 | `deepseek2`: MLA (low-rank q, kv latent, per-head `k_b`/`v_b` expansion), dense-lead blocks, sigmoid/softmax/sqrt-softplus gating, selection bias, group-limited routing, shared expert without a scalar gate | WORKS |
 | Generation stops at the checkpoint's own `eos_token_id` | WORKS |
-| Chat templates (`tokenizer.chat_template`, Jinja) | **MISSING**, the prompt is sent verbatim |
+| Chat templates: a restricted Jinja interpreter over the checkpoint's own `tokenizer.chat_template` | WORKS (see below) |
+| Built-in templates for 11 marker families + evidence-based selection from the token table | WORKS |
+| `internlm2`, `exaone`, `orion`, `gptneox`, `stablelm` adapters | WORKS |
 | `glm4-moe`, `minicpm3`, and the remaining 157 architectures in llama.cpp's `src/models/` | **MISSING** |
 | PrismML rotated weight basis (`prism.hadamard.*`) and Hadamard activation transform | **MISSING**, hard blocker |
 | Hybrid linear attention (`ssm_*`, `conv1d` state) | **MISSING**, hard blocker |
@@ -190,7 +192,8 @@ produce logits identical to the plain fixture and the test would catch it.
 
 Current parity fixtures: `llama-gqa`, `qwen2-bias`, `qwen3-qknorm`, `gemma`,
 `gemma2`, `phi3-fused`, `glm4`, `minicpm`, `qwen3moe`, `qwen2moe`,
-`phi2-layernorm`, `deepseek2-mla`.
+`phi2-layernorm`, `deepseek2-mla`, `internlm2`, `exaone`, `orion`, `gptneox`,
+`stablelm` — 17 architectures.
 
 ### What each architecture actually needed
 
@@ -250,44 +253,70 @@ routing masks whole groups by setting their selection score to −inf.
 
 ### Chat templates
 
-`tokenizer.chat_template` is Jinja. FreeMoe does not interpret it: `run` takes a
-prompt string and feeds its bytes to the tokenizer exactly as given, so a chat
-model needs the prompt already wrapped in its turn markers. The probe reports
-`chat_template_present` so this is visible per file rather than silent.
+`tokenizer.chat_template` is Jinja2, and without it a chat model is unusable:
+the role markers, the BOS placement and the trailing assistant prefix are all
+part of the prompt the model was trained on, so feeding raw text produces
+confidently wrong output rather than an error.
 
-The decision recorded here is to implement a *restricted* interpreter for the
-subset GGUF templates actually use (`{% for %}`, `{% if %}`, `{{ }}` with
-`.strip()`, `messages`, `add_generation_prompt`, `bos_token`, `eos_token`), with
-a per-family built-in template as the fallback when a file carries none, and to
-fail at *chat* time — not at load time — when a template uses anything outside
-the subset, so plain completion keeps working on the same checkpoint. Until that
-lands, the honest state is: no Jinja, no per-family templates, verbatim prompts.
+FreeMoe ships a **restricted Jinja interpreter** (`src/chat_template.cpp`) and
+renders whatever the checkpoint declares. The alternative — llama.cpp's approach
+of a table of C++ string builders plus a chain of substring heuristics — needs
+one builder per known template and *silently* produces a wrong prompt for
+anything unrecognised. Reading the template is smaller (one engine instead of
+sixty builders) and more correct; the cost is a language subset, which is why an
+unsupported construct is a named, typed `NOT_IMPLEMENTED` error raised at
+*chat* time only, so plain completion keeps working on the same checkpoint.
 
-### The one thing GGUF does not say
+Supported: `{% for %}` (with `if` filters, `else`, and `loop.index/index0/first/
+last/length/revindex`), `{% if %}/{% elif %}/{% else %}`, `{% set %}` including
+`namespace()` field assignment, `{{ }}` output, `{# #}` comments, whitespace
+control (`{%- -%}`), the operators `+ - * / // % ~ == != < <= > >= and or not in
+in`, `is defined/none/string/number`, indexing, slices, `[a, b]` lists, and the
+filters `trim strip upper lower length string int float first last list join
+replace default tojson`. `raise_exception()` is honoured, which is how gemma
+rejects a system turn and llama2 rejects non-alternating roles — those come back
+as typed errors instead of malformed prompts.
 
-Everything above is decided from tensors, shapes or a metadata key: the norm
-type comes from which epsilon key the file declares, the biases from the
-tensors, the fused layouts from the shapes, and a missing `ffn_norm` from the
-absence of the tensor.
+Not supported, and reported as such: `{% macro %}`, `{% include %}`, `{% import
+%}`, `{% filter %}`, `{% with %}`, `{% set %}` inside a filter expression, and
+attribute access on anything but maps.
 
-The *activation function* is the exception. GGUF has no key for it, so a
-gate-free FFN — up, activation, down, with no gate to disambiguate it — cannot
-be identified from the file at all. FreeMoe therefore accepts a gate-free FFN
-only for `phi2`, applies GELU there, and refuses every other architecture with
-a `NOT_IMPLEMENTED` error rather than guessing. A parity fixture is the check,
-and `phi2-layernorm` is that fixture.
+**Choosing a template** (`resolve_chat_template`):
 
-### A reference that does not do what it documents
+1. `--chat-template-file` or `--chat-template` (a built-in name or literal
+   template text) wins.
+2. Otherwise the checkpoint's own `tokenizer.chat_template`.
+3. Otherwise a built-in picked from the **token table** — does the vocabulary
+   actually contain `<|start_header_id|>`, `<start_of_turn>`, `<|im_start|>`,
+   `[INST]`? That is evidence, and it is stronger than the architecture name
+   (`llama` covers both the llama2 and llama3 marker sets). The architecture
+   name is only the last resort.
+4. Nothing applies: `--chat` fails with an error naming the architecture rather
+   than inventing a prompt. `run` without `--chat` is unaffected.
 
-minicpm declares three scales: `embedding_scale`, `residual_scale` and
-`logit_scale`. llama.cpp reads and logs all three, but a repository-wide search
-across the graph code finds only `embedding_scale` actually applied. The other
-two are dead metadata in the reference.
+Built-in templates: `chatml`, `llama2`, `llama3`, `gemma`, `phi3`, `deepseek2`,
+`orion`, `zephyr`, `vicuna`, `raw` (the native adapter's protocol constant), and
+`gptneox` has none — its checkpoints carry no standard markers.
 
-FreeMoe therefore applies the embedding scale and **records but does not apply**
-the other two, because applying them would disagree with the reference on every
-logit. The probe says so in `scale_note` rather than leaving it to be inferred
-from silence, and `minicpm_scales` pins the decision in a test.
+The provenance of every render is reported: `chat_template_source` is
+`checkpoint`, `builtin:<name>` or `override`. "The file told us" and "we used a
+default" are different claims about whether the prompt is right, so the CLI
+never blurs them. `--render-only` prints the exact bytes handed to the
+tokenizer, which is the only way a template is observable.
+
+### Breadth: the block is data, not code
+
+Five further adapters landed with no new forward-pass code: `internlm2`,
+`exaone`, `orion`, `gptneox` and `stablelm`. Each differs from the existing
+block only in facts the checkpoint can state — the norm type (from which epsilon
+key the file declares), norm biases (from the tensors), the rotary width, a
+fused q/k/v projection, and the activation.
+
+The activation is the one fact GGUF cannot express for a *gate-free* FFN (up →
+activation → down has no gate to disambiguate it), so it is read from the
+architecture. That table is deliberately small and cites llama.cpp's own model
+files: `phi2` and `gptneox` are `LLM_FFN_GELU` with `LLM_FFN_SEQ`. Any other
+architecture with a gate-free FFN is still refused rather than guessed.
 
 ## Ordered work that remains
 
@@ -305,10 +334,12 @@ from silence, and `minicpm_scales` pins the decision in a test.
 6. ~~Architecture variants: `gemma`, `phi3`, `qwen2`, `qwen3`, `glm4`,
    `minicpm`, `qwen3moe`, `qwen2moe`, `phi2`.~~ **DONE**
    ~~MLA (`deepseek2`)~~ **DONE** — see the section above.
-   Still open: `glm4-moe`, `minicpm3`, the MTP/`nextn` heads (parsed and
-   reported as ignored), and the rest of llama.cpp's `src/models/` tree.
-6b. **Chat templates.** Jinja is not implemented; a restricted interpreter for
-   the GGUF subset plus per-family fallbacks is the planned step (see above).
+   Still open: `glm4-moe`, `minicpm3`, `olmo2` (its q/k norm is *not* per head,
+   so it needs a second norm placement), `olmoe`/`mixtral` (MoE variants of the
+   same block), the MTP/`nextn` heads (parsed and reported as ignored), and the
+   rest of llama.cpp's `src/models/` tree.
+6b. ~~**Chat templates.**~~ **DONE** — restricted Jinja interpreter, 10 built-in
+   templates, evidence-based selection, `--render-only` for inspection.
 7. **Ternary formats** (`PTQ1_0`/`TQ1_0`/`TQ2_0`) for #20 and #21.
 8. **Multimodal** (#8) is out of scope for this engine: the text decoder can be
    supported, the vision tower cannot, and pretending otherwise would be the

@@ -461,6 +461,62 @@ std::string Engine::detokenize(const std::vector<int32_t> &ids) const {
     return tokenizer_->decode(ids, c.bos_id, c.eos_id);
 }
 
+ChatRender Engine::render_chat(const std::vector<ChatMessage> &messages,
+                                bool add_generation_prompt,
+                                const std::string &template_override) const {
+    if (!initialized_) fail(ErrorCode::INTERNAL_ERROR, "engine is not initialized");
+    const ModelConfig &c = manifest_.config;
+
+    ChatRender render;
+    std::string template_text;
+    if (!template_override.empty()) {
+        template_text = resolve_chat_template(std::string(), std::string(), template_override);
+        const std::string name = builtin_chat_template_by_name(template_override).empty()
+                                     ? std::string()
+                                     : template_override;
+        render.template_source = name.empty() ? "override" : "builtin:" + name;
+        render.template_name = name;
+    } else if (c.chat_template == "raw-v1") {
+        // The native `freemoe-tiny` adapter stores a protocol constant here, not
+        // Jinja: its prompts are raw bytes. Rendering it as a template would
+        // emit the literal string "raw-v1".
+        template_text = builtin_chat_template("raw");
+        render.template_source = "builtin:raw";
+        render.template_name = "raw";
+    } else if (!c.chat_template.empty()) {
+        template_text = c.chat_template;
+        render.template_source = "checkpoint";
+    } else {
+        // No template in the file: pick one from the token table, which is
+        // evidence, and fall back to the architecture only when the vocabulary
+        // carries none of the known marker sets.
+        const std::string name = builtin_chat_template_from_tokens(
+            c.architecture, tokenizer_->contains_piece("<|start_header_id|>"),
+            tokenizer_->contains_piece("<|im_start|>"),
+            tokenizer_->contains_piece("<start_of_turn>"),
+            tokenizer_->contains_piece("<|user|>") && tokenizer_->contains_piece("<|end|>"),
+            tokenizer_->contains_piece("[INST]"),
+            tokenizer_->contains_piece("<|user|>") && tokenizer_->contains_piece("<|endoftext|>"));
+        // `name` is a template name, not an architecture: look it up directly.
+        if (!name.empty()) template_text = builtin_chat_template_by_name(name);
+        render.template_source = name.empty() ? "" : "builtin:" + name;
+        render.template_name = name;
+    }
+    if (template_text.empty()) {
+        fail(ErrorCode::INVALID_ARGUMENT,
+             "this checkpoint carries no chat template and no built-in is known for architecture '" +
+                 c.architecture +
+                 "'; pass --chat-template NAME or --chat-template-file PATH, or run without --chat");
+    }
+
+    ChatTemplateConfig config;
+    config.add_generation_prompt = add_generation_prompt;
+    config.bos_token = tokenizer_->piece(c.bos_id);
+    config.eos_token = tokenizer_->piece(c.eos_id);
+    render.prompt = render_chat_template(template_text, messages, config);
+    return render;
+}
+
 std::vector<int32_t> Engine::tokenize(const std::string &prompt) const {
     const ModelConfig &c = manifest_.config;
     if (prompt.empty() || prompt.size() + 2 > c.context)
@@ -542,8 +598,23 @@ std::vector<float> Engine::forward_token(int32_t token, uint64_t position,
         const double inner = 0.7978845608028654 * (v + 0.044715 * v * v * v);
         return static_cast<float>(0.5 * v * (1.0 + std::tanh(inner)));
     };
-    const bool use_gelu = c.activation == "gelu";
-    auto activate = [&](float x) { return use_gelu ? gelu(x) : silu(x); };
+    // The activation is a per-family fact read from the checkpoint: llama's
+    // SwiGLU, gpt-neox's GELU, gemma's GeGLU. Keeping one switch here is what
+    // lets architectures differ only in data rather than in code.
+    if (c.activation != "silu" && c.activation != "gelu" && c.activation != "gelu_erf" &&
+        c.activation != "relu" && c.activation != "relu_sq" && c.activation != "softplus")
+        fail(ErrorCode::NOT_IMPLEMENTED, "unsupported activation '" + c.activation + "'");
+    const std::string activation_name = c.activation;
+    auto activate = [&](float x) -> float {
+        const double v = static_cast<double>(x);
+        if (activation_name == "gelu") return gelu(x);
+        if (activation_name == "gelu_erf")
+            return static_cast<float>(0.5 * v * (1.0 + std::erf(v / std::sqrt(2.0))));
+        if (activation_name == "relu") return static_cast<float>(std::max(0.0, v));
+        if (activation_name == "relu_sq") return static_cast<float>(std::max(0.0, v) * std::max(0.0, v));
+        if (activation_name == "softplus") return static_cast<float>(std::log1p(std::exp(v)));
+        return silu(x);
+    };
     auto residual_add = [&](std::vector<float> &x, const std::vector<float> &delta, const std::string &name) {
         for (size_t i = 0; i < x.size(); ++i) x[i] += delta[i];
         backend_->record_control(name, (x.size() + delta.size()) * sizeof(float), x.size() * sizeof(float));
@@ -834,8 +905,8 @@ std::vector<float> Engine::forward_token(int32_t token, uint64_t position,
                                          act.size() * sizeof(float), 0);
             }
             for (float &v : act) v = activate(v);
-            backend_->record_control("gelu.L" + std::to_string(layer), act.size() * sizeof(float),
-                                     act.size() * sizeof(float));
+            backend_->record_control(activation_name + ".L" + std::to_string(layer),
+                                     act.size() * sizeof(float), act.size() * sizeof(float));
             ffn = matvec_view(tensor_view(prefix + "ffn_down.weight"), act, c.hidden,
                               c.intermediate, "ffn_down.L" + std::to_string(layer));
             if (c.ffn_bias) {

@@ -1771,7 +1771,8 @@ void test_architecture_parity() {
     const std::vector<std::string> slugs = {"llama-gqa", "qwen2-bias", "qwen3-qknorm", "gemma",
                                            "gemma2", "phi3-fused", "minicpm", "qwen3moe",
                                            "glm4", "qwen2moe", "phi2-layernorm",
-                                           "deepseek2-mla"};
+                                           "deepseek2-mla", "internlm2", "exaone", "orion",
+                                           "gptneox", "stablelm"};
     for (const std::string &slug : slugs) {
         const std::string model = "tests/fixtures/" + slug + "-shape.gguf";
         ArchGolden golden = read_arch_golden("tests/golden/" + slug + "_reference.txt");
@@ -2092,6 +2093,214 @@ void test_deepseek2_mla() {
           "the probe reports the selection bias");
 }
 
+// ---------------------------------------------------------------------------
+// Chat templates
+// ---------------------------------------------------------------------------
+
+// The templates below are the shapes published checkpoints actually carry, not
+// invented ones: ChatML (qwen2/3, glm4), llama3's header markers, gemma's turn
+// markers, phi3's, and llama2's [INST]. Each expectation is what
+// HuggingFace's `apply_chat_template` produces for the same conversation.
+void test_chat_template_rendering() {
+    const std::vector<fm::ChatMessage> with_system = {
+        {"system", "be terse"}, {"user", "hello"}, {"assistant", "hi"}};
+    fm::ChatTemplateConfig config;
+    config.bos_token = "<s>";
+    config.eos_token = "</s>";
+
+    std::string chatml = fm::builtin_chat_template("qwen2");
+    CHECK(chatml == fm::builtin_chat_template_by_name("chatml"),
+          "the qwen2 built-in is the chatml template");
+    CHECK(fm::render_chat_template(chatml, with_system, config) ==
+              "<|im_start|>system\nbe terse<|im_end|>\n"
+              "<|im_start|>user\nhello<|im_end|>\n"
+              "<|im_start|>assistant\nhi<|im_end|>\n"
+              "<|im_start|>assistant\n",
+          "chatml renders roles, newlines and the assistant prefix");
+
+    config.add_generation_prompt = false;
+    CHECK(fm::render_chat_template(chatml, {{"user", "hi"}}, config) ==
+              "<|im_start|>user\nhi<|im_end|>\n",
+          "add_generation_prompt=false omits the assistant prefix");
+    config.add_generation_prompt = true;
+
+    // llama3 exercises set, loop.index0, the trim filter and bos_token.
+    const std::string llama3 = fm::builtin_chat_template_by_name("llama3");
+    CHECK(fm::render_chat_template(llama3, {{"user", "  hello  "}}, config) ==
+              "<s><|start_header_id|>user<|end_header_id|>\n\nhello<|eot_id|>"
+              "<|start_header_id|>assistant<|end_header_id|>\n\n",
+          "llama3: bos on the first turn only, content trimmed, assistant header");
+
+    // gemma refuses a system role; that must surface as a typed error rather
+    // than a prompt nobody trained on.
+    bool refused = false;
+    try {
+        fm::render_chat_template(fm::builtin_chat_template_by_name("gemma"),
+                                 {{"system", "x"}, {"user", "y"}}, config);
+    } catch (const fm::Error &e) {
+        refused = e.code == fm::ErrorCode::INVALID_ARGUMENT;
+    }
+    CHECK(refused, "gemma's template rejects a system role with a typed error");
+    CHECK(fm::render_chat_template(fm::builtin_chat_template("gemma"),
+                                   {{"user", "hi"}}, config) ==
+              "<s><start_of_turn>user\nhi<end_of_turn>\n<start_of_turn>model\n",
+          "gemma renders turns and the model prefix");
+
+    CHECK(fm::render_chat_template(fm::builtin_chat_template_by_name("phi3"), {{"user", "hi"}}, config) ==
+              "<|user|>\nhi<|end|>\n<|assistant|>\n",
+          "phi3 renders its markers");
+
+    // llama2 uses a slice, a boolean sentinel and a comparison chain.
+    const std::string llama2 = fm::builtin_chat_template("llama");
+    CHECK(llama2 == fm::builtin_chat_template_by_name("llama2"),
+          "the llama built-in is the llama2 template");
+    CHECK(fm::render_chat_template(llama2, {{"user", "hi"}}, config) ==
+              "<s>[INST] hi [/INST]",
+          "llama2 renders the instruction block");
+    CHECK(fm::render_chat_template(llama2, {{"system", "sys"}, {"user", "hi"}}, config) ==
+              "<s>[INST] <<SYS>>\nsys\n<</SYS>>\n\nhi [/INST]",
+          "llama2 folds the system turn into the first instruction");
+    bool alternation = false;
+    try {
+        fm::render_chat_template(llama2, {{"user", "a"}, {"user", "b"}}, config);
+    } catch (const fm::Error &) {
+        alternation = true;
+    }
+    CHECK(alternation, "llama2 rejects non-alternating roles");
+
+    // Whitespace control: `-` strips the surrounding whitespace, which is the
+    // difference between a prompt with stray newlines and one without.
+    fm::ChatTemplateConfig no_tokens;
+    CHECK(fm::render_chat_template(
+              "  {%- for m in messages -%}  {{ m['content'] }}  {%- endfor -%}  ",
+              {{"user", "a"}, {"user", "b"}}, no_tokens) == "ab",
+          "whitespace control strips on both sides");
+    CHECK(fm::render_chat_template("x{# a comment #}y", {{"user", "z"}}, no_tokens) == "xy",
+          "comments render nothing");
+    // An empty conversation is refused rather than rendering a bare template.
+    bool empty_refused = false;
+    try {
+        fm::render_chat_template("x", {}, no_tokens);
+    } catch (const fm::Error &) {
+        empty_refused = true;
+    }
+    CHECK(empty_refused, "an empty conversation is refused");
+}
+
+void test_chat_template_constructs() {
+    fm::ChatTemplateConfig config;
+    // `is defined` guards, which deepseek's template uses on its own variable.
+    CHECK(fm::render_chat_template(
+              "{% if not extra is defined %}{% set extra = 'dflt' %}{% endif %}{{ extra }}",
+              {{"user", "x"}}, config) == "dflt",
+          "'is defined' guards an optional variable");
+    CHECK(fm::render_chat_template(
+              "{% if extra is defined %}{{ extra }}{% else %}none{% endif %}", {{"user", "x"}},
+              config) == "none",
+          "'is not defined' takes the else branch");
+
+    // namespace() and field assignment: deepseek uses this to carry state
+    // across loop iterations.
+    CHECK(fm::render_chat_template(
+              "{% set ns = namespace(n=0) %}{% for m in messages %}"
+              "{% set ns.n = ns.n + 1 %}{% endfor %}{{ ns.n }}",
+              {{"user", "a"}, {"user", "b"}, {"user", "c"}}, config) == "3",
+          "namespace() carries a counter across iterations");
+
+    // Filters, loop metadata and operators.
+    CHECK(fm::render_chat_template(
+              "{% for m in messages %}{{ loop.index }}/{{ loop.length }}:"
+              "{{ m['content'] | upper | replace('A', 'b') }}{% if not loop.last %},{% endif %}"
+              "{% endfor %}",
+              {{"user", "aa"}, {"user", "cc"}}, config) == "1/2:bb,2/2:CC",
+          "loop metadata, chained filters and conditionals");
+
+    CHECK(fm::render_chat_template(
+              "{{ messages[0]['content'] }}|{{ messages[1:] | length }}|"
+              "{{ 'x' ~ 'y' }}|{{ 7 // 2 }}|{{ 7 % 3 }}|{{ messages[0]['role'] in ['user'] }}",
+              {{"user", "a"}, {"user", "b"}}, config) == "a|1|xy|3|1|true",
+          "slices, concatenation, integer division, modulo and 'in'");
+
+    // An unsupported construct is refused by name, not silently ignored, and
+    // it is refused at render time so plain completion keeps working.
+    bool unsupported = false;
+    std::string reason;
+    try {
+        fm::render_chat_template("{% macro m() %}{% endmacro %}", {{"user", "x"}}, config);
+    } catch (const fm::Error &e) {
+        unsupported = e.code == fm::ErrorCode::NOT_IMPLEMENTED &&
+                      std::string(e.what()).find("macro") != std::string::npos;
+    }
+    CHECK(unsupported, "an unsupported construct names itself in a typed error");
+    CHECK(!fm::chat_template_supported("{% macro m() %}{% endmacro %}", &reason),
+          "the probe reports the template as unsupported");
+    CHECK(reason.find("macro") != std::string::npos, "the probe names the construct");
+    CHECK(fm::chat_template_supported(fm::builtin_chat_template_by_name("chatml"), &reason),
+          "every built-in template is inside the supported subset");
+
+    // Every built-in must render; a template that only parses is not enough.
+    for (const char *name : {"chatml", "llama2", "llama3", "gemma", "phi3", "deepseek2",
+                             "zephyr", "vicuna", "raw"}) {
+        fm::ChatTemplateConfig cfg;
+        cfg.bos_token = "<s>";
+        cfg.eos_token = "</s>";
+        std::string out;
+        bool threw = false;
+        try {
+            out = fm::render_chat_template(fm::builtin_chat_template_by_name(name), {{"user", "hi"}}, cfg);
+        } catch (const fm::Error &) {
+            threw = true;
+        }
+        CHECK(!threw && !out.empty(), std::string("built-in template renders: ") + name);
+    }
+}
+
+// End to end: a checkpoint carrying its own template renders through the engine,
+// and the rendered bytes are what the tokenizer then sees.
+void test_chat_template_engine() {
+    const std::string path = "tests/fixtures/llama-gqa-shape.gguf";
+    RunConfig config;
+    config.model_path = path;
+    config.budget.total_hot_bytes = 64ull * 1024 * 1024;
+    Engine engine(config);
+    engine.initialize();
+
+    fm::ChatRender render = engine.render_chat(
+        {{"system", "sys"}, {"user", "hi"}}, true, "");
+    CHECK(render.template_source == "checkpoint", "the checkpoint's own template is used");
+    CHECK(render.prompt ==
+              "<|im_start|>system\nsys<|im_end|>\n<|im_start|>user\nhi<|im_end|>\n"
+              "<|im_start|>assistant\n",
+          "the checkpoint template renders the conversation");
+
+    // The rendered prompt is the prompt: tokenizing it must yield exactly those
+    // bytes (plus BOS), which is what makes the template observable rather than
+    // cosmetic. The fixture's context is 64 tokens, so this checks the token
+    // stream rather than running the long conversation through the decoder.
+    PromptResult short_run = engine.run_prompt(render.prompt.substr(0, 8), 1);
+    CHECK(short_run.input_ids.size() == 9,
+          "an 8-byte prompt is tokenized to BOS plus eight pieces");
+
+    // A built-in is chosen by *template* name here, while the table is keyed by
+    // architecture; conflating the two silently renders an empty prompt.
+    RunConfig stable;
+    stable.model_path = "tests/fixtures/stablelm-shape.gguf";
+    stable.budget.total_hot_bytes = 64ull * 1024 * 1024;
+    Engine stable_engine(stable);
+    stable_engine.initialize();
+    fm::ChatRender builtin = stable_engine.render_chat({{"user", "hi"}}, true, "");
+    CHECK(builtin.template_source == "builtin:chatml",
+          "an architecture with no template of its own falls back to its built-in");
+    CHECK(builtin.prompt == "<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n",
+          "the built-in renders the conversation");
+    stable_engine.release_runtime();
+
+    fm::ChatRender overridden = engine.render_chat({{"user", "hi"}}, false, "raw");
+    CHECK(overridden.template_source == "builtin:raw", "a named built-in overrides the file");
+    CHECK(overridden.prompt == "hi", "the raw template sends the content verbatim");
+    engine.release_runtime();
+}
+
 void test_soak_sessions() {
     const uint32_t N_SOAK = 256;
     std::string prompt = first_prompt();
@@ -2146,6 +2355,9 @@ int main(int argc, char **argv) {
     maybe_run("shared_expert", test_shared_expert);
     maybe_run("phi2_block", test_phi2_block);
     maybe_run("deepseek2_mla", test_deepseek2_mla);
+    maybe_run("chat_template_rendering", test_chat_template_rendering);
+    maybe_run("chat_template_constructs", test_chat_template_constructs);
+    maybe_run("chat_template_engine", test_chat_template_engine);
     maybe_run("soak_sessions", test_soak_sessions);
     std::cout << g_checks << " checks, " << g_failures << " failures\n";
     return g_failures == 0 ? 0 : 1;

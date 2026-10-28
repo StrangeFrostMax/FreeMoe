@@ -662,7 +662,8 @@ bool is_llama_family(const std::string &arch) {
     static const std::set<std::string> family = {
         "llama", "qwen2", "qwen3", "smollm", "smollm2", "tinyllama",
         "gemma", "gemma2", "gemma3", "phi3", "minicpm", "qwen3moe", "glm4",
-        "qwen2moe", "phi2", "deepseek2",
+        "qwen2moe", "phi2", "deepseek2", "internlm2", "orion", "exaone", "gptneox",
+        "stablelm",
     };
     return family.count(arch) != 0;
 }
@@ -1002,13 +1003,20 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
             cfg.ffn_no_gate = true;
     }
     if (cfg.ffn_no_gate) {
-        // Only the gate-free activations this build can reproduce are accepted.
-        const bool gelu_arch = arch == "phi2";
-        if (!gelu_arch)
+        // A gate-free FFN cannot be told from its tensors which activation it
+        // means, so the architecture has to say. The table is read from
+        // llama.cpp's own model files (`LLM_FFN_SEQ` with the listed
+        // activation); anything else is still refused rather than guessed.
+        static const std::map<std::string, const char *> seq_activation = {
+            {"phi2", "gelu"},     // src/models/phi2.cpp: LLM_FFN_GELU, LLM_FFN_SEQ
+            {"gptneox", "gelu"},  // src/models/gptneox.cpp: LLM_FFN_GELU, LLM_FFN_SEQ
+        };
+        auto it = seq_activation.find(arch);
+        if (it == seq_activation.end())
             fail(ErrorCode::NOT_IMPLEMENTED,
-                 "a gate-free feed-forward is only defined for phi2 here; refusing rather than "
-                 "guessing its activation");
-        cfg.activation = "gelu";
+                 "a gate-free feed-forward is only defined for " + std::string("phi2 and gptneox") +
+                     " here; refusing rather than guessing its activation");
+        cfg.activation = it->second;
     }
     if (opt_double(doc, keys("rope.freq_base"), &number)) cfg.rope_theta = number;
     else if (opt_double(doc, keys("rope_theta"), &number)) cfg.rope_theta = number;
