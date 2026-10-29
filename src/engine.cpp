@@ -365,6 +365,14 @@ void Engine::rope_half(std::vector<float> &q, uint32_t q_heads, std::vector<floa
     // describes every layer. Dividing by them stretches those pairs' positions,
     // which is how granite/llama4-style checkpoints extend context without YaRN.
     if (c.rope_freqs) plan.freq_factors = weights("blk.0.rope_freqs.weight");
+    // mRoPE reads one position per axis. A text token occupies the same place on
+    // all four, so the text path fills the array with the single position; the
+    // section assignment then cannot change the result, which is exactly why the
+    // two agree with llama.cpp on text-only prompts.
+    const std::array<double, 4> positions = {static_cast<double>(position),
+                                             static_cast<double>(position),
+                                             static_cast<double>(position),
+                                             static_cast<double>(position)};
     // Query and key can have different head counts under grouped-query
     // attention, so each vector is walked independently.
     for (uint32_t h = 0; h < std::max(q_heads, k_heads); ++h) {
@@ -375,7 +383,7 @@ void Engine::rope_half(std::vector<float> &q, uint32_t q_heads, std::vector<floa
         for (uint32_t i = 0; i < pairs; ++i) {
             double cs = 0.0;
             double sn = 0.0;
-            plan.rotation(i, static_cast<double>(position), cs, sn);
+            plan.rotation(i, positions, cs, sn);
             for (std::vector<float> *vec : {in_q ? &q : nullptr, in_k ? &k : nullptr}) {
                 if (!vec) continue;
                 float a0 = (*vec)[base + 2 * i];
@@ -610,7 +618,8 @@ std::vector<float> Engine::forward_token(int32_t token, uint64_t position,
     // SwiGLU, gpt-neox's GELU, gemma's GeGLU. Keeping one switch here is what
     // lets architectures differ only in data rather than in code.
     if (c.activation != "silu" && c.activation != "gelu" && c.activation != "gelu_erf" &&
-        c.activation != "relu" && c.activation != "relu_sq" && c.activation != "softplus")
+        c.activation != "relu" && c.activation != "relu_sq" && c.activation != "softplus" &&
+        c.activation != "swiglu-oai" && c.activation != "silu-clamp")
         fail(ErrorCode::NOT_IMPLEMENTED, "unsupported activation '" + c.activation + "'");
     const std::string activation_name = c.activation;
     auto activate = [&](float x) -> float {
@@ -622,6 +631,32 @@ std::vector<float> Engine::forward_token(int32_t token, uint64_t position,
         if (activation_name == "relu_sq") return static_cast<float>(std::max(0.0, v) * std::max(0.0, v));
         if (activation_name == "softplus") return static_cast<float>(std::log1p(std::exp(v)));
         return silu(x);
+    };
+    // The gated activation, including the two clamped variants. Both clamp the
+    // gate from above and the up branch symmetrically; they differ in what the
+    // gate produces and whether one is added to the up branch (gpt-oss's
+    // `swiglu_oai` is `silu(alpha*gate) * (up + 1)`).
+    auto gated = [&](float gate, float up, uint32_t layer) -> float {
+        const double limit = c.activation_limit;
+        if (c.activation == "swiglu-oai") {
+            const double x = std::min(static_cast<double>(gate), limit);
+            const double y = std::clamp(static_cast<double>(up), -limit, limit);
+            return static_cast<float>((x / (1.0 + std::exp(-c.activation_alpha * x))) * (y + 1.0));
+        }
+        if (c.activation == "silu-clamp") {
+            // deepseek4/4.1 store one bound per layer. A present entry is used
+            // verbatim -- including 0.0, which means "this layer is not clamped"
+            // and is common in those checkpoints. The scalar is only a fallback
+            // for files that carry no per-layer array.
+            const double layer_limit =
+                layer < c.swiglu_clamp.size() ? c.swiglu_clamp[layer] : limit;
+            const double g = silu(gate);
+            if (layer_limit <= 0.0) return static_cast<float>(g * up);
+            const double g_clamped = std::min(g, layer_limit);
+            const double u_clamped = std::clamp(static_cast<double>(up), -layer_limit, layer_limit);
+            return static_cast<float>(g_clamped * u_clamped);
+        }
+        return activate(gate) * up;
     };
     auto residual_add = [&](std::vector<float> &x, const std::vector<float> &delta, const std::string &name) {
         for (size_t i = 0; i < x.size(); ++i) x[i] += delta[i];
@@ -712,6 +747,12 @@ std::vector<float> Engine::forward_token(int32_t token, uint64_t position,
             RopePlan plan;
             plan.init(c, c.rope_dim);
             if (c.rope_freqs) plan.freq_factors = weights("blk.0.rope_freqs.weight");
+            // Text prompts put the token at the same position on every mRoPE
+            // axis, so one value fills the array here as it does above.
+            const std::array<double, 4> positions = {static_cast<double>(position),
+                                                     static_cast<double>(position),
+                                                     static_cast<double>(position),
+                                                     static_cast<double>(position)};
             auto rope_part = [&](std::vector<float> &vec, uint32_t heads, uint32_t stride,
                                  uint32_t offset, const std::string &name) {
                 // Rotary positions, applied to the rope slice only: the trailing
@@ -722,7 +763,7 @@ std::vector<float> Engine::forward_token(int32_t token, uint64_t position,
                     for (uint32_t i = 0; i < rope_pairs(width); ++i) {
                         double cs = 0.0;
                         double sn = 0.0;
-                        plan.rotation(i, static_cast<double>(position), cs, sn);
+                        plan.rotation(i, positions, cs, sn);
                         const float a0 = vec[base + 2 * i];
                         const float a1 = vec[base + 2 * i + 1];
                         vec[base + 2 * i] = static_cast<float>(a0 * cs - a1 * sn);
@@ -958,7 +999,7 @@ std::vector<float> Engine::forward_token(int32_t token, uint64_t position,
                                  c.hidden, "ffn_up.L" + std::to_string(layer));
             }
             std::vector<float> act(c.intermediate);
-            for (uint32_t i = 0; i < c.intermediate; ++i) act[i] = activate(gate[i]) * up[i];
+            for (uint32_t i = 0; i < c.intermediate; ++i) act[i] = gated(gate[i], up[i], layer);
             backend_->record_control("swiglu.L" + std::to_string(layer),
                                      (gate.size() + up.size()) * sizeof(float),
                                      act.size() * sizeof(float));
@@ -1039,8 +1080,18 @@ std::vector<float> Engine::forward_token(int32_t token, uint64_t position,
             }
             if (c.expert_gating == "softmax-weight")
                 selected_weights = softmax(selected_weights);
-            if (c.expert_weights_norm && total > 0.0f) {
-                for (float &w : selected_weights) w /= total;
+            if (c.expert_weights_norm) {
+                // The reference clamps the denominator instead of guarding with a
+                // comparison, and deepseek4.1 adds 1e-20 rather than clamping to
+                // the smallest F16 normal. Both are recorded in the config, so
+                // the arithmetic matches rather than merely avoiding a divide by
+                // zero.
+                const double denominator =
+                    c.expert_weights_epsilon_additive
+                        ? static_cast<double>(total) + c.expert_weights_epsilon
+                        : std::max(static_cast<double>(total), c.expert_weights_epsilon);
+                for (float &w : selected_weights)
+                    w = static_cast<float>(w / denominator);
             }
             for (float &w : selected_weights)
                 w = static_cast<float>(w * c.expert_weights_scale);
@@ -1058,8 +1109,15 @@ std::vector<float> Engine::forward_token(int32_t token, uint64_t position,
                 uint32_t expert = ids[i];
                 // Expert payloads keep their stored block type; each projection
                 // is a contiguous slice inside the expert record.
+                // Fused checkpoints store gate and up in one tensor; the record's
+                // two extents already point at its halves, so only the type ids
+                // come from the tensor info and one named tensor serves both.
                 const TensorInfo *gate_info = manifest_.tensor(prefix + "ffn_gate_exps.weight");
                 const TensorInfo *up_info = manifest_.tensor(prefix + "ffn_up_exps.weight");
+                if (!gate_info && !up_info) {
+                    gate_info = manifest_.tensor(prefix + "ffn_gate_up_exps.weight");
+                    up_info = gate_info;
+                }
                 const TensorInfo *down_info = manifest_.tensor(prefix + "ffn_down_exps.weight");
                 if (!gate_info || !up_info || !down_info)
                     fail(ErrorCode::MISSING_REQUIRED_TENSOR, "expert tensors are missing");
@@ -1083,7 +1141,7 @@ std::vector<float> Engine::forward_token(int32_t token, uint64_t position,
                         up_view, h, ewidth, c.hidden,
                         "expert_up.L" + std::to_string(layer) + ".E" + std::to_string(expert));
                     std::vector<float> act(ewidth);
-                    for (uint32_t j = 0; j < ewidth; ++j) act[j] = silu(gate[j]) * up[j];
+                    for (uint32_t j = 0; j < ewidth; ++j) act[j] = gated(gate[j], up[j], layer);
                     backend_->record_control("expert_swiglu.L" + std::to_string(layer),
                                              (gate.size() + up.size()) * sizeof(float),
                                              act.size() * sizeof(float));
@@ -1120,7 +1178,7 @@ std::vector<float> Engine::forward_token(int32_t token, uint64_t position,
                     tensor_view(prefix + "ffn_up_shexp.weight"), h, swidth, c.hidden,
                     "shexp_up.L" + std::to_string(layer));
                 std::vector<float> s_act(swidth);
-                for (uint32_t j = 0; j < swidth; ++j) s_act[j] = activate(s_gate[j]) * s_up[j];
+                for (uint32_t j = 0; j < swidth; ++j) s_act[j] = gated(s_gate[j], s_up[j], layer);
                 backend_->record_control("shexp_swiglu.L" + std::to_string(layer),
                                          (s_gate.size() + s_up.size()) * sizeof(float),
                                          s_act.size() * sizeof(float));

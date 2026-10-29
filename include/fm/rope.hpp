@@ -11,6 +11,7 @@
 // `rope_yarn` in ggml/src/ggml-cpu/ops.cpp) read through llama.cpp's model and
 // context code, so a checkpoint that runs in llama.cpp rotates the same way
 // here.
+#include <array>
 #include <cstdint>
 
 #include "fm/gguf.hpp"
@@ -57,8 +58,27 @@ struct RopePlan {
     // the head width but is smaller when `rope.dimension_count` says so.
     void init(const ModelConfig &cfg, uint32_t n_dims);
 
+    // mRoPE sections, in rotary *pairs*, from `{arch}.rope.dimension_sections`:
+    // time, height, width, extra. A zero total means plain rotary.
+    std::array<uint32_t, 4> sections = {0, 0, 0, 0};
+    // Interleaved sectioning (qwen3-vl, qwen3.5) cycles t/t/y/x instead of
+    // assigning runs of pairs in order.
+    bool interleaved_sections = false;
+
+    // Which of the four mRoPE axes pair `pair` reads its position from. Exposed
+    // because it is the only part of mRoPE that a text-only prompt cannot
+    // exercise: with four equal positions the choice makes no difference, so the
+    // assignment has to be tested directly.
+    uint32_t axis_of(uint32_t pair) const;
+
     // cos/sin for pair `pair` (elements `2*pair`, `2*pair+1`) at `position`.
     void rotation(uint32_t pair, double position, double &cos_theta,
+                  double &sin_theta) const;
+
+    // cos/sin for a prompt that carries one position per mRoPE axis. For text
+    // all four are equal, which makes this identical to the scalar overload --
+    // that equivalence is what lets the text path stay one code path.
+    void rotation(uint32_t pair, const std::array<double, 4> &positions, double &cos_theta,
                   double &sin_theta) const;
 };
 

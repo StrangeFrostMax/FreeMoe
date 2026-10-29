@@ -1,4 +1,5 @@
 #include "fm/gguf.hpp"
+#include "fm/adapter.hpp"
 #include "fm/quant.hpp"
 #include "fm/rope.hpp"
 
@@ -70,7 +71,17 @@ const std::map<uint32_t, QuantGeometry> &quantisation_table() {
         {13, {256, 176, "Q5_K"}},
         {14, {256, 210, "Q6_K"}},
         {15, {256, 292, "Q8_K"}},
+        {16, {256, 66, "IQ2_XXS"}},
+        {17, {256, 74, "IQ2_XS"}},
+        {18, {256, 98, "IQ3_XXS"}},
+        {19, {256, 50, "IQ1_S"}},
         {20, {32, 18, "IQ4_NL"}},
+        {21, {256, 110, "IQ3_S"}},
+        {22, {256, 82, "IQ2_S"}},
+        {23, {256, 136, "IQ4_XS"}},
+        {29, {256, 56, "IQ1_M"}},
+        {39, {32, 17, "MXFP4"}},
+        {40, {64, 36, "NVFP4"}},
         {24, {1, 1, "I8"}},
         {25, {1, 2, "I16"}},
         {26, {1, 4, "I32"}},
@@ -111,6 +122,7 @@ const char *tensor_role_name(TensorRole role) {
     case TensorRole::FFN_DOWN: return "FFN_DOWN";
     case TensorRole::FFN_ROUTER: return "FFN_ROUTER";
     case TensorRole::FFN_GATE_EXPS: return "FFN_GATE_EXPS";
+    case TensorRole::FFN_GATE_UP_EXPS: return "FFN_GATE_UP_EXPS";
     case TensorRole::FFN_UP_EXPS: return "FFN_UP_EXPS";
     case TensorRole::FFN_DOWN_EXPS: return "FFN_DOWN_EXPS";
     case TensorRole::ATTN_Q_BIAS: return "ATTN_Q_BIAS";
@@ -392,6 +404,7 @@ TensorRole role_from_name(const std::string &name, uint32_t &layer) {
         {"ffn_down.weight", TensorRole::FFN_DOWN},
         {"ffn_router.weight", TensorRole::FFN_ROUTER},
         {"ffn_gate_exps.weight", TensorRole::FFN_GATE_EXPS},
+        {"ffn_gate_up_exps.weight", TensorRole::FFN_GATE_UP_EXPS},
         {"ffn_up_exps.weight", TensorRole::FFN_UP_EXPS},
         {"ffn_down_exps.weight", TensorRole::FFN_DOWN_EXPS},
         {"attn_q.bias", TensorRole::ATTN_Q_BIAS},
@@ -1027,6 +1040,50 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
     // file's. Every fourth layer (1-based) keeps its keys unrotated.
     if (arch == "smollm3") cfg.no_rope_layer_step = 4;
 
+    // Router renormalisation denominator. llama.cpp clamps it to the smallest F16
+    // normal for every architecture except deepseek4.1, which adds 1e-20; keeping
+    // the rule here means the two are not conflated.
+    if (arch == "deepseek41") {
+        cfg.expert_weights_epsilon = 1e-20;
+        cfg.expert_weights_epsilon_additive = true;
+    }
+
+    // Clamped gated activations. Two families, two variants:
+    //   * gpt-oss / minimax-m3 use `swiglu_oai` (alpha 1.702, limit 7.0), the
+    //     constants llama.cpp hard-codes for LLM_FFN_SWIGLU_OAI_MOE;
+    //   * deepseek4/4.1, glm5-next and dflash keep plain silu but clamp gate and
+    //     up per layer, with the bound in `swiglu_clamp_exp` / `swiglu_clamp_shexp`.
+    {
+        if (arch == "gpt-oss" || arch == "minimax-m3") {
+            cfg.activation = "swiglu-oai";
+            cfg.activation_alpha = 1.702;
+            cfg.activation_limit = 7.0;
+        } else if (auto clamp_it = doc.metadata.find(arch + ".swiglu_clamp_exp");
+                   clamp_it != doc.metadata.end() && clamp_it->second.is_array()) {
+            for (const auto &entry : clamp_it->second.array)
+                cfg.swiglu_clamp.push_back(entry.as_double());
+            const double worst =
+                *std::max_element(cfg.swiglu_clamp.begin(), cfg.swiglu_clamp.end());
+            if (worst > 1e-6) {
+                cfg.activation = "silu-clamp";
+                cfg.activation_limit = worst;
+            }
+        }
+    }
+
+    // Fused gate+up expert tensors. The two projections live in one tensor, gate
+    // block first (ggml_swiglu's split order), so presence of the fused name and
+    // absence of the separate ones is the evidence. A file carrying both is
+    // ambiguous and refused rather than guessed.
+    {
+        const bool fused = doc.tensor_by_name.count(layer_name(0, "ffn_gate_up_exps.weight")) != 0;
+        const bool separate = doc.tensor_by_name.count(layer_name(0, "ffn_gate_exps.weight")) != 0;
+        if (fused && separate)
+            fail(ErrorCode::METADATA_MISMATCH,
+                 "both ffn_gate_up_exps and ffn_gate_exps are present; the expert layout is ambiguous");
+        cfg.fused_gate_up_exps = fused;
+    }
+
     // Per-pair rotary frequency divisors. Layer 0 carries them; later layers may
     // repeat them, so a file with the vector on layer 0 only is complete.
     if (doc.tensor_by_name.count(layer_name(0, "rope_freqs.weight")) != 0)
@@ -1050,6 +1107,33 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
     if (opt_double(doc, keys("rope.freq_base"), &number)) cfg.rope_theta = number;
     else if (opt_double(doc, keys("rope_theta"), &number)) cfg.rope_theta = number;
     else cfg.rope_theta = 10000.0;
+
+    // mRoPE sections. The key holds four counts of rotary *pairs*; llama.cpp
+    // turns mRoPE on only when the first two are non-zero, which is what keeps a
+    // text-only checkpoint that carries the key in ordinary rotary mode.
+    if (auto it = doc.metadata.find(arch + ".rope.dimension_sections");
+        it != doc.metadata.end() && it->second.is_array()) {
+        const auto &entries = it->second.array;
+        if (entries.size() != cfg.rope_sections.size())
+            fail(ErrorCode::METADATA_MISMATCH,
+                 arch + ".rope.dimension_sections must have four entries, got " +
+                     std::to_string(entries.size()));
+        for (size_t i = 0; i < entries.size(); ++i)
+            cfg.rope_sections[i] = static_cast<uint32_t>(entries[i].as_u64());
+        // The interleaved layout is an architecture rule, not a file flag:
+        // upstream selects it in llama_rope_type() for these families.
+        static const std::set<std::string> interleaved = {
+            "qwen3vl", "qwen3vlmoe", "qwen35", "qwen35moe", "clef",
+        };
+        cfg.mrope_interleaved = interleaved.count(arch) != 0;
+        cfg.mrope = cfg.rope_sections[0] > 0 && cfg.rope_sections[1] > 0;
+        const uint32_t total = cfg.rope_sections[0] + cfg.rope_sections[1] +
+                               cfg.rope_sections[2] + cfg.rope_sections[3];
+        if (cfg.mrope && total > (cfg.rope_dim ? cfg.rope_dim : cfg.head_dim) / 2)
+            fail(ErrorCode::METADATA_MISMATCH,
+                 arch + ".rope.dimension_sections cover " + std::to_string(total) +
+                     " pairs, more than the rotary head width holds");
+    }
 
     // Context extension. The keys are read verbatim and the arithmetic is
     // derived in src/rope.cpp, so the derived values cannot drift from the file.
@@ -1256,9 +1340,15 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
         // model, so the branch is chosen per layer rather than per model.
         const bool moe_layer = cfg.expert_count != 0 && l >= cfg.dense_lead;
         if (moe_layer) {
-            for (const char *suffix : {"ffn_gate_inp.weight", "ffn_gate_exps.weight",
-                                       "ffn_up_exps.weight", "ffn_down_exps.weight"})
-                expect(layer_name(l, suffix));
+            if (cfg.fused_gate_up_exps) {
+                for (const char *suffix : {"ffn_gate_inp.weight", "ffn_gate_up_exps.weight",
+                                           "ffn_down_exps.weight"})
+                    expect(layer_name(l, suffix));
+            } else {
+                for (const char *suffix : {"ffn_gate_inp.weight", "ffn_gate_exps.weight",
+                                           "ffn_up_exps.weight", "ffn_down_exps.weight"})
+                    expect(layer_name(l, suffix));
+            }
             if (cfg.shared_expert) {
                 for (const char *suffix : {"ffn_gate_shexp.weight", "ffn_up_shexp.weight",
                                            "ffn_down_shexp.weight"})
@@ -1287,7 +1377,8 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
             const char *reason = ignorable_reason(tensor.name);
             if (reason == nullptr)
                 fail(ErrorCode::UNKNOWN_TENSOR,
-                     "tensor " + tensor.name + " has no mapping in the " + arch + " adapter");
+                     "tensor " + tensor.name + " has no mapping in the " + arch +
+                         " adapter; no adapter tag claims this name (see `freemoe adapters`)");
             tensor.role = TensorRole::IGNORED;
             tensor.layer = -1;
             tensor.canonical = tensor.name;
@@ -1309,6 +1400,8 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
         if (role == TensorRole::UNKNOWN)
             fail(ErrorCode::UNKNOWN_TENSOR, "cannot map tensor role for " + tensor.name);
         tensor.role = role;
+        tensor.tag = adapter_tensor_tag(role);
+        tensor.op = adapter_tensor_op(role);
         const bool global_role = role == TensorRole::TOKEN_EMBD || role == TensorRole::OUTPUT ||
                                  role == TensorRole::OUTPUT_NORM ||
                                  role == TensorRole::OUTPUT_BIAS ||
@@ -1428,9 +1521,15 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
             if (cfg.expert_selection_bias)
                 expect_dims(*m.tensor(layer_name(l, "ffn_exp_probs_b.bias")),
                             {cfg.expert_count});
-            for (const char *suffix : {"ffn_gate_exps.weight", "ffn_up_exps.weight"})
-                expect_dims(*m.tensor(layer_name(l, suffix)),
-                            {cfg.hidden, ewidth, cfg.expert_count});
+            if (cfg.fused_gate_up_exps) {
+                // [hidden, 2*width, experts]: gate block then up block per expert.
+                expect_dims(*m.tensor(layer_name(l, "ffn_gate_up_exps.weight")),
+                            {cfg.hidden, static_cast<uint64_t>(ewidth) * 2, cfg.expert_count});
+            } else {
+                for (const char *suffix : {"ffn_gate_exps.weight", "ffn_up_exps.weight"})
+                    expect_dims(*m.tensor(layer_name(l, suffix)),
+                                {cfg.hidden, ewidth, cfg.expert_count});
+            }
             expect_dims(*m.tensor(layer_name(l, "ffn_down_exps.weight")),
                         {ewidth, cfg.hidden, cfg.expert_count});
             if (cfg.shared_expert) {
@@ -1479,12 +1578,20 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
         // Each expert's slice of a stacked tensor must be a whole number of
         // quantisation blocks, otherwise a slice would start or end mid-block.
         const uint32_t expert_count = cfg.expert_count;
+        // The record always carries three extents; the fused layout splits its
+        // single gate_up tensor into two of them, so everything downstream (the
+        // slot layout, the expert reader) is unchanged.
         const std::array<TensorRole, 3> roles = {TensorRole::FFN_GATE_EXPS,
                                                  TensorRole::FFN_UP_EXPS,
                                                  TensorRole::FFN_DOWN_EXPS};
-        const std::array<std::string, 3> suffixes = {"ffn_gate_exps.weight",
-                                                     "ffn_up_exps.weight",
-                                                     "ffn_down_exps.weight"};
+        const std::array<std::string, 3> suffixes =
+            cfg.fused_gate_up_exps
+                ? std::array<std::string, 3>{"ffn_gate_up_exps.weight",
+                                             "ffn_gate_up_exps.weight",
+                                             "ffn_down_exps.weight"}
+                : std::array<std::string, 3>{"ffn_gate_exps.weight",
+                                             "ffn_up_exps.weight",
+                                             "ffn_down_exps.weight"};
         // Only layers at or past the dense lead carry stacked experts; the
         // leading blocks of a deepseek checkpoint are plain FFNs.
         for (uint32_t l = cfg.dense_lead; l < cfg.layers; ++l) {
@@ -1497,9 +1604,13 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
                 const TensorInfo &tensor = *m.tensor(layer_name(l, suffixes[r]));
                 if (tensor.byte_size % expert_count != 0)
                     fail(ErrorCode::SHAPE_MISMATCH, "stacked expert tensor is not evenly divisible");
-                strides[r] = tensor.byte_size / expert_count;
-                if (tensor.block_size > 1 &&
-                    (tensor.dims[0] * tensor.dims[1] / expert_count) % tensor.block_size != 0)
+                uint64_t slice = tensor.byte_size / expert_count;
+                if (cfg.fused_gate_up_exps && r < 2) slice /= 2;  // gate half, up half
+                strides[r] = slice;
+                const uint64_t rows = cfg.fused_gate_up_exps && r < 2
+                                          ? tensor.dims[0] * tensor.dims[1] / (2 * expert_count)
+                                          : tensor.dims[0] * tensor.dims[1] / expert_count;
+                if (tensor.block_size > 1 && rows % tensor.block_size != 0)
                     fail(ErrorCode::SHAPE_MISMATCH,
                          "expert slice is not a whole number of quantisation blocks");
             }
@@ -1511,7 +1622,14 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
                 rec.checksum_known = false; // vendor files publish no checksums
                 for (int r = 0; r < 3; ++r) {
                     const TensorInfo &tensor = *m.tensor(layer_name(l, suffixes[r]));
-                    rec.extents[r] = {roles[r], tensor.absolute_offset + e * strides[r], strides[r]};
+                    // A fused tensor's expert slice starts at e * (2*half); its
+                    // gate half is first and its up half follows immediately.
+                    const uint64_t base =
+                        tensor.absolute_offset + e * (cfg.fused_gate_up_exps && r < 2
+                                                          ? strides[0] * 2
+                                                          : strides[r]);
+                    const uint64_t offset = r == 1 && cfg.fused_gate_up_exps ? base + strides[0] : base;
+                    rec.extents[r] = {roles[r], offset, strides[r]};
                 }
                 m.expert_index.emplace(ModelManifest::expert_key(l, e), m.experts.size());
                 m.experts.push_back(rec);
@@ -1656,6 +1774,8 @@ ModelManifest build_manifest(const GGUFDocument &doc, const std::string &source_
         if (tensor.canonical.empty()) tensor.canonical = tensor.name;
         uint32_t layer = 0;
         tensor.role = role_from_name(tensor.name, layer);
+        tensor.tag = adapter_tensor_tag(tensor.role);
+        tensor.op = adapter_tensor_op(tensor.role);
         bool global_role = tensor.role == TensorRole::TOKEN_EMBD ||
                            tensor.role == TensorRole::OUTPUT ||
                            tensor.role == TensorRole::OUTPUT_NORM;
@@ -1888,6 +2008,11 @@ Json inspect_json(const ModelManifest &manifest, const std::string &source_path)
         entry.set("canonical_name",
                   tensor->canonical.empty() ? tensor->name : tensor->canonical);
         entry.set("role", tensor_role_name(tensor->role));
+        // The adapter tag and the operation it feeds, in llama.cpp's vocabulary.
+        // Two adapters can map the same source name to different roles, so the
+        // tag is the thing to compare in a bug report.
+        entry.set("tag", tensor->tag);
+        entry.set("op", tensor->op);
         entry.set("type", tensor->type_name);
         // Whether the type byte was recognised and whether `bytes` is the
         // decoder's own figure or was recovered from the neighbouring tensor.
@@ -2012,10 +2137,21 @@ TensorCapability tensor_capability(uint32_t type_id) {
         cap.execute = true;
         cap.note = "block decoder plus quantised GEMV kernel";
         break;
+    case 16: case 17: case 18: case 19: case 21: case 22: case 23: case 29:
+        // The IQ family: grid-indexed codecs with sign bits and packed scales.
+        cap.dequantize = true;
+        cap.execute = true;
+        cap.note = "grid-indexed IQ block decoder plus quantised GEMV kernel";
+        break;
     case 20: // IQ4_NL: 4-bit non-linear lookup, decode + execute
         cap.dequantize = true;
         cap.execute = true;
         cap.note = "non-linear 4-bit block decoder plus quantised GEMV kernel";
+        break;
+    case 39: case 40: // MXFP4, NVFP4: FP4 with a per-block exponent scale
+        cap.dequantize = true;
+        cap.execute = true;
+        cap.note = "FP4 block decoder (E8M0/UE4M3 scale) plus quantised GEMV kernel";
         break;
     case 24: case 25: case 26: case 27: case 28: // I8..F64
         cap.dequantize = true;

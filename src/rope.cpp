@@ -86,6 +86,8 @@ void resolve_rope_scaling(ModelConfig &cfg) {
 
 void RopePlan::init(const ModelConfig &cfg, uint32_t n_dims) {
     this->n_dims = n_dims;
+    sections = cfg.rope_sections;
+    interleaved_sections = cfg.mrope_interleaved;
     freq_base = cfg.rope_theta > 0.0 ? cfg.rope_theta : 10000.0;
     freq_scale = cfg.rope_freq_scale > 0.0 ? cfg.rope_freq_scale : 1.0;
     ext_factor = cfg.rope_ext_factor;
@@ -99,6 +101,32 @@ void RopePlan::init(const ModelConfig &cfg, uint32_t n_dims) {
         corr_low = dims[0];
         corr_high = dims[1];
     }
+}
+
+uint32_t RopePlan::axis_of(uint32_t pair) const {
+    const uint32_t total = sections[0] + sections[1] + sections[2] + sections[3];
+    if (total == 0) return 0;
+    // The section pattern repeats every `total` pairs, so a head wider than the
+    // sections wrap around rather than running out.
+    const uint32_t sector = pair % total;
+    if (interleaved_sections) {
+        // t/t/y/x in triplets: the modulo picks the axis, the bound stops the
+        // cycle once the axis has run out of pairs.
+        if (sector % 3 == 1 && sector < 3 * sections[1]) return 1;
+        if (sector % 3 == 2 && sector < 3 * sections[2]) return 2;
+        if (sector % 3 == 0 && sector < 3 * sections[0]) return 0;
+        return 3;
+    }
+    if (sector >= sections[0] && sector < sections[0] + sections[1]) return 1;
+    if (sector >= sections[0] + sections[1] && sector < sections[0] + sections[1] + sections[2])
+        return 2;
+    if (sector >= sections[0] + sections[1] + sections[2]) return 3;
+    return 0;
+}
+
+void RopePlan::rotation(uint32_t pair, const std::array<double, 4> &positions, double &cos_theta,
+                        double &sin_theta) const {
+    rotation(pair, positions[axis_of(pair)], cos_theta, sin_theta);
 }
 
 void RopePlan::rotation(uint32_t pair, double position, double &cos_theta,

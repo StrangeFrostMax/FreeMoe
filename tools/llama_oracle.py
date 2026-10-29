@@ -120,7 +120,14 @@ def load_model(path: Path) -> dict[str, Any]:
                             else float(key("embedding_scale", 12.0))
                             if arch == "minicpm" else 1.0),
         "norm_add_one": arch in ("gemma", "gemma2", "gemma3"),
-        "activation": "gelu" if arch in ("gemma", "gemma2", "gemma3") else "silu",
+        "activation": ("swiglu-oai" if arch in ("gpt-oss", "minimax-m3")
+                       else "gelu" if arch in ("gemma", "gemma2", "gemma3") else "silu"),
+        "activation_limit": 7.0 if arch in ("gpt-oss", "minimax-m3") else 0.0,
+        "activation_alpha": 1.702 if arch in ("gpt-oss", "minimax-m3") else 0.0,
+        # Per-layer clamp for `silu-clamp`, straight from the metadata array.
+        # A file that declares it selects the clamped variant, exactly as the
+        # engine does; the mode is never inferred from the architecture name.
+        "swiglu_clamp": [float(v) for v in key("swiglu_clamp_exp", [])],
         # Detected from the tensors, exactly as the engine's adapter does:
         # keying this off the architecture name silently skipped glm4's norms.
         "post_norms": "blk.0.attn_post_norm.weight" in tensors,
@@ -194,6 +201,9 @@ def load_model(path: Path) -> dict[str, Any]:
         raise ReferenceError("inconsistent grouped-query head counts")
     if cfg["rope_dim"] % 2 or cfg["rope_dim"] > cfg["hd"]:
         raise ReferenceError("invalid rotary dimension")
+    if cfg["activation"] == "silu" and any(v > 1e-6 for v in cfg["swiglu_clamp"]):
+        cfg["activation"] = "silu-clamp"
+        cfg["activation_limit"] = max(cfg["swiglu_clamp"])
     return cfg
 
 
@@ -373,26 +383,56 @@ def expert_output(cfg: dict[str, Any], layer: int, expert: int,
     from an assumption about float sizes.
     """
     H, I = cfg["H"], cfg["I_exp"]
-    count = cfg["experts"]
     tensors = cfg["tensors"]
-    out = []
-    for name, out_dim, in_dim in (
-            (prefix + "ffn_gate_exps.weight", I, H),
-            (prefix + "ffn_up_exps.weight", I, H)):
-        dims, data = tensors[name]
-        per_expert = out_dim * in_dim
+    if prefix + "ffn_gate_up_exps.weight" in tensors:
+        # Fused layout: one tensor per layer of shape [H, 2*I, experts], gate
+        # block first. Each expert owns a contiguous 2*I*H slice, so the halves
+        # are a slice of that slice rather than of the whole tensor.
+        dims, data = tensors[prefix + "ffn_gate_up_exps.weight"]
+        per_expert = 2 * I * H
         base = expert * per_expert
-        out.append(matvec(data[base:base + per_expert], x, out_dim, in_dim))
-    gate_vals, up_vals = out
-    if cfg["activation"] == "gelu":
-        act = [gelu(gate_vals[i]) * up_vals[i] for i in range(I)]
+        gate_vals = matvec(data[base:base + I * H], x, I, H)
+        up_vals = matvec(data[base + I * H:base + 2 * I * H], x, I, H)
     else:
-        act = [gate_vals[i] / (1.0 + math.exp(-gate_vals[i])) * up_vals[i]
-               for i in range(I)]
+        out = []
+        for name, out_dim, in_dim in (
+                (prefix + "ffn_gate_exps.weight", I, H),
+                (prefix + "ffn_up_exps.weight", I, H)):
+            dims, data = tensors[name]
+            per_expert = out_dim * in_dim
+            base = expert * per_expert
+            out.append(matvec(data[base:base + per_expert], x, out_dim, in_dim))
+        gate_vals, up_vals = out
+    act = [gated(cfg, gate_vals[i], up_vals[i], layer) for i in range(I)]
     dims, data = tensors[prefix + "ffn_down_exps.weight"]
     per_expert = H * I
     base = expert * per_expert
     return matvec(data[base:base + per_expert], act, H, I)
+
+
+def gated(cfg: dict[str, Any], gate: float, up: float, layer: int) -> float:
+    """The gated activation, including the two clamped variants.
+
+    `swiglu-oai` is gpt-oss's `silu(alpha*gate) * (up + 1)` with both branches
+    clamped to +/-limit; `silu-clamp` is plain silu with a per-layer bound. Both
+    come from ggml's `swiglu_oai` / `swiglu_clamp` kernels.
+    """
+    kind = cfg["activation"]
+    limit = cfg.get("activation_limit") or 0.0
+    if kind == "swiglu-oai":
+        x = min(gate, limit)
+        y = max(-limit, min(limit, up))
+        return (x / (1.0 + math.exp(-cfg["activation_alpha"] * x))) * (y + 1.0)
+    if kind == "silu-clamp":
+        per_layer = cfg.get("swiglu_clamp") or []
+        bound = per_layer[layer] if layer < len(per_layer) else limit
+        if bound <= 0.0:
+            return gate / (1.0 + math.exp(-gate)) * up
+        g = min(gate / (1.0 + math.exp(-gate)), bound)
+        return g * max(-bound, min(bound, up))
+    if kind == "gelu":
+        return gelu(gate) * up
+    return gate / (1.0 + math.exp(-gate)) * up
 
 
 def softmax(values: list[float]) -> list[float]:
@@ -637,8 +677,7 @@ class Session:
                 if cfg["activation"] == "gelu":
                     act = [gelu(gate[i]) * up[i] for i in range(cfg["I"])]
                 else:
-                    act = [gate[i] / (1.0 + math.exp(-gate[i])) * up[i]
-                           for i in range(cfg["I"])]
+                    act = [gated(cfg, gate[i], up[i], layer) for i in range(cfg["I"])]
                 down = matvec(self.tensor(p + "ffn_down.weight"), act, H, cfg["I"])
             if cfg["shared_expert"] and layer >= cfg["dense_lead"]:
                 # qwen2moe's shared expert: a dense FFN beside the routed ones,
@@ -656,8 +695,7 @@ class Session:
                 if cfg["activation"] == "gelu":
                     s_act = [gelu(s_gate[i]) * s_up[i] for i in range(W)]
                 else:
-                    s_act = [s_gate[i] / (1.0 + math.exp(-s_gate[i])) * s_up[i]
-                             for i in range(W)]
+                    s_act = [gated(cfg, s_gate[i], s_up[i], layer) for i in range(W)]
                 s_down = matvec(self.tensor(p + "ffn_down_shexp.weight"), s_act, H, W)
                 down = [down[i] + gate_scalar * s_down[i] for i in range(H)]
             if cfg["post_norms"]:
