@@ -36,7 +36,19 @@ jobs:
             while IFS= read -r line; do echo "::error title=build::$line"; done
           exit 1
       - name: Unit and architecture tests
-        run: make test
+        run: |
+          set -o pipefail
+          make test 2>&1 | tee test.log
+      # Same reasoning as the build step: without this, a failing test surfaces
+      # only as "exit code 1" on the check run, because the raw log is behind a
+      # short-lived blob URL. Annotate the failing lines and the tail.
+      - name: Report test failures
+        if: failure()
+        run: |
+          grep -nE "\[FAIL\]|FAILED|Traceback|Error|error:|failures" test.log | head -25 |
+            while IFS= read -r line; do echo "::error title=tests::$line"; done
+          tail -25 test.log | while IFS= read -r line; do echo "::error title=tests tail::$line"; done
+          exit 1
       - name: Fixture and table regeneration checks
         run: |
           python3 tools/gen_quant_tables.py --check
