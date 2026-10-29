@@ -110,6 +110,9 @@ const std::map<std::string, ArchFacts> &known_architectures() {
         // The state rolls forward in place rather than through a kv cache.
         {"mamba", {true, false}},
         {"mamba2", {true, false}},
+        // jamba: a hybrid stack, so it needs both a rolling state and a
+        // per-position cache, and its attention layers carry no rotary.
+        {"jamba", {true, false}},
         {"glm4moe", {false, true}},
         {"multimodal", {false, true}},
     };

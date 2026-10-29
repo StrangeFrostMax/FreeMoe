@@ -42,9 +42,12 @@
 > * **The recurrent block runs.** `mamba`, `mamba2` and the falcon-mamba
 >   `dt_b_c_rms` variant have fixtures, oracle goldens and parity rows: a 1D
 >   convolution plus the `ggml_ssm_scan` arithmetic, with the state sized and
->   reserved per layer instead of a per-position cache. Hybrid stacks
->   (recurrent layers interleaved with attention) are refused explicitly,
->   because their attention layers would need a cache beside the state.
+>   reserved per layer instead of a per-position cache. The **hybrid layout**
+>   runs as well (`jamba` fixture, golden and parity row): recurrent and
+>   attention layers interleaved in one stack, with the split, the feed-forward
+>   and the router all read per layer, and one cache region holding a
+>   per-position cache for the attention layers and a rolling state for the
+>   recurrent ones.
 > * **Adapter rows carry llama.cpp's tag vocabulary** (`inspect --tags`,
 >   `freemoe adapters`), so a failure can be compared with an upstream
 >   `llama_model_loader` message tensor by tensor.

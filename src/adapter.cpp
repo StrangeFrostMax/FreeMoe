@@ -54,6 +54,8 @@ const AdapterRow kRows[] = {
      "1D convolution plus a state-space scan, element-wise decay, no attention"},
     {"mamba2", "LLM_ARCH_MAMBA2", "llm_build_mamba_base::build_mamba2_layer",
      "grouped scan with a scalar decay and a grouped norm, no attention"},
+    {"jamba", "LLM_ARCH_JAMBA", "llama_model_jamba::build_arch_graph",
+     "mamba layers interleaved with attention layers that carry no rotary"},
 };
 
 }  // namespace
@@ -152,8 +154,11 @@ std::vector<std::string> adapter_config_tags(const ModelConfig &cfg) {
     tags.push_back("adapter=" + cfg.adapter);
     tags.push_back("kind=" + cfg.model_kind);
 
-    // Attention shape. A recurrent file has no attention to describe.
-    if (cfg.ssm_kind.empty()) {
+    // Attention shape. A pure recurrent file has no attention to describe; a
+    // hybrid has both, so both sets of tags are emitted and the reader can see
+    // which layers run which.
+    const bool attention_layers = cfg.attention_layer_count() != 0;
+    if (attention_layers) {
         if (cfg.kv_heads == cfg.heads) tags.push_back("attn=mha");
         else if (cfg.kv_heads == 1) tags.push_back("attn=mqa");
         else tags.push_back("attn=gqa");
@@ -175,6 +180,9 @@ std::vector<std::string> adapter_config_tags(const ModelConfig &cfg) {
         if (cfg.ssm_groups > 1) tags.push_back("ssm_groups=" + std::to_string(cfg.ssm_groups));
         if (cfg.ssm_vector_norms) tags.push_back("ssm_dt_b_c_rms=yes");
         if (!cfg.has_ffn) tags.push_back("ffn=none");
+        if (cfg.recurrent_layer_count() != cfg.layers)
+            tags.push_back("recurrent_layers=" + std::to_string(cfg.recurrent_layer_count()) +
+                           "/" + std::to_string(cfg.layers));
     }
     if (cfg.attn_temp_scale != 0.0) tags.push_back("attn_temp=on");
     if (cfg.ffn_gate_bias) tags.push_back("bias=ffn_gate");
@@ -184,8 +192,10 @@ std::vector<std::string> adapter_config_tags(const ModelConfig &cfg) {
     if (cfg.attn_logit_softcap > 0.0) tags.push_back("attn_softcap=on");
 
     // Rotary. A recurrent layer has none, so the tag is omitted rather than
-    // claiming a full-width rotation that never runs.
-    if (cfg.ssm_kind.empty())
+    // claiming a full-width rotation that never runs; jamba has attention layers
+    // that rotate nothing, which is a different fact again and says so.
+    if (cfg.rope_disabled) tags.push_back("rope=none");
+    else if (attention_layers)
         tags.push_back("rope=" + (cfg.rope_dim && cfg.rope_dim != cfg.head_dim
                                       ? std::string("partial")
                                       : std::string("full")));
@@ -224,6 +234,14 @@ std::vector<std::string> adapter_config_tags(const ModelConfig &cfg) {
     if (cfg.ffn_no_gate) tags.push_back("ffn=no-gate");
     if (cfg.expert_count) {
         tags.push_back("moe=stacked");
+        // A hybrid can place its experts on one kind of layer only (jamba mixes
+        // dense and MoE blocks), so the count of routed layers is a fact about
+        // the file that a per-model tag would hide.
+        uint32_t routed = 0;
+        for (uint32_t l = 0; l < cfg.layers; ++l)
+            if (cfg.layer_is_moe(l)) ++routed;
+        if (routed != cfg.layers) tags.push_back("moe_layers=" + std::to_string(routed) + "/" +
+                                                 std::to_string(cfg.layers));
         tags.push_back("experts=" + std::to_string(cfg.expert_count) + "x" +
                        std::to_string(cfg.expert_top_k));
         tags.push_back("gating=" + cfg.expert_gating);

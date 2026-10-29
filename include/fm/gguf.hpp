@@ -343,15 +343,78 @@ struct ModelConfig {
     // tensors are the evidence, so this is read rather than assumed.
     bool ssm_vector_norms = false;
     // Per-layer recurrence. An empty list means every layer is recurrent, which
-    // is what a pure mamba file says by simply having no attention tensors.
+    // is what a pure mamba file says by simply having no attention tensors. A
+    // hybrid stack (jamba, nemotron-h) states the split explicitly: in llama.cpp
+    // it is `attention.recurrent_layers` or a per-layer `attention.head_count_kv`
+    // whose zero entries mean "this layer has no attention at all".
     std::vector<uint8_t> recurrent_layers;
-    // False for a pure state-space model: llama.cpp's mamba block has no FFN.
+    // Per-layer feed-forward presence. A pure state-space model has none at all;
+    // a hybrid may put one behind either kind of layer, so this is a mask rather
+    // than a flag. Empty means every layer has one.
+    std::vector<uint8_t> ffn_layers;
     bool has_ffn = true;
+    // Per-layer routed-expert presence. Upstream marks `ffn_gate_inp` as
+    // optional per layer, which is how a family can mix dense and MoE blocks
+    // (jamba does). Empty means "follow model_kind and dense_lead", which is what
+    // a uniform file says.
+    std::vector<uint8_t> moe_layers;
+    // jamba's attention layers carry no rotary position at all; upstream says so
+    // by not calling the rope in its block, and the file says so by carrying no
+    // `rope.dimension_count`.
+    bool rope_disabled = false;
 
     bool layer_is_recurrent(uint32_t layer) const {
         if (ssm_kind.empty()) return false;
         if (recurrent_layers.empty()) return true;
         return layer < recurrent_layers.size() && recurrent_layers[layer] != 0;
+    }
+    bool layer_has_ffn(uint32_t layer) const {
+        if (!has_ffn) return false;
+        if (ffn_layers.empty()) return true;
+        return layer < ffn_layers.size() && ffn_layers[layer] != 0;
+    }
+    bool layer_is_moe(uint32_t layer) const {
+        // A file with no per-layer mask (the native reference family) uses the
+        // model-wide rule: experts on every layer past the dense lead.
+        if (moe_layers.empty()) return model_kind == "moe" && layer >= dense_lead;
+        return layer < moe_layers.size() && moe_layers[layer] != 0;
+    }
+    // How many layers of each kind a stack has. The cache is laid out as one
+    // region per kind, so an attention layer indexes the attention region by its
+    // position among attention layers rather than by its own layer index.
+    uint32_t attention_layer_count() const {
+        uint32_t count = 0;
+        for (uint32_t l = 0; l < layers; ++l)
+            if (!layer_is_recurrent(l)) ++count;
+        return count;
+    }
+    uint32_t recurrent_layer_count() const {
+        uint32_t count = 0;
+        for (uint32_t l = 0; l < layers; ++l)
+            if (layer_is_recurrent(l)) ++count;
+        return count;
+    }
+    uint32_t attention_slot(uint32_t layer) const {
+        uint32_t slot = 0;
+        for (uint32_t l = 0; l < layer && l < layers; ++l)
+            if (!layer_is_recurrent(l)) ++slot;
+        return slot;
+    }
+    uint32_t recurrent_slot(uint32_t layer) const {
+        uint32_t slot = 0;
+        for (uint32_t l = 0; l < layer && l < layers; ++l)
+            if (layer_is_recurrent(l)) ++slot;
+        return slot;
+    }
+    // Floats of per-position cache the attention layers need, at `context`
+    // positions: one (key, value) pair per kv head per layer. The recurrent
+    // layers contribute nothing here; their rolling state is fixed size.
+    uint64_t attention_cache_floats(uint64_t context) const {
+        const uint64_t kv_dim = static_cast<uint64_t>(kv_heads) * head_dim;
+        return static_cast<uint64_t>(attention_layer_count()) * context * (kv_dim + v_dim());
+    }
+    uint64_t recurrent_state_floats() const {
+        return static_cast<uint64_t>(recurrent_layer_count()) * ssm_state_floats();
     }
     // The channels the 1D convolution runs over: the state width for mamba, and
     // the state plus the grouped B and C for mamba2.

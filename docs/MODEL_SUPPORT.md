@@ -67,7 +67,8 @@ each family, the tool records what a specific file contains.
 | `mistral3`: biases on all three FFN projections, adaptive RMSNorm over the sinusoidal delay embedding (`gelu_erf` + `seq`), per-position attention temperature | WORKS (fixture + oracle golden) |
 | `qwen3vl`, `qwen3vlmoe`: the text block with mRoPE section splits (required key, as upstream) | WORKS (fixture + oracle golden each); vision tower out of scope |
 | `mamba`, `mamba2`: 1D convolution + state-space scan, `dt_b_c_rms`, the recurrent state reserved per layer in place of a kv cache | WORKS (fixtures, oracle goldens, `recurrent_families`) |
-| Hybrid stacks (recurrent layers interleaved with attention, e.g. `jamba`, `nemotron_h`, `falcon-h1`) | **MISSING** — refused by name: the attention layers need a cache beside the state |
+| `jamba`: recurrent (mamba) layers interleaved with attention layers that carry no rotary, per-layer feed-forward, and a stack that mixes dense and MoE blocks | WORKS (fixture + oracle golden); `recurrent_layers=2/4 rope=none moe_layers=2/4` in `inspect --tags` |
+| Hybrid stacks of other architectures (`nemotron_h`, `falcon-h1`, `granite-hybrid`, `plamo2`) | **Adapter row missing, not the block**: the layout runs (`jamba`); each of these needs its own row and block details, and `falcon-h1` runs its two mixers in parallel rather than interleaved |
 | `glm4-moe`, `minicpm3`, and the remaining architectures in llama.cpp's `src/models/` | **MISSING** — see `docs/MODEL_COVERAGE_STATUS.md` for the per-model reason |
 | PrismML rotated weight basis (`prism.hadamard.*`) and Hadamard activation transform | **MISSING**, hard blocker |
 | Linear attention: gated delta-net (`qwen35`, `qwen3next`, `kimi-linear`) | **MISSING**, hard blocker (a different scan: per-head matrix state) |

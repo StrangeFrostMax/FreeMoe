@@ -85,17 +85,54 @@ def load_model(path: Path) -> dict[str, Any]:
 
     hidden = int(key("embedding_length"))
     n_layer = int(key("block_count"))
-    # A pure state-space file has no attention, so it states no head count.
-    has_ssm = "blk.0.ssm_in.weight" in tensors
-    heads = 0 if has_ssm else int(key("attention.head_count"))
-    hd = 0 if has_ssm else int(key("attention.key_length", hidden // heads))
+    # Which layers are recurrent, read from the tensors exactly as the engine
+    # does: a layer with `ssm_in` has no attention, and the layers without one
+    # are an ordinary attention stack. A pure mamba file is all-recurrent; a
+    # hybrid (jamba) mixes the two, so every block fact below is read from a
+    # layer that actually runs that block.
+    recurrent = [f"blk.{l}.ssm_in.weight" in tensors for l in range(n_layer)]
+    has_ssm = any(recurrent)
+    has_attn = not all(recurrent)
+    probe = next(l for l in range(n_layer) if not recurrent[l]) if has_attn else 0
+    first_recr = next(l for l in range(n_layer) if recurrent[l]) if has_ssm else 0
+
+    def blk(name: str) -> str:
+        return f"blk.{probe}.{name}"
+
+    def has(name: str) -> bool:
+        return blk(name) in tensors
+
+    def blk_rec(name: str) -> str:
+        return f"blk.{first_recr}.{name}"
+
+    def moe_layer(layer: int) -> bool:
+        # Upstream makes `ffn_gate_inp` optional per layer, which is how one stack
+        # mixes dense and MoE blocks.
+        return f"blk.{layer}.ffn_gate_inp.weight" in tensors
+
+    def ffn_layer(layer: int) -> bool:
+        for suffix in ("ffn_up.weight", "ffn_gate_up.weight", "ffn_up_exps.weight",
+                       "ffn_gate_up_exps.weight", "ffn_down_exps.weight"):
+            if f"blk.{layer}.{suffix}" in tensors:
+                return True
+        return False
+
+    heads = int(key("attention.head_count")) if has_attn else 0
+    hd = int(key("attention.key_length", hidden // heads)) if has_attn else 0
+    kv_head_key = key("attention.head_count_kv", heads) if has_attn else 0
+    if isinstance(kv_head_key, list):
+        # Per-layer array form: zero entries are the recurrent layers.
+        values = {int(v) for v in kv_head_key if int(v) != 0}
+        if len(values) != 1:
+            raise ReferenceError("per-layer attention.head_count_kv values differ")
+        kv_head_key = values.pop()
     cfg = {
         "arch": arch,
         "H": hidden,
-        "I": 0 if has_ssm else int(key("feed_forward_length")),
+        "I": int(key("feed_forward_length")) if has_attn else 0,
         "L": int(key("block_count")),
         "heads": heads,
-        "kv_heads": 0 if has_ssm else int(key("attention.head_count_kv", heads)),
+        "kv_heads": int(kv_head_key) if has_attn else 0,
         "hd": hd,
         "V": int(key("vocab_size", len(md.get("tokenizer.ggml.tokens", [])))),
         "ctx": int(key("context_length")),
@@ -114,37 +151,37 @@ def load_model(path: Path) -> dict[str, Any]:
         "bos": int(md.get("tokenizer.ggml.bos_token_id", 1)),
         "eos": int(md.get("tokenizer.ggml.eos_token_id", 2)),
         # Presence of the per-head q/k scales is the evidence qwen3 uses them.
-        "qk_norm": "blk.0.attn_q_norm.weight" in tensors,
+        "qk_norm": has("attn_q_norm.weight"),
         # phi3 fuses q/k/v into one projection (and one optional bias).
-        "fused_qkv": "blk.0.attn_qkv.weight" in tensors,
+        "fused_qkv": has("attn_qkv.weight"),
         # glm4 keeps gate and up in one tensor: gate first, then up. The width is
         # the evidence -- phi2 also has no gate, but its up is [hidden, I].
-        "fused_gate_up": (not has_ssm
-                          and "blk.0.ffn_gate.weight" not in tensors
-                          and "blk.0.ffn_up.weight" in tensors
-                          and "blk.0.ffn_gate_exps.weight" not in tensors
-                          and tensors["blk.0.ffn_up.weight"][0][1] == 2 * int(key("feed_forward_length"))),
+        "fused_gate_up": (has_attn
+                          and not has("ffn_gate.weight")
+                          and has("ffn_up.weight")
+                          and not has("ffn_gate_exps.weight")
+                          and tensors[blk("ffn_up.weight")][0][1] == 2 * int(key("feed_forward_length"))),
         # phi2's block: LayerNorm, biases on the norms/FFN/logits, a gate-free
         # GELU feed-forward fed by the attention norm, and one shared residual.
         # Every one of these is read from the tensors or the epsilon key.
         "layer_norm": f"{arch}.attention.layer_norm_epsilon" in md,
-        "norm_bias": "blk.0.attn_norm.bias" in tensors,
+        "norm_bias": has("attn_norm.bias"),
         # A block with neither an FFN norm nor a post-attention norm reuses the
         # attention's normalised input (phi2). gpt-oss has the post-attention
         # norm, so it is an ordinary pre-norm block.
-        "parallel_residual": ("blk.0.ffn_norm.weight" not in tensors
-                              and "blk.0.attn_post_norm.weight" not in tensors
+        "parallel_residual": (not has("ffn_norm.weight")
+                              and not has("attn_post_norm.weight")
                               # a recurrent layer has no FFN to normalise
                               and not has_ssm),
-        "ffn_bias": "blk.0.ffn_up.bias" in tensors,
-        "ffn_gate_bias": "blk.0.ffn_gate.bias" in tensors,
+        "ffn_bias": has("ffn_up.bias"),
+        "ffn_gate_bias": has("ffn_gate.bias"),
         # mistral3's adaptive RMSNorm and its delay embedding.
-        "ffn_norm_ada": "blk.0.ffn_norm_ada_down.weight" in tensors,
+        "ffn_norm_ada": has("ffn_norm_ada_down.weight"),
         "realtime_delay": int(key("realtime_delay_tokens", 0)),
         # llama.cpp's per-position attention temperature.
         "attn_temp_scale": float(key("attention.temperature_scale", 0.0)),
         "attn_temp_floor": float(key("rope.scaling.original_context_length", 0.0)),
-        "attn_output_bias": "blk.0.attn_output.bias" in tensors,
+        "attn_output_bias": has("attn_output.bias"),
         "logit_bias": "output.bias" in tensors,
         # gemma family: scaled embeddings, zero-centred norm scales, GeGLU.
         # A multiplier, not a flag: gemma uses sqrt(hidden), minicpm 12.0.
@@ -167,15 +204,14 @@ def load_model(path: Path) -> dict[str, Any]:
         # keying this off the architecture name silently skipped glm4's norms.
         # Both post-norms or neither: gpt-oss has the attention one alone,
         # which is not a post-norm block at all but a re-named FFN norm.
-        "post_norms": ("blk.0.attn_post_norm.weight" in tensors
-                       and "blk.0.ffn_post_norm.weight" in tensors),
+        "post_norms": (has("attn_post_norm.weight") and has("ffn_post_norm.weight")),
         # BitNet's SUBLN: an RMSNorm on the attention output before the output
         # projection, and one on the gated FFN output before the down
         # projection. Tensor-presence evidence, like every other structure here.
-        "sub_norms": "blk.0.attn_sub_norm.weight" in tensors,
+        "sub_norms": has("attn_sub_norm.weight"),
         # Optional one-element `*.scale` tensors that multiply a projection's
         # output; llama.cpp folds them into `build_lora_mm`, before any bias.
-        "proj_scales": "blk.0.attn_q.scale" in tensors,
+        "proj_scales": has("attn_q.scale"),
         "attn_softcap": float(key("attn_logit_softcapping", 0.0)),
         "final_softcap": float(key("final_logit_softcapping", 0.0)),
         "window": int(key("attention.sliding_window", 0)),
@@ -185,8 +221,7 @@ def load_model(path: Path) -> dict[str, Any]:
         "window_layers": _window_layers(md, arch, n_layer, int(key("attention.sliding_window", 0))),
         # gpt-oss feeds the FFN from its post-attention norm and has no ffn_norm
         # tensor of its own.
-        "ffn_norm_is_post": ("blk.0.attn_post_norm.weight" in tensors
-                             and "blk.0.ffn_norm.weight" not in tensors),
+        "ffn_norm_is_post": (has("attn_post_norm.weight") and not has("ffn_norm.weight")),
         # Two distinct MoE biases, in two distinct places.
         "router_bias": any(f"blk.{l}.ffn_gate_inp.bias" in tensors for l in range(n_layer)),
         "expert_proj_bias": any(f"blk.{l}.ffn_gate_exps.bias" in tensors
@@ -195,16 +230,19 @@ def load_model(path: Path) -> dict[str, Any]:
         # A file with `ssm_in` has no attention; a pure mamba file has no FFN
         # either. Both facts are read from the tensors, as they are in the
         # adapter.
-        "ssm_kind": ("mamba2" if ("blk.0.ssm_a" in tensors and
-                                  tensors["blk.0.ssm_a"][0][0] == 1)
-                     else "mamba" if "blk.0.ssm_in.weight" in tensors else ""),
+        "ssm_kind": ("mamba2" if (blk_rec("ssm_a") in tensors and
+                                  tensors[blk_rec("ssm_a")][0][0] == 1)
+                     else "mamba" if has_ssm else ""),
         "ssm_conv": int(key("ssm.conv_kernel", 0)),
         "ssm_inner": int(key("ssm.inner_size", 0)),
         "ssm_state": int(key("ssm.state_size", 0)),
         "ssm_dt_rank": int(key("ssm.time_step_rank", 0)),
         "ssm_groups": max(1, int(key("ssm.group_count", 1))),
-        "ssm_vector_norms": "blk.0.ssm_dt_norm.weight" in tensors,
-        "has_ffn": "blk.0.ffn_norm.weight" in tensors,
+        "ssm_vector_norms": blk_rec("ssm_dt_norm.weight") in tensors,
+        "recurrent": recurrent,
+        "moe_layers": [moe_layer(l) for l in range(n_layer)],
+        "ffn_layers": [ffn_layer(l) for l in range(n_layer)],
+        "has_ffn": any(ffn_layer(l) for l in range(n_layer)),
         "tensors": tensors,
         # Routing semantics straight from the checkpoint. Renormalising over the
         # selected experts is only equivalent to a full softmax when every expert
@@ -213,9 +251,9 @@ def load_model(path: Path) -> dict[str, Any]:
         "top_k": int(key("expert_used_count", 0)),
         # Routed experts and the shared expert can each be narrower than the
         # dense FFN, so the three widths are separate.
-        "I_exp": 0 if has_ssm else int(key("expert_feed_forward_length",
+        "I_exp": 0 if not has_attn else int(key("expert_feed_forward_length",
                                            key("feed_forward_length"))),
-        "I_shexp": 0 if has_ssm else int(key("expert_shared_feed_forward_length",
+        "I_shexp": 0 if not has_attn else int(key("expert_shared_feed_forward_length",
                                              key("feed_forward_length"))),
         # Evidence, not architecture name: the tensors are what the forward pass
         # reads, so their presence is what decides whether the branch runs. Every
@@ -231,13 +269,12 @@ def load_model(path: Path) -> dict[str, Any]:
         # Attention sinks: a per-head logit that the softmax denominator includes
         # and the value sum never reads. Detected from the tensor, like every
         # other structural fact.
-        "attn_sinks": "blk.0.attn_sinks.weight" in tensors,
+        "attn_sinks": has("attn_sinks.weight"),
         # SmolLM3 keeps every fourth layer unrotated.
         "no_rope_step": 4 if arch == "smollm3" else 0,
         # Per-pair rotary frequency divisors; layer 0 is authoritative.
-        "rope_freqs": ("blk.0.rope_freqs.weight" in tensors
-                       and tensors["blk.0.rope_freqs.weight"][1]),
-        "mla": "blk.0.attn_kv_a_mqa.weight" in tensors,
+        "rope_freqs": (has("rope_freqs.weight") and tensors[blk("rope_freqs.weight")][1]),
+        "mla": has("attn_kv_a_mqa.weight"),
         "q_lora_rank": int(key("attention.q_lora_rank", 0)),
         "kv_lora_rank": int(key("attention.kv_lora_rank", 0)),
         "head_v": int(key("attention.value_length_mla", hd)),
@@ -257,8 +294,11 @@ def load_model(path: Path) -> dict[str, Any]:
     # A block with up/down but no gate has no gated activation. GGUF cannot say
     # which activation, so phi2's GELU is applied and anything else is refused --
     # the same rule the engine's adapter enforces.
-    cfg["ffn_no_gate"] = (cfg["experts"] == 0 and "blk.0.ffn_gate.weight" not in tensors
-                          and "blk.0.ffn_up.weight" in tensors and not cfg["fused_gate_up"])
+    cfg["ffn_no_gate"] = (cfg["experts"] == 0 and not has("ffn_gate.weight")
+                          and has("ffn_up.weight") and not cfg["fused_gate_up"])
+    # jamba applies no rotation at all: upstream's block never calls the rope, so
+    # a file of that architecture is not rotated at head width by default.
+    cfg["rope_disabled"] = arch == "jamba"
     if cfg["ffn_no_gate"]:
         # A gate-free FFN cannot say which activation it means, so the
         # architecture has to. Read from llama.cpp's model files: both phi2 and
@@ -276,15 +316,15 @@ def load_model(path: Path) -> dict[str, Any]:
     if arch in ("qwen3vl", "qwen3vlmoe", "qwen35", "qwen35moe") and \
             f"{arch}.rope.dimension_sections" not in md:
         raise ReferenceError(f"{arch} requires rope.dimension_sections")
-    if not cfg["ssm_kind"]:
+    if has_attn:
         if cfg["heads"] * cfg["hd"] != cfg["H"]:
             raise ReferenceError("heads * head_dim != hidden")
         if cfg["kv_heads"] > cfg["heads"] or cfg["heads"] % cfg["kv_heads"]:
             raise ReferenceError("inconsistent grouped-query head counts")
         if cfg["rope_dim"] % 2 or cfg["rope_dim"] > cfg["hd"]:
             raise ReferenceError("invalid rotary dimension")
-    elif cfg["ssm_conv"] < 2 or not (cfg["ssm_inner"] and cfg["ssm_state"] and
-                                     cfg["ssm_dt_rank"]):
+    if has_ssm and (cfg["ssm_conv"] < 2 or not (cfg["ssm_inner"] and cfg["ssm_state"] and
+                                                cfg["ssm_dt_rank"])):
         raise ReferenceError("an SSM layer needs a convolution width of at least 2 "
                              "and non-zero sizes")
     if cfg["activation"] == "silu" and any(v > 1e-6 for v in cfg["swiglu_clamp"]):
@@ -741,10 +781,12 @@ class Session:
             if TRACE is not None:
                 TRACE[f"h.L{layer}"] = list(h)
             attn_normed = list(h) if cfg["parallel_residual"] else None
-            if cfg["ssm_kind"]:
+            if cfg["recurrent"][layer]:
                 delta = self.ssm_block(layer, p, h)
+                if TRACE is not None:
+                    TRACE[f"ssm.L{layer}"] = (sum(h), sum(delta))
                 x = [x[i] + delta[i] for i in range(H)]
-                if not cfg["has_ffn"]:
+                if not cfg["ffn_layers"][layer]:
                     continue
                 h = norm_of(x, p + "ffn_norm")
             else:
@@ -824,7 +866,9 @@ class Session:
                         q = head_rmsnorm(q, heads, self.tensor(p + "attn_q_norm.weight"), cfg["eps"])
                         k = head_rmsnorm(k, kv_heads, self.tensor(p + "attn_k_norm.weight"), cfg["eps"])
                     step = cfg["no_rope_step"]
-                    if step == 0 or (layer + 1) % step != 0:
+                    # jamba rotates nothing at all: upstream's attention layer
+                    # never calls the rope.
+                    if not cfg["rope_disabled"] and (step == 0 or (layer + 1) % step != 0):
                         rope_half(q, hd, heads, self.pos, cfg["rope_dim"], cfg["theta"],
                                   cfg["rope_scale"], cfg["rope_freqs"])
                         rope_half(k, hd, kv_heads, self.pos, cfg["rope_dim"], cfg["theta"],
@@ -916,6 +960,8 @@ class Session:
                     dims, data = self.tensors[p + "ffn_norm_ada_up.weight"]
                     scale = matvec(data, ada, H, bottleneck)
                     h = [h[j] * (1.0 + scale[j]) for j in range(H)]
+            if TRACE is not None:
+                TRACE[f"x.L{layer}"] = list(x)
             if cfg["ffn_no_gate"]:
                 # phi2: up -> gelu -> down, with a bias on both projections.
                 up = matvec(self.tensor(p + "ffn_up.weight"), h, cfg["I"], H)
@@ -927,7 +973,7 @@ class Session:
                 if cfg["ffn_bias"]:
                     bias = self.tensor(p + "ffn_down.bias")
                     down = [down[i] + bias[i] for i in range(H)]
-            elif cfg["experts"] and layer >= cfg["dense_lead"]:
+            elif cfg["moe_layers"][layer]:
                 # Router -> gating function -> optional selection bias -> optional
                 # group mask -> top-k -> combine. Which function turns logits into
                 # probabilities is a per-family fact, so the checkpoint says.
@@ -1031,6 +1077,8 @@ class Session:
             if TRACE is not None:
                 TRACE[f"ffn.L{layer}"] = list(down)
             x = [x[i] + down[i] for i in range(H)]
+            if TRACE is not None:
+                TRACE[f"end.L{layer}"] = list(x)
 
         final = norm_of(x, "output_norm")
         out_name = "output.weight" if "output.weight" in self.tensors else "token_embd.weight"

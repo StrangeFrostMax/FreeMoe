@@ -2866,7 +2866,7 @@ void test_architecture_parity() {
                                            "glm4-mrope", "bitnet", "arcee", "nemotron",
                                            "jais2", "gpt-oss", "plm", "mistral3",
                                            "qwen3vl", "qwen3vlmoe", "mamba", "mamba2",
-                                           "mamba-dtrms"};
+                                           "mamba-dtrms", "jamba"};
     for (const std::string &slug : slugs) {
         const std::string model = "tests/fixtures/" + slug + "-shape.gguf";
         ArchGolden golden = read_arch_golden("tests/golden/" + slug + "_reference.txt");
@@ -3799,8 +3799,10 @@ void test_recurrent_families() {
               "an expansion other than 2 is refused");
     }
     {
-        // A hybrid stack would need a cache per attention layer beside the
-        // recurrent state, which this adapter does not describe.
+        // A declared recurrence mask is a claim, not evidence: a file that says a
+        // layer is recurrent must carry that layer's `ssm_in`, and one that says
+        // it is an attention layer must not. Half of a hybrid stack would run the
+        // wrong block on one of the two, so the disagreement is an error.
         GGUFDocument broken = parse_gguf_file("tests/fixtures/mamba-shape.gguf");
         MetadataValue layers;
         layers.type = GGUFValueType::ARRAY;
@@ -3811,9 +3813,79 @@ void test_recurrent_families() {
             layers.array.push_back(entry);
         }
         broken.metadata["mamba.attention.recurrent_layers"] = layers;
-        CHECK(throws_code(ErrorCode::NOT_IMPLEMENTED,
+        CHECK(throws_code(ErrorCode::METADATA_MISMATCH,
                           [&]() { (void)build_manifest(broken, "mamba-shape.gguf"); }),
-              "a mixed recurrent/attention stack is refused rather than half-run");
+              "a recurrence mask that disagrees with the tensors is refused");
+    }
+    {
+        // The same rule through the other spelling llama.cpp uses: a per-layer
+        // head count whose zero entry claims the layer has no attention.
+        GGUFDocument broken = parse_gguf_file("tests/fixtures/mamba2-shape.gguf");
+        MetadataValue counts;
+        counts.type = GGUFValueType::ARRAY;
+        for (int i = 0; i < 2; ++i) {
+            MetadataValue entry;
+            entry.type = GGUFValueType::INT32;
+            entry.i = i == 0 ? 0 : 2;
+            counts.array.push_back(entry);
+        }
+        broken.metadata["mamba2.attention.head_count_kv"] = counts;
+        CHECK(throws_code(ErrorCode::METADATA_MISMATCH,
+                          [&]() { (void)build_manifest(broken, "mamba2-shape.gguf"); }),
+              "a per-layer kv-head mask that disagrees with the tensors is refused");
+    }
+    // A hybrid stack runs both halves: the mamba layers keep their rolling state,
+    // the attention layers own a per-position cache, and the budget reserves both.
+    {
+        const std::string path = "tests/fixtures/jamba-shape.gguf";
+        RunConfig config;
+        config.model_path = path;
+        config.budget.total_hot_bytes = 64ull * 1024 * 1024;
+        Engine engine(config);
+        engine.initialize();
+        const ModelConfig &cfg = engine.manifest().config;
+        CHECK(cfg.attention_layer_count() == 2 && cfg.recurrent_layer_count() == 2,
+              "the hybrid splits its layers between the two mixers");
+        CHECK(cfg.layer_is_recurrent(0) && !cfg.layer_is_recurrent(1),
+              "the split is per layer, not per model");
+        CHECK(cfg.rope_disabled && cfg.heads == 4 && cfg.kv_heads == 2,
+              "jamba keeps its head counts and applies no rotary");
+        CHECK(!cfg.layer_is_moe(0) && cfg.layer_is_moe(1),
+              "the router is a per-layer fact: this stack mixes dense and MoE blocks");
+        CHECK(cfg.attention_slot(1) == 0 && cfg.attention_slot(3) == 1,
+              "attention layers index the cache by their position among attention layers");
+
+        ArchGolden golden = read_arch_golden("tests/golden/jamba_reference.txt");
+        PromptResult result = engine.run_prompt(golden.prompt, 8);
+        CHECK(result.generated_ids == golden.greedy,
+              "the hybrid decodes the token sequence the reference computes");
+        int convolutions = 0, scans = 0, attentions = 0;
+        for (const OpRecord &op : engine.backend().operations()) {
+            if (op.name.rfind("ssm_conv.", 0) == 0) ++convolutions;
+            if (op.name.rfind("ssm_scan.", 0) == 0) ++scans;
+            if (op.name.rfind("attention.", 0) == 0) ++attentions;
+        }
+        const int per_token = static_cast<int>(result.input_ids.size() + result.generated_ids.size());
+        CHECK(convolutions == per_token * 2 && scans == per_token * 2,
+              "the scan runs on the recurrent layers only");
+        CHECK(attentions == per_token * 2,
+              "attention runs on the attention layers only, once each");
+        engine.release_runtime();
+
+        // The budget follows both halves: a per-position cache for the attention
+        // layers plus a fixed state for the recurrent ones.
+        const ModelManifest manifest = build_manifest(parse_gguf_file(path), path);
+        BudgetConfig budget;
+        budget.total_hot_bytes = 64ull * 1024 * 1024;
+        DeviceInfo device;
+        device.memory_type = "host";
+        const BudgetResult reservation = compute_budget(manifest, budget, device);
+        const uint64_t expected =
+            (manifest.config.attention_cache_floats(manifest.config.context) +
+             manifest.config.recurrent_state_floats()) *
+            sizeof(float);
+        CHECK(reservation.kv_bytes == expected,
+              "a hybrid reserves the attention cache and the recurrent state, not one or other");
     }
     {
         GGUFDocument broken = parse_gguf_file("tests/fixtures/mamba2-shape.gguf");

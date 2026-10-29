@@ -90,7 +90,11 @@ def arch_tensors(spec: dict[str, Any]) -> list[TensorSpec]:
     for layer in range(layers):
         p = f"blk.{layer}."
         out += [tensor(p + "attn_norm.weight", [h], 0.0, norm=True)]
-        if spec.get("ssm"):
+        # A hybrid stack (jamba) interleaves the two block kinds, so the mask
+        # decides what this layer carries. A pure file leaves it unset and every
+        # layer gets the same shape.
+        recr_here = bool(spec.get("ssm")) and layer in spec.get("ssm_layers", range(layers))
+        if recr_here:
             # llama.cpp's mamba block: no attention, and a pure file has no
             # feed-forward either. The A and D tensors carry no ".weight" suffix
             # upstream, so they are written bare here too.
@@ -219,7 +223,8 @@ def arch_tensors(spec: dict[str, Any]) -> list[TensorSpec]:
             out += [tensor(p + "ffn_norm.weight", [h], 0.0, norm=True)]
             if spec.get("layernorm"):
                 out += [tensor(p + "ffn_norm.bias", [h], 0.05)]
-        moe_here = spec.get("experts") and layer >= spec.get("dense_lead", 0)
+        moe_here = (spec.get("experts") and layer >= spec.get("dense_lead", 0)
+                    and layer in spec.get("moe_layers", range(layers)))
         if spec.get("experts") and not moe_here:
             out += [
                 tensor(p + "ffn_gate.weight", [h, i], 0.16),
@@ -339,10 +344,17 @@ def arch_metadata(spec: dict[str, Any]) -> dict[str, tuple[Any, ...]]:
         # A pure state-space file states none of these: llama.cpp's mamba
         # loader reads no head count, no feed-forward width and no rotary width,
         # and writing them here would be a fixture that no real file resembles.
-        **({} if spec.get("ssm") else {
+        # A hybrid (jamba) states all of them, and states the split itself as a
+        # per-layer head_count_kv whose zero entries are the recurrent layers --
+        # which is exactly how llama.cpp reads it.
+        **({} if spec.get("ssm") and not spec.get("hybrid") else {
             f"{arch}.feed_forward_length": ("u32", spec["intermediate"]),
             f"{arch}.attention.head_count": ("u32", spec["heads"]),
-            f"{arch}.attention.head_count_kv": ("u32", spec["kv_heads"]),
+            **({f"{arch}.attention.head_count_kv": (
+                "array_i32", [0 if l in spec["ssm_layers"] else spec["kv_heads"]
+                              for l in range(spec["layers"])])}
+               if spec.get("hybrid") else
+               {f"{arch}.attention.head_count_kv": ("u32", spec["kv_heads"])}),
             f"{arch}.attention.key_length": ("u32", spec["head_dim"]),
             f"{arch}.attention.value_length": ("u32", spec["head_dim"]),
         }),
@@ -350,10 +362,13 @@ def arch_metadata(spec: dict[str, Any]) -> dict[str, tuple[Any, ...]]:
         # the adapter uses as evidence for the norm type.
         (f"{arch}.attention.layer_norm_epsilon" if spec.get("layernorm")
          else f"{arch}.attention.layer_norm_rms_epsilon"): ("f32", 1e-5),
-        **({} if spec.get("ssm") else {
-            f"{arch}.rope.dimension_count": ("u32", spec["rope_dim"]),
-            f"{arch}.rope.freq_base": ("f32", 10000.0),
-        }),
+        # jamba rotates nothing: upstream's attention layer never calls the rope,
+        # so the file carries no rotary keys at all.
+        **({} if spec.get("ssm") and not spec.get("hybrid") else
+           ({} if spec.get("no_rope") else {
+               f"{arch}.rope.dimension_count": ("u32", spec["rope_dim"]),
+               f"{arch}.rope.freq_base": ("f32", 10000.0),
+           })),
         f"{arch}.context_length": ("u32", spec["context"]),
         f"{arch}.vocab_size": ("u32", V),
         "tokenizer.ggml.model": ("string", "freemoe.byte-v1"),
@@ -530,6 +545,32 @@ SPECS: list[dict[str, Any]] = [
         "ssm_dt_rank": 4,
         "ssm_groups": 2,
         "layers": 2,
+    },
+    {
+        # jamba (llama.cpp models/jamba.cpp): a hybrid stack, half mamba and half
+        # attention, with a feed-forward behind both kinds of layer. Three things
+        # in it are per-layer rather than model-wide: the recurrence mask, the
+        # feed-forward presence and the router (jamba mixes dense and MoE blocks).
+        # Its attention layers also carry no rotary position at all -- upstream's
+        # block never calls the rope -- so the file states no rotary keys.
+        "slug": "jamba",
+        "arch": "jamba",
+        "name": "FreeMoe synthetic jamba (mamba and attention layers interleaved)",
+        "ssm": "mamba",
+        "hybrid": True,
+        "ssm_layers": (0, 2),
+        "ssm_inner": 64,      # mamba-1 expansion: 2 * hidden
+        "ssm_state": 4,
+        "ssm_conv": 4,
+        "ssm_dt_rank": 3,
+        "ssm_vector_norms": True,
+        "ssm_ffn": True,
+        "kv_heads": 2,
+        "no_rope": True,
+        "experts": 4,
+        "expert_width": 16,
+        "moe_layers": (1, 3),
+        "layers": 4,
     },
     {
         # mistral3 (llama.cpp models/mistral3.cpp): the llama block plus three

@@ -191,10 +191,13 @@ void Engine::load_fixed_weights() {
     // the scan state are read before they are written. The KV cache does not
     // care, but it costs the same single pass and removes a class of
     // uninitialised-read bugs from the first token.
-    if (!manifest_.config.ssm_kind.empty())
-        std::memset(kv_, 0,
-                    static_cast<size_t>(manifest_.config.layers) *
-                        manifest_.config.ssm_state_floats() * sizeof(float));
+    if (!manifest_.config.ssm_kind.empty()) {
+        const uint64_t attention_floats =
+            manifest_.config.attention_cache_floats(manifest_.config.context);
+        std::memset(kv_ + attention_floats, 0,
+                    static_cast<size_t>(manifest_.config.recurrent_state_floats() *
+                                        sizeof(float)));
+    }
 
     std::vector<uint8_t> host_weights(static_cast<size_t>(manifest_.fixed_weight_bytes));
     uint64_t offset = 0;
@@ -704,6 +707,11 @@ std::vector<float> Engine::forward_token(int32_t token, uint64_t position,
         }
     }
 
+    // Where the two halves of the cache region begin. A pure attention model has
+    // no recurrent layers, a pure mamba model has no attention cache, and a
+    // hybrid has both: the attention cache is layer-major over attention layers
+    // only, and the recurrent states follow it.
+    const uint64_t attention_floats = c.attention_cache_floats(c.context);
     // `ggml_compute_softplus_f32`: a plain log(1+e^x) below 20, and the identity
     // above it, where the exponential would overflow. The threshold is part of
     // the reference's arithmetic, not an optimisation.
@@ -722,7 +730,10 @@ std::vector<float> Engine::forward_token(int32_t token, uint64_t position,
         const uint32_t state_size = c.ssm_state;
         const uint32_t conv_width = c.ssm_conv;
         const uint32_t channels = c.ssm_conv_channels();
-        float *slot = kv_ + static_cast<size_t>(layer) * c.ssm_state_floats();
+        // The buffer holds the attention layers' per-position cache first, then
+        // one rolling state per recurrent layer, so a hybrid stack can have both.
+        float *slot = kv_ + attention_floats +
+                      static_cast<size_t>(c.recurrent_slot(layer)) * c.ssm_state_floats();
         // d_conv - 1 columns of history, then the state itself.
         float *history = slot;
         float *ssm_state = slot + static_cast<size_t>(conv_width - 1) * channels;
@@ -896,7 +907,6 @@ std::vector<float> Engine::forward_token(int32_t token, uint64_t position,
         if (c.layer_is_recurrent(layer)) {
             residual_add(x, ssm_block(layer, prefix, h),
                          "residual.ssm.L" + std::to_string(layer));
-            if (!c.has_ffn) continue;
         } else {
         // phi2 runs the FFN on the *attention's* normalised input and adds both
         // branches to the same residual, so `h` is reused rather than replaced.
@@ -1085,8 +1095,12 @@ std::vector<float> Engine::forward_token(int32_t token, uint64_t position,
         // NoPE layers (SmolLM3) skip the rotation entirely: their keys stay as the
         // projection produced them, and the position information reaches the model
         // through the layers that do rotate.
-        const bool rotate = c.no_rope_layer_step == 0 ||
-                            (layer + 1) % c.no_rope_layer_step != 0;
+        // jamba's attention layers carry no rotary position at all -- upstream's
+        // block simply never calls the rope -- so a file that states none is not
+        // rotated at head width by default.
+        const bool rotate = !c.rope_disabled &&
+                            (c.no_rope_layer_step == 0 ||
+                             (layer + 1) % c.no_rope_layer_step != 0);
         if (!c.mla && rotate) rope_half(q, c.heads, k, c.kv_heads, position);
         // llama.cpp's per-position attention temperature (mistral3, llama4-style
         // checkpoints): every query component is scaled by
@@ -1103,7 +1117,10 @@ std::vector<float> Engine::forward_token(int32_t token, uint64_t position,
                                      q.size() * sizeof(float), q.size() * sizeof(float));
         }
 
-        size_t current_base = (static_cast<size_t>(layer) * c.context + position) * kv_stride;
+        // Only attention layers own a slot in the per-position cache, so a hybrid
+        // indexes it by the layer's position among them.
+        const size_t cache_slot = static_cast<size_t>(c.attention_slot(layer));
+        size_t current_base = (cache_slot * c.context + position) * kv_stride;
         std::memcpy(kv_ + current_base, k.data(), static_cast<size_t>(kv_dim) * sizeof(float));
         std::memcpy(kv_ + current_base + kv_dim, v.data(), static_cast<size_t>(v_dim) * sizeof(float));
 
@@ -1122,7 +1139,7 @@ std::vector<float> Engine::forward_token(int32_t token, uint64_t position,
                     : position + 1 - c.sliding_window;
             std::vector<double> scores(position + 1);
             for (uint64_t t = first_visible; t <= position; ++t) {
-                size_t base = (static_cast<size_t>(layer) * c.context + t) * kv_stride;
+                size_t base = (cache_slot * c.context + t) * kv_stride;
                 const float *kt = kv_ + base + kvb;
                 double dot = 0.0;
                 for (uint32_t j = 0; j < c.head_dim; ++j)
@@ -1153,7 +1170,7 @@ std::vector<float> Engine::forward_token(int32_t token, uint64_t position,
             std::vector<double> acc(c.head_v_dim(), 0.0);
             const size_t vb = static_cast<size_t>(head / group) * c.head_v_dim();
             for (uint64_t t = first_visible; t <= position; ++t) {
-                size_t base = (static_cast<size_t>(layer) * c.context + t) * kv_stride;
+                size_t base = (cache_slot * c.context + t) * kv_stride;
                 const float *vt = kv_ + base + kv_dim + vb;
                 double p = probs[t - first_visible];
                 for (uint32_t j = 0; j < c.head_v_dim(); ++j) acc[j] += p * vt[j];
@@ -1235,15 +1252,18 @@ std::vector<float> Engine::forward_token(int32_t token, uint64_t position,
                                      h.size() * sizeof(float), h.size() * sizeof(float));
         }
         }  // end of the attention branch
-        if (c.layer_is_recurrent(layer) && c.has_ffn) {
+        if (!c.layer_has_ffn(layer)) continue;
+        if (c.layer_is_recurrent(layer)) {
             // A hybrid block: the recurrent layer has already taken its residual
             // and the feed-forward reads the post-residual norm, exactly as in
             // the attention branch.
             h = norm(x, prefix + "ffn_norm", "ffn_norm.L" + std::to_string(layer));
         }
         std::vector<float> ffn(c.hidden, 0.0f);
-        // The leading blocks of an MoE model can still carry a plain FFN.
-        const bool moe_layer = c.model_kind == "moe" && layer >= c.dense_lead;
+        // The leading blocks of an MoE model can still carry a plain FFN, and a
+        // hybrid can place its experts on one kind of layer only (jamba mixes
+        // dense and MoE blocks), so the router tensors decide per layer.
+        const bool moe_layer = c.layer_is_moe(layer);
         if (!moe_layer && c.ffn_no_gate) {
             // phi2: one up projection, GELU, one down projection, both biased.
             std::vector<float> act = matvec_view(tensor_view(prefix + "ffn_up.weight"), h,
