@@ -376,9 +376,13 @@ text that already starts with a space, which is why `" hello"` starts with two
 markers — because that is what the reference does and the difference is visible
 in the expected vectors.
 
-Unicode categories come from tables generated from Python's `unicodedata`
-(`tools/gen_unicode_tables.py`), because a wrong category silently moves a word
-boundary. `make test` fails if the committed table is stale.
+Unicode categories come from tables generated from a pinned Unicode database
+(`tools/gen_unicode_tables.py`, Unicode 15.1.0), because a wrong category
+silently moves a word boundary. `make test` fails if the committed table is stale
+under the same Unicode version; on an interpreter carrying a different version
+the check prints `SKIP` rather than pretending to verify (a different database
+cannot tell whether the file is stale), and CI pins the version so the check is
+real there.
 
 ## Breadth: the block is data, not code
 

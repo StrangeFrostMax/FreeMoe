@@ -12,14 +12,26 @@ jobs:
     # ships. `make zen3-fallback` is the separate Zen 3 evidence target and runs
     # on the real machine, not here.
     runs-on: ubuntu-latest
+    env:
+      # Makes a Unicode-version mismatch a failure instead of a `SKIP`, so the
+      # regeneration gate really verifies the committed table here.
+      FREEMOE_REQUIRE_UNICODE: "15.1.0"
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
+      # The generated Unicode class table comes from a versioned database, so
+      # the interpreter that verifies it must carry the same version the table
+      # was generated from (see tools/gen_unicode_tables.py). `unicodedata2`
+      # pins that version independently of the runner image's Python, and a
+      # venv keeps it out of the system interpreter.
       - name: Configure
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq build-essential python3
+          sudo apt-get install -y -qq build-essential python3 python3-venv
+          python3 -m venv .ci-venv
+          .ci-venv/bin/pip install --quiet --disable-pip-version-check "unicodedata2==15.1.0"
+          echo "$PWD/.ci-venv/bin" >> "$GITHUB_PATH"
           g++ --version | head -1
           python3 --version
       - name: Build
