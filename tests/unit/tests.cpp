@@ -3694,6 +3694,10 @@ void test_recurrent_families() {
     const Expect cases[] = {
         {"mamba", "mamba", 1, false},
         {"mamba-dtrms", "mamba", 1, true},
+        // The flag without the weights: upstream's `build_norm` degenerates to
+        // unit gain, so the norms still run. The golden is the reference's own
+        // arithmetic for that file, not this build's.
+        {"mamba-flagonly", "mamba", 1, true},
         {"mamba2", "mamba2", 2, false},
     };
     for (const Expect &c : cases) {
@@ -3756,6 +3760,104 @@ void test_recurrent_families() {
         CHECK(conv_bytes_exact, tag + "the convolution reports its window and kernel traffic");
         CHECK(scan_bytes_exact, tag + "the scan reports the state it reads and writes");
         engine.release_runtime();
+    }
+
+    // mamba2 has no dt/B/C norm anywhere in upstream: `build_mamba2_layer`
+    // applies its grouped `ssm_norm` after the scan and nothing before it, and
+    // `ssm.dt_b_c_rms` is a key only models/mamba.cpp reads. Upstream's mamba2
+    // loader does not even create those tensors, so a file carrying them is not
+    // a checkpoint that runtime produces -- it is refused by name rather than
+    // normalised. That refusal is what keeps the arithmetic from drifting: there
+    // is no way to reach the scan with a norm upstream does not apply.
+    {
+        auto run = [&](const std::string &slug) {
+            RunConfig config;
+            config.model_path = "tests/fixtures/" + slug + "-shape.gguf";
+            config.budget.total_hot_bytes = 64ull * 1024 * 1024;
+            Engine engine(config);
+            engine.initialize();
+            PromptResult result = engine.run_prompt("Hello", 8);
+            int dt_norm_ops = 0;
+            for (const OpRecord &op : engine.backend().operations())
+                if (op.name.rfind("ssm_dt_norm.", 0) == 0) ++dt_norm_ops;
+            engine.release_runtime();
+            return std::make_pair(std::move(result), dt_norm_ops);
+        };
+        auto plain = run("mamba2");
+        auto with_norms = run("mamba2-dtnorm");
+        // The two files share every weight (each tensor is generated from its own
+        // name) and differ only in the extra norm tensors and the flag. Applying
+        // them would change the scan's inputs, so identical output is the proof
+        // that they are inert here.
+        CHECK(with_norms.first.generated_ids == plain.first.generated_ids,
+              "the dt/B/C weights do not change what mamba2 generates");
+        CHECK(with_norms.second == 0, "no dt norm runs inside a mamba2 layer");
+        // The goldens record the same thing independently of the engine: the
+        // python reference computes the identical ids for both files.
+        const ArchGolden plain_golden = read_arch_golden("tests/golden/mamba2_reference.txt");
+        const ArchGolden extra_golden = read_arch_golden("tests/golden/mamba2-dtnorm_reference.txt");
+        CHECK(extra_golden.greedy == plain_golden.greedy,
+              "the reference agrees that the dt/B/C weights change nothing");
+    }
+
+    // mamba-1 reads `ssm.dt_b_c_rms` (models/mamba.cpp). With the flag set and
+    // no weights in the file the norms still apply, because upstream's
+    // `build_norm` multiplies only when the weight tensor is present: the norm
+    // degenerates to unit gain instead of disappearing. A file without the flag
+    // and without the tensors is left alone.
+    {
+        const std::string path = "tests/fixtures/mamba-shape.gguf";
+        const GGUFDocument plain = parse_gguf_file(path);
+        CHECK(!build_manifest(plain, path).config.ssm_vector_norms,
+              "mamba without the flag and without the weights applies no dt/B/C norm");
+
+        GGUFDocument flagged = plain;
+        MetadataValue flag;
+        flag.type = GGUFValueType::BOOL;
+        flag.b = true;
+        flagged.metadata["mamba.ssm.dt_b_c_rms"] = flag;
+        const ModelManifest manifest = build_manifest(flagged, path);
+        CHECK(manifest.config.ssm_vector_norms,
+              "mamba applies the dt/B/C norms when the file sets ssm.dt_b_c_rms");
+        CHECK(!manifest.config.ssm_dt_norm_present && !manifest.config.ssm_b_norm_present &&
+                  !manifest.config.ssm_c_norm_present,
+              "the flagged file carries no norm weights, so the norms are unit gain");
+        const std::vector<std::string> tags = adapter_config_tags(manifest.config);
+        CHECK(std::find(tags.begin(), tags.end(), "ssm_dt_b_c_rms=yes") != tags.end(),
+              "the adapter tag says the norms are applied");
+    }
+
+    // jamba creates all three norms as required tensors (models/jamba.cpp:65-71),
+    // so a jamba file missing one is malformed rather than plain. Dropping the
+    // tensor from the file must be refused, not silently run without it.
+    {
+        const std::string path = "tests/fixtures/jamba-shape.gguf";
+        auto without = [&](std::initializer_list<const char *> victims) {
+            GGUFDocument doc = parse_gguf_file(path);
+            for (const char *victim : victims)
+                doc.tensors.erase(
+                    std::remove_if(doc.tensors.begin(), doc.tensors.end(),
+                                   [&](const TensorInfo &t) { return t.name == victim; }),
+                    doc.tensors.end());
+            doc.tensor_by_name.clear();
+            for (size_t i = 0; i < doc.tensors.size(); ++i)
+                doc.tensor_by_name[doc.tensors[i].name] = i;
+            return doc;
+        };
+        // Every recurrent layer loses the weight: the stack agrees with itself,
+        // and jamba's own rule rejects it by name.
+        const GGUFDocument all_layers =
+            without({"blk.0.ssm_b_norm.weight", "blk.2.ssm_b_norm.weight"});
+        CHECK(throws_code(ErrorCode::MISSING_REQUIRED_TENSOR,
+                          [&]() { (void)build_manifest(all_layers, path); }),
+              "jamba without ssm_b_norm.weight is refused by name");
+        // Only one layer loses it: the layers now disagree, and one model-wide
+        // rule cannot describe the stack, so that is refused too rather than
+        // normalising half the layers.
+        const GGUFDocument one_layer = without({"blk.0.ssm_b_norm.weight"});
+        CHECK(throws_code(ErrorCode::METADATA_MISMATCH,
+                          [&]() { (void)build_manifest(one_layer, path); }),
+              "recurrent layers that disagree about the norms are refused");
     }
 
     // The budget follows the state, not the context: a recurrent file must not

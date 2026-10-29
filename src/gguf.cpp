@@ -880,7 +880,8 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
     // A layer with `ssm_in` has no attention: llama.cpp's mamba block is a 1D
     // convolution followed by a state-space scan. A *pure* mamba model is then
     // all-recurrent and has no feed-forward either, while a hybrid stack
-    // (jamba, nemotron-h, falcon-h1) interleaves recurrent and attention layers.
+    // interleaves recurrent and attention layers. jamba is the only such family
+    // mapped here; nemotron-h and falcon-h1 interleave differently and are not.
     // The tensors are the evidence, so the mask starts from them; metadata can
     // only confirm it.
     std::vector<uint8_t> recurrence(cfg.layers, 0);
@@ -960,10 +961,12 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
             doc.tensors[a_it->second].dims[0] == 1;
         cfg.ssm_kind = scalar_a ? "mamba2" : "mamba";
         // mamba2 channels the grouped B and C through the same convolution as
-        // the state, and normalises B, C and dt per group.
+        // the state, and normalises the scan's output per group (`ssm_norm`).
+        // It never normalises dt, B or C on the way in: upstream's
+        // `build_mamba2_layer` has no dt/B/C norm, and `ssm.dt_b_c_rms` is a
+        // mamba-1 key read only by models/mamba.cpp. A file that carries those
+        // weights anyway describes a norm the reference does not apply.
         if (cfg.ssm_kind == "mamba2") {
-            cfg.ssm_vector_norms =
-                doc.tensor_by_name.count(layer_name(first_recurrent, "ssm_dt_norm.weight")) != 0;
             if (doc.tensor_by_name.count(layer_name(first_recurrent, "ssm_norm.weight")) == 0)
                 fail(ErrorCode::MISSING_REQUIRED_TENSOR,
                      "mamba2 needs its grouped norm (blk." + std::to_string(first_recurrent) +
@@ -972,8 +975,43 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
                 fail(ErrorCode::SHAPE_MISMATCH,
                      "the SSM inner size must divide into groups and heads");
         } else {
-            cfg.ssm_vector_norms =
-                doc.tensor_by_name.count(layer_name(first_recurrent, "ssm_dt_norm.weight")) != 0;
+            // mamba-1: upstream normalises dt, B and C before the scan when the
+            // file sets `ssm.dt_b_c_rms` (models/mamba.cpp reads it) or carries
+            // all three weights (models/mamba-base.cpp:99). A weight that is
+            // absent is not "no norm": `build_norm` multiplies only when the
+            // weight tensor is present, so that norm degenerates to unit gain.
+            const char *const dt_suffix = "ssm_dt_norm.weight";
+            const char *const b_suffix = "ssm_b_norm.weight";
+            const char *const c_suffix = "ssm_c_norm.weight";
+            const auto carries = [&](uint32_t layer, const char *suffix) {
+                return doc.tensor_by_name.count(layer_name(layer, suffix)) != 0;
+            };
+            cfg.ssm_dt_norm_present = carries(first_recurrent, dt_suffix);
+            cfg.ssm_b_norm_present = carries(first_recurrent, b_suffix);
+            cfg.ssm_c_norm_present = carries(first_recurrent, c_suffix);
+            // One rule is applied to every recurrent layer, so a stack whose
+            // layers disagree would silently get the wrong arithmetic on some
+            // of them. Refuse rather than pick one.
+            for (uint32_t l = 0; l < cfg.layers; ++l) {
+                if (!recurrence[l]) continue;
+                if (carries(l, dt_suffix) != cfg.ssm_dt_norm_present ||
+                    carries(l, b_suffix) != cfg.ssm_b_norm_present ||
+                    carries(l, c_suffix) != cfg.ssm_c_norm_present)
+                    fail(ErrorCode::METADATA_MISMATCH,
+                         "recurrent layers disagree about the dt/B/C norms: blk." +
+                             std::to_string(l) + " differs from blk." +
+                             std::to_string(first_recurrent));
+            }
+            const bool all_norms = cfg.ssm_dt_norm_present && cfg.ssm_b_norm_present &&
+                                   cfg.ssm_c_norm_present;
+            cfg.ssm_vector_norms = cfg.ssm_dt_b_c_rms || all_norms;
+            // jamba creates the three norms as required tensors
+            // (models/jamba.cpp:65-71), so a jamba file without them is
+            // malformed rather than plain.
+            if (arch == "jamba" && !all_norms)
+                fail(ErrorCode::MISSING_REQUIRED_TENSOR,
+                     "jamba's recurrent layers require ssm_dt_norm.weight, "
+                     "ssm_b_norm.weight and ssm_c_norm.weight (models/jamba.cpp)");
             // mamba-1's scan is one head per channel.
             if (cfg.ssm_inner != 2 * cfg.hidden)
                 fail(ErrorCode::SHAPE_MISMATCH,
@@ -1802,10 +1840,15 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
                 expect(layer_name(l, "ssm_dt.weight"));
             }
             if (cfg.ssm_kind == "mamba2") expect(layer_name(l, "ssm_norm.weight"));
-            if (cfg.ssm_vector_norms)
-                for (const char *suffix : {"ssm_dt_norm.weight", "ssm_b_norm.weight",
-                                           "ssm_c_norm.weight"})
-                    expect(layer_name(l, suffix));
+            // The dt/B/C norms are claimed when the file carries them, not
+            // required: only jamba creates them upstream, and a mamba file that
+            // sets `ssm.dt_b_c_rms` without them gets unit-gain norms rather than
+            // a missing-tensor error (models/mamba-base.cpp:99 with null
+            // weights). Claiming by presence also stops such a tensor from being
+            // reported as an adapter gap.
+            for (const char *suffix : {"ssm_dt_norm.weight", "ssm_b_norm.weight",
+                                       "ssm_c_norm.weight"})
+                if (m.tensor(layer_name(l, suffix)) != nullptr) expect(layer_name(l, suffix));
         } else {
             expect(layer_name(l, "attn_output.weight"));
             if (cfg.attn_output_bias) expect(layer_name(l, "attn_output.bias"));

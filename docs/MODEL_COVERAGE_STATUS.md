@@ -23,14 +23,14 @@ what the work is: the 50 model names reduce to about eight capabilities.
 | Linear + YaRN context extension, `rope_freqs` divisors | `rope_scaling` checks, 4 fixtures |
 | Attention sinks, NoPE layers | `attention_sinks`, `rope_scaling`, fixtures |
 | MLA (DeepSeek-V2/V3 style), sigmoid/softmax/sqrt-softplus gating, group-limited routing, selection bias, shared expert | `deepseek2-mla` fixture + oracle |
-| GQA/MQA, per-head qk-norm, partial rotary, fused qkv, fused gate-up, post-norms, sliding window (model-wide and per layer), tanh softcap, LayerNorm variants, silu/gelu/relu²/gelu_erf/swiglu_oai, gate-free FFN | 36 architecture fixtures (`architecture_parity`, 266 checks) |
+| GQA/MQA, per-head qk-norm, partial rotary, fused qkv, fused gate-up, post-norms, sliding window (model-wide and per layer), tanh softcap, LayerNorm variants, silu/gelu/relu²/gelu_erf/swiglu_oai, gate-free FFN | 42 architecture fixtures (`architecture_parity`, 273 checks) |
 | 36 quantisation types incl. ternary `TQ1_0`/`TQ2_0`/`Q1_0`/`Q2_0`/`PQ2_0`, the whole IQ family (IQ1_S/M, IQ2_XXS/XS/S, IQ3_XXS/S, IQ4_XS/NL) and FP4 (MXFP4, NVFP4) | `quant_reference_decode`, `quant_model_parity` (Q8_0/Q4_0/Q4_K/Q6_K end to end); **matches llama.cpp's own dequantizers to ≤1e-6 relative** of block magnitude via `tools/quant_upstream_check.py` (26 types, 0 failures; worst absolute 5.0e-06 on IQ4_NL, MXFP4/NVFP4 exact). Not claimed bit-exact — see `docs/GAP_ANALYSIS.md` |
 | Fused `ffn_gate_up_exps`, clamped SwiGLU (`swiglu-oai`, per-layer `swiglu_clamp`), router renormalisation floor | `ffn_variants`, `activation_clamp_forms` (13 checks), `qwen3moe-fused-up` and `qwen3moe-clamp` fixtures |
 | Mixed-precision expert stacks: per-projection types inside one expert record (Q4_K gate/up + Q6_K down), fused and separate | `quant_expert_mixed_types` (32 checks), `quant-expert-{fused,separate}.gguf` + F32 twins |
 | Pointwise activation primitives (`relu`, `relu_sq`, `gelu_erf`, `softplus`) as upstream's `llm_ffn_op_type` defines them | `pointwise_activations` (12 checks) pins the arithmetic. Three of the four are now **reachable end to end**: `relu_sq` through `arcee`/`nemotron`/`jais2`/`plm` (`gate_free_families`, 33 checks, and their parity fixtures — with silu substituted `arcee` fails the golden by 0.98 absolute), and `gelu_erf` through `mistral3`'s adaptive norm MLP, whose activation upstream writes as `LLM_FFN_GELU_ERF` with `LLM_FFN_SEQ` (`mistral3_block`). `relu` and `softplus` stay primitive-only: no architecture in llama.cpp's `src/models/` selects either, so a fixture that applied one would be inventing a family |
 | Refusal paths: unmapped architecture, undecodable tensor type, missing output head | `refusal_paths` (17 checks) — error code, message and probe blocker JSON |
 | mRoPE section split (`rope.dimension_sections`), plain and interleaved | `rope_mrope`; `glm4-mrope`, `qwen3vl` and `qwen3vlmoe` fixtures. The section split is a **required key** for the mRoPE families, as it is upstream (`mrope_families`), and the interleaved layout is selected by architecture the way `llama_rope_type()` does |
-| Recurrent (state-space) layers: mamba and mamba2, including the dt/B/C norms | `mamba`, `mamba-dtrms` and `mamba2` fixtures + oracle goldens, one parity row each, and `recurrent_families` (55 checks). The state replaces the kv cache and the budget reserves it as such |
+| Recurrent (state-space) layers: mamba and mamba2. mamba-1's dt/B/C norms follow upstream's rule — `ssm.dt_b_c_rms` **or** all three weights — and a norm whose weight is absent is unit gain, not a skipped norm; mamba2 never applies them, and jamba requires the three weights | `mamba`, `mamba-dtrms`, `mamba-flagonly`, `mamba2` and `mamba2-dtnorm` fixtures + oracle goldens, one parity row each, and `recurrent_families` (77 checks). The state replaces the kv cache and the budget reserves it as such |
 | Hybrid stacks: recurrent layers interleaved with attention layers in one file (`jamba`) | `jamba` fixture + oracle golden, a parity row, and the same test: the split is read per layer (`attention.recurrent_layers`, or a per-layer `head_count_kv` whose zeros mean "no attention"), the feed-forward and the router are per-layer too, and the budget reserves the attention cache *and* the rolling state. jamba's attention layers carry no rotary at all, so `rope=none` is a tag |
 | Attention sinks, biased routers, per-expert projection biases, post-attention norm as the FFN norm, alternating full/windowed layers | `gpt-oss` fixture + `gpt_oss_block`; the same flags are what `minimax-m3` needs |
 | Adapter rows tagged in llama.cpp's vocabulary (`inspect --tags`, `freemoe adapters`) | `adapter_tags`, 85 checks |
@@ -44,7 +44,7 @@ Supported architecture strings today (each has a fixture unless noted):
 plus the native `freemoe-tiny`. `smollm`/`smollm2`/`tinyllama` are the same llama
 block. The three lists that decide this — the adapter table, the loader's family
 list and the probe's known-architecture table — are bound to each other by the
-`adapter_binding` test (323 checks), which is what caught `smollm3` and `bitnet`
+`adapter_binding` test (332 checks), which is what caught `smollm3` and `bitnet`
 missing from the probe's table while their adapters existed.
 
 ## The requested list
@@ -99,15 +99,22 @@ path" above mean exactly that: the language model runs, the tower does not.
   hybrid they diverge and the gather read a region nothing had written, which is
   zeros. `jamba`'s logits were off by ~2.0 absolute before the fix and agree with
   the oracle to ~1e-6 after it. The parity row is what holds it.
-* **The remaining gaps, stated rather than implied.** `falcon-h1` runs its two
-  mixers in parallel inside every layer instead of interleaving them, and
-  `nemotron_h`, `granite-hybrid` and `plamo2` still need their own adapter rows
-  and block details; the hybrid layout itself runs. `qwen35` needs the gated
+* **The remaining gaps, stated rather than implied.** `falcon-h1` is **not
+  mapped**: what exists here is its pre-tokenizer name, not its block, and it
+  needs the interleaved two-mixer layer before an adapter row could be honest.
+  `nemotron_h`, `granite-hybrid` and `plamo2` likewise have no adapter row and
+  no block details; the hybrid *layout* runs (the mamba/attention split, the
+  rolling state next to the per-position cache, jamba's mix of dense and MoE
+  layers), but no file of those families can be loaded. `qwen35` needs the gated
   delta-net scan (a per-head matrix state, not the mamba one). `deepseek4` and
-  `deepseek41` remain unrowed because their graph carries the DSA indexer,
-  hyper-connections and an MTP head, none of which this build models. None of
-  these is a wiring detail behind a working path: each is a block this build
-  does not have, and the tables above say so per architecture.
+  `deepseek41` are accepted by `probe` and carry adapter rows, while their graph
+  also carries the DSA indexer, hyper-connections and an MTP head that this
+  build does not model; the MTP tensors are skipped with a recorded reason, the
+  indexer's would be refused as unknown tensors, and `hyper_connection.count` is
+  read but consumed only for `dflash`, so a real V4 file is not gated by this
+  build's own metadata checks. Treat that pair as unverified, not supported.
+  None of these is a wiring detail behind a working path: each is a block this
+  build does not have, and the tables above say so per architecture.
 
 ## What this page is not
 
