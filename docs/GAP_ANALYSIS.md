@@ -354,7 +354,7 @@ added only when all three passed:
 3. **Parity.** A fixture shaped like that family's checkpoint and an oracle
    golden; the engine must match it, or the row does not stay.
 
-Twelve rows survived (see `docs/MODEL_COVERAGE_STATUS.md`); this is what the
+Fourteen rows survived (see `docs/MODEL_COVERAGE_STATUS.md`); this is what the
 other candidates are blocked on, in the terms of the file that blocks them:
 
 | Blocking fact | Architectures | What it needs |
@@ -367,8 +367,8 @@ other candidates are blocked on, in the terms of the file that blocks them:
 | Dual dense+MoE FFN in one layer (both branches summed) | `arctic`, `ernie4_5`, `granite-moe` | A block that runs both, as `arctic` does |
 | No kv cache at all (diffusion / embedding decoders) | `dream`, `llada`, `eurobert` | A caching policy, not a tensor |
 | Encoder-only with `cls.*`/`token_types`/pooling | `modern-bert`, `neo-bert`, `jina-bert-v2/v3`, `nomic-bert*`, `gemma-embedding*` | A pooling head and a segment embedding |
-| ALiBi instead of rotary | `bloom`, `falcon`, `mpt`, `jais` | The ALiBi bias, which no other mapped family uses |
-| Absolute position embeddings | `gpt2`, `starcoder`, `mpt` (`position_embd`) | A position-embedding tensor role |
+| ALiBi instead of rotary | ~~`bloom`, `jais`~~ **implemented** this branch; `falcon`, `mpt` | Their tensor sets, not the bias: `falcon` needs `attn_norm_2` (a second pre-attention norm), `mpt` needs `position_embd` and `ffn.act` |
+| Absolute position embeddings | `gpt2`, `starcoder`, `mpt` (`position_embd`) | A position-embedding tensor role: one lookup added to the embedding |
 | T5 encoder/decoder with relative-position buckets | `t5` | Two graphs and a bucket bias |
 
 **Fixed alongside:** llama.cpp renamed the sandwich-norm tensors
@@ -381,6 +381,35 @@ current names — holds a parity row. Mutating the rename table makes that row
 fail, so the alias cannot be dropped silently.
 
 ---
+
+### C11a. ALiBi and the embedding norm — **FIXED**; both are executed arithmetic now
+
+Upstream computes the ALiBi bias in the *mask tensor*: `-|query - key|`
+(`src/llama-graph.cpp:511`), which `soft_max_ext` multiplies by a per-head slope
+derived from `max_bias` in `ggml_compute_forward_soft_max_f32`
+(`ggml/src/ggml-cpu/ops.cpp:5831-5850`):
+
+```
+n_head_log2 = 2^floor(log2(n_head));  m0 = 2^(-max_bias/n_head_log2);
+m1 = 2^(-max_bias/2/n_head_log2)
+slope(h) = h < n_head_log2 ? m0^(h+1) : m1^(2(h-n_head_log2)+1)
+```
+
+The engine computes the slopes once per sequence and adds `slope(h) * -(query -
+key)` to the scaled score before the softmax, and the oracle derives the same
+slopes independently. `bloom` hardcodes `max_bias = 8.0` in its own
+`load_arch_hparams` (upstream's comment calls making it metadata a TODO), so a
+bloom file is biased whether or not it carries the key; `jais` reads the key and
+rotates nothing at all.
+
+`bloom` also normalises the token embedding once before block 0 with a biased
+LayerNorm (`token_embd_norm`), which is a norm site no other mapped family has:
+it carries no `blk.N.` prefix, so it cannot ride on the block's norm path. Both
+halves are required, as upstream's two `create_tensor` calls demand.
+
+Evidence: `bloom` and `jais` fixtures, oracle goldens, parity rows. Mutating the
+bias away fails by 0.077 (bloom) and 0.444 (jais); mutating the embedding norm
+away fails bloom by 1.440.
 
 ### C10. Benchmarks run on an ISA the target CPU does not have
 

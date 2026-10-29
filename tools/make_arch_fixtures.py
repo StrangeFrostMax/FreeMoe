@@ -100,6 +100,13 @@ def arch_tensors(spec: dict[str, Any]) -> list[TensorSpec]:
     kv_heads = spec.get("kv_heads", heads)
     kv_dim = kv_heads * hd
     out = [tensor("token_embd.weight", [h, V], 0.35)]
+    if spec.get("token_embd_norm"):
+        # bloom normalises the embedding once before block 0; both halves are
+        # required, as upstream's `create_tensor` calls demand.
+        out += [
+            tensor("token_embd_norm.weight", [h], 0.0, norm=True),
+            tensor("token_embd_norm.bias", [h], 0.05),
+        ]
     for layer in range(layers):
         p = f"blk.{layer}."
         out += [tensor(p + "attn_norm.weight", [h], 0.0, norm=True)]
@@ -379,7 +386,7 @@ def arch_metadata(spec: dict[str, Any]) -> dict[str, tuple[Any, ...]]:
         # jamba rotates nothing: upstream's attention layer never calls the rope,
         # so the file carries no rotary keys at all.
         **({} if spec.get("ssm") and not spec.get("hybrid") else
-           ({} if spec.get("no_rope") else {
+           ({} if spec.get("no_rope") or spec.get("alibi_only") else {
                f"{arch}.rope.dimension_count": ("u32", spec["rope_dim"]),
                f"{arch}.rope.freq_base": ("f32", 10000.0),
            })),
@@ -453,6 +460,10 @@ def arch_metadata(spec: dict[str, Any]) -> dict[str, tuple[Any, ...]]:
         # Per-layer clamp bounds, the shape llama.cpp reads for deepseek4/4.1.
         rows = spec["swiglu_clamp"]
         md[f"{arch}.swiglu_clamp_exp"] = ("array_f32", [float(v) for v in rows])
+    if spec.get("alibi_max_bias") is not None:
+        # The ALiBi bias knob (`attention.max_alibi_bias`), as bloom (hardcoded
+        # upstream) and jais (read from the file) select it.
+        md[f"{arch}.attention.max_alibi_bias"] = ("f32", spec["alibi_max_bias"])
     if spec.get("attn_softcap"):
         md[f"{arch}.attn_logit_softcapping"] = ("f32", spec["attn_softcap"])
     if spec.get("final_softcap"):
@@ -563,6 +574,37 @@ SPECS: list[dict[str, Any]] = [
         "ssm_dt_rank": 3,
         "ssm_flag_only": True,
         "layers": 2,
+    },
+    {
+        # bloom (llama.cpp src/models/bloom.cpp): bias-carrying LayerNorm on the
+        # embedding, on both block norms and on the final norm; one fused qkv
+        # with its bias; a gate-free GELU MLP; and ALiBi instead of any rotation.
+        # Every one of those is a number the golden can tell apart.
+        "slug": "bloom",
+        "arch": "bloom",
+        "name": "FreeMoe synthetic bloom with ALiBi and an embedding norm",
+        "layernorm": True,
+        "token_embd_norm": True,
+        "fused_qkv": True,
+        "qkv_bias": True,
+        "ffn_no_gate": True,
+        "ffn_bias": True,
+        "attn_output_bias": True,
+        "alibi_only": True,
+    },
+    {
+        # jais (llama.cpp src/models/jais.cpp): the same bias-carrying LayerNorm
+        # and fused qkv, a gated SwiGLU FFN, no rotation at all, and ALiBi from
+        # the metadata key rather than a hardcoded constant.
+        "slug": "jais",
+        "arch": "jais",
+        "name": "FreeMoe synthetic jais with ALiBi",
+        "layernorm": True,
+        "fused_qkv": True,
+        "qkv_bias": True,
+        "attn_output_bias": True,
+        "alibi_only": True,
+        "alibi_max_bias": 8.0,
     },
     {
         # deci (llama.cpp src/models/deci.cpp): RMSNorm, SwiGLU, separate q/k/v and optional YaRN rope factors.

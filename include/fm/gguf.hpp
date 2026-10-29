@@ -99,6 +99,8 @@ enum class TensorRole : uint32_t {
     ATTN_SINKS,
     ROPE_FREQS,
     ATTN_K_NORM,
+    TOKEN_EMBD_NORM,
+    TOKEN_EMBD_NORM_BIAS,
     ATTN_POST_NORM,
     FFN_POST_NORM,
     // Fused query/key/value projection (phi3).
@@ -286,6 +288,15 @@ struct ModelConfig {
     double logit_scale = 0.0;
     // gemma stores RMSNorm scales zero-centred: the effective scale is 1 + w.
     bool norm_add_one = false;
+    // ALiBi: llama.cpp's `attention.max_alibi_bias`. A positive value selects the
+    // distance bias ggml adds inside the softmax (`soft_max_ext`'s `max_bias`),
+    // with a per-head slope derived from the head index. bloom hardcodes 8.0 in
+    // `load_arch_hparams`; jais reads the key. 0 means "no bias", which is every
+    // other family.
+    double alibi_max_bias = 0.0;
+    // bloom normalises the token embedding once, before the first block
+    // (`blk`-less `token_embd_norm`), which no other mapped family does.
+    bool token_embd_norm = false;
     // "silu" (SwiGLU), "gelu" (GeGLU), "swiglu-oai" (gpt-oss / minimax-m3: a
     // clamped gate times a clamped-up-plus-one) or "silu-clamp" (deepseek4/4.1,
     // glm5-next: silu(gate) clamped from above times a clamped up).

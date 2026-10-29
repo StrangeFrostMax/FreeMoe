@@ -23,7 +23,7 @@ what the work is: the 50 model names reduce to about eight capabilities.
 | Linear + YaRN context extension, `rope_freqs` divisors | `rope_scaling` checks, 4 fixtures |
 | Attention sinks, NoPE layers | `attention_sinks`, `rope_scaling`, fixtures |
 | MLA (DeepSeek-V2/V3 style), sigmoid/softmax/sqrt-softplus gating, group-limited routing, selection bias, shared expert | `deepseek2-mla` fixture + oracle |
-| GQA/MQA, per-head qk-norm, partial rotary, fused qkv, fused gate-up, post-norms (both the old and the current llama.cpp tensor names), sliding window (model-wide and per layer), tanh softcap, LayerNorm variants (with and without bias), silu/gelu/relu²/gelu_erf/swiglu_oai, gate-free FFN | 55 architecture fixtures (`architecture_parity`, 447 checks) |
+| GQA/MQA, per-head qk-norm, partial rotary, fused qkv, fused gate-up, post-norms (both the old and the current llama.cpp tensor names), sliding window (model-wide and per layer), tanh softcap, LayerNorm variants (with and without bias), silu/gelu/relu²/gelu_erf/swiglu_oai, gate-free FFN | 57 architecture fixtures (`architecture_parity`) |
 | 36 quantisation types incl. ternary `TQ1_0`/`TQ2_0`/`Q1_0`/`Q2_0`/`PQ2_0`, the whole IQ family (IQ1_S/M, IQ2_XXS/XS/S, IQ3_XXS/S, IQ4_XS/NL) and FP4 (MXFP4, NVFP4) | `quant_reference_decode`, `quant_model_parity` (Q8_0/Q4_0/Q4_K/Q6_K end to end); **matches llama.cpp's own dequantizers to ≤1e-6 relative** of block magnitude via `tools/quant_upstream_check.py` (26 types, 0 failures; worst absolute 5.0e-06 on IQ4_NL, MXFP4/NVFP4 exact). Not claimed bit-exact — see `docs/GAP_ANALYSIS.md` |
 | Fused `ffn_gate_up_exps`, clamped SwiGLU (`swiglu-oai`, per-layer `swiglu_clamp`), router renormalisation floor | `ffn_variants`, `activation_clamp_forms` (13 checks), `qwen3moe-fused-up` and `qwen3moe-clamp` fixtures |
 | Mixed-precision expert stacks: per-projection types inside one expert record (Q4_K gate/up + Q6_K down), fused and separate | `quant_expert_mixed_types` (32 checks), `quant-expert-{fused,separate}.gguf` + F32 twins |
@@ -32,8 +32,9 @@ what the work is: the 50 model names reduce to about eight capabilities.
 | mRoPE section split (`rope.dimension_sections`), plain and interleaved | `rope_mrope`; `glm4-mrope`, `qwen3vl` and `qwen3vlmoe` fixtures. The section split is a **required key** for the mRoPE families, as it is upstream (`mrope_families`), and the interleaved layout is selected by architecture the way `llama_rope_type()` does |
 | Recurrent (state-space) layers: mamba and mamba2. mamba-1's dt/B/C norms follow upstream's rule — `ssm.dt_b_c_rms` **or** all three weights — and a norm whose weight is absent is unit gain, not a skipped norm; mamba2 never applies them, and jamba requires the three weights | `mamba`, `mamba-dtrms`, `mamba-flagonly`, `mamba2` and `mamba2-dtnorm` fixtures + oracle goldens, one parity row each, and `recurrent_families` (77 checks). The state replaces the kv cache and the budget reserves it as such |
 | Hybrid stacks: recurrent layers interleaved with attention layers in one file (`jamba`) | `jamba` fixture + oracle golden, a parity row, and the same test: the split is read per layer (`attention.recurrent_layers`, or a per-layer `head_count_kv` whose zeros mean "no attention"), the feed-forward and the router are per-layer too, and the budget reserves the attention cache *and* the rolling state. jamba's attention layers carry no rotary at all, so `rope=none` is a tag |
+| ALiBi (a distance bias whose per-head slope derives from `attention.max_alibi_bias`, added inside the softmax), and a bias-carrying LayerNorm over the token embedding before block 0 | `bloom` (hardcoded `max_bias = 8.0`, ALiBi *instead of* any rotation) and `jais` (the key is optional, no rotary at all) fixtures + oracle goldens + parity rows. Dropping the bias fails the golden by 0.077 (bloom) and 0.444 (jais); dropping the embedding norm fails bloom by 1.440 |
 | Attention sinks, biased routers, per-expert projection biases, post-attention norm as the FFN norm, alternating full/windowed layers | `gpt-oss` fixture + `gpt_oss_block`; the same flags are what `minimax-m3` needs |
-| Adapter rows tagged in llama.cpp's vocabulary (`inspect --tags`, `freemoe adapters`) | `adapter_tags`, 85 checks; `adapter_binding`, 380 checks |
+| Adapter rows tagged in llama.cpp's vocabulary (`inspect --tags`, `freemoe adapters`) | `adapter_tags`, 85 checks; `adapter_binding` |
 
 Supported architecture strings today (each has a fixture unless noted):
 `llama`, `qwen2`, `qwen3`, `qwen2moe`, `qwen3moe`, `gemma`, `gemma2`, `gemma3`,
@@ -42,7 +43,7 @@ Supported architecture strings today (each has a fixture unless noted):
 `arcee`, `nemotron`, `jais2`, `gpt-oss`, `plm`, `mistral3`, `qwen3vl`,
 `qwen3vlmoe`, `mamba`, `mamba2`, `deci`, `nanbeige`, `xverse`, `maincoder`,
 `qwen`, `codeshell`, `starcoder2`, `pockettts`, `cohere2`, `paddleocr`,
-`hunyuan-dense`, `llama-embed`,
+`hunyuan-dense`, `llama-embed`, `bloom`, `jais`,
 plus the native `freemoe-tiny`. `smollm`/`smollm2`/`tinyllama` are the same llama
 block. The three lists that decide this — the adapter table, the loader's family
 list and the probe's known-architecture table — are bound to each other by the

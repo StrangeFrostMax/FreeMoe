@@ -113,6 +113,8 @@ const std::map<std::string, ArchFacts> &known_architectures() {
         // jamba: a hybrid stack, so it needs both a rolling state and a
         // per-position cache, and its attention layers carry no rotary.
         {"jamba", {true, false}},
+        {"bloom", {true, false}},
+        {"jais", {true, false}},
         {"codeshell", {true, false}},
         {"cohere2", {true, false}},
         {"deci", {true, false}},

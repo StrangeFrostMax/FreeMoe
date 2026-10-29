@@ -232,6 +232,7 @@ void Engine::load_fixed_weights() {
                              tensor.role == TensorRole::ATTN_NORM_BIAS ||
                              tensor.role == TensorRole::FFN_NORM_BIAS ||
                              tensor.role == TensorRole::OUTPUT_NORM_BIAS ||
+                             tensor.role == TensorRole::TOKEN_EMBD_NORM_BIAS ||
                              tensor.role == TensorRole::FFN_UP_BIAS ||
                              tensor.role == TensorRole::FFN_DOWN_BIAS ||
                              tensor.role == TensorRole::FFN_GATE_BIAS ||
@@ -675,6 +676,23 @@ std::vector<float> Engine::forward_token(int32_t token, uint64_t position,
     // each and the clamp variants are testable in isolation.
     if (!is_known_activation(c.activation))
         fail(ErrorCode::NOT_IMPLEMENTED, "unsupported activation '" + c.activation + "'");
+    // ALiBi slopes, exactly as `ggml_compute_forward_soft_max_f32` derives them:
+    // n_head_log2 = 2^floor(log2(n_head)); m0 = 2^(-max_bias/n_head_log2);
+    // m1 = 2^(-max_bias/2/n_head_log2); slope = m0^(h+1) for the first
+    // n_head_log2 heads and m1^(2(h-n_head_log2)+1) for the rest. The bias is
+    // slope * -(query_pos - key_pos), added to the scaled score inside the
+    // softmax. Computed once and reused by every layer and position.
+    std::vector<double> alibi_slopes;
+    if (c.alibi_max_bias > 0.0 && c.heads > 0) {
+        uint32_t n_head_log2 = 1;
+        while (n_head_log2 * 2 <= c.heads) n_head_log2 *= 2;
+        const double m0 = std::pow(2.0, -(c.alibi_max_bias) / n_head_log2);
+        const double m1 = std::pow(2.0, -(c.alibi_max_bias / 2.0) / n_head_log2);
+        alibi_slopes.resize(c.heads);
+        for (uint32_t h = 0; h < c.heads; ++h)
+            alibi_slopes[h] = h < n_head_log2 ? std::pow(m0, static_cast<double>(h) + 1.0)
+                                              : std::pow(m1, 2.0 * static_cast<double>(h - n_head_log2) + 1.0);
+    }
     auto activate = [&](float x) -> float { return pointwise_activation(c, x); };
     // The gated activation lives in include/fm/activation.hpp so the two clamp
     // forms can be tested against hand-computed values instead of only through
@@ -714,6 +732,14 @@ std::vector<float> Engine::forward_token(int32_t token, uint64_t position,
             // subsequent activation.
             const float scale = static_cast<float>(c.embedding_scale);
             for (float &v : x) v *= scale;
+        }
+        if (c.token_embd_norm) {
+            // bloom normalises the embedding once, before block 0
+            // (models/bloom.cpp's `inpL = build_norm(inpL, tok_norm, ...)`).
+            // It is not a per-layer norm and has no `blk.N.` prefix, so it
+            // cannot ride on the block's norm path.
+            x = layernorm(x, norm_weights("token_embd_norm.weight"),
+                          bias_weights("token_embd_norm.bias"), "layernorm.inp");
         }
     }
 
@@ -1163,7 +1189,13 @@ std::vector<float> Engine::forward_token(int32_t token, uint64_t position,
                 double dot = 0.0;
                 for (uint32_t j = 0; j < c.head_dim; ++j)
                     dot += static_cast<double>(q[hb + j]) * kt[j];
-                scores[t] = dot * scale;
+                double value = dot * scale;
+                // ALiBi: the reference puts the bias in the mask tensor as
+                // -(query - key) and lets `soft_max_ext` scale it by the head's
+                // slope, so it is part of the score the softmax sees.
+                if (!alibi_slopes.empty())
+                    value += alibi_slopes[head] * -static_cast<double>(position - t);
+                scores[t] = value;
             }
             // Masked positions are excluded before the softmax rather than
             // given zero weight afterwards, so the normalisation stays exact.

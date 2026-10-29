@@ -136,6 +136,8 @@ const char *tensor_role_name(TensorRole role) {
     case TensorRole::ATTN_SINKS: return "ATTN_SINKS";
     case TensorRole::ROPE_FREQS: return "ROPE_FREQS";
     case TensorRole::ATTN_K_NORM: return "ATTN_K_NORM";
+    case TensorRole::TOKEN_EMBD_NORM: return "TOKEN_EMBD_NORM";
+    case TensorRole::TOKEN_EMBD_NORM_BIAS: return "TOKEN_EMBD_NORM_BIAS";
     case TensorRole::ATTN_POST_NORM: return "ATTN_POST_NORM";
     case TensorRole::FFN_POST_NORM: return "FFN_POST_NORM";
     case TensorRole::ATTN_QKV: return "ATTN_QKV";
@@ -437,6 +439,8 @@ TensorRole role_from_name(const std::string &name, uint32_t &layer) {
     if (name == "token_embd.weight") return TensorRole::TOKEN_EMBD;
     if (name == "output.weight") return TensorRole::OUTPUT;
     if (name == "output.bias") return TensorRole::OUTPUT_BIAS;
+    if (name == "token_embd_norm.weight") return TensorRole::TOKEN_EMBD_NORM;
+    if (name == "token_embd_norm.bias") return TensorRole::TOKEN_EMBD_NORM_BIAS;
     if (name == "output_norm.weight") return TensorRole::OUTPUT_NORM;
     if (name == "output_norm.bias") return TensorRole::OUTPUT_NORM_BIAS;
     static const std::vector<std::pair<std::string, TensorRole>> suffixes = {
@@ -863,6 +867,8 @@ bool is_llama_family(const std::string &arch) {
         "jamba",
         // Batch A: verified llama-block families (see tools/triage_upstream_archs.py).
         "codeshell",
+        "bloom",
+        "jais",
         "cohere2",
         "deci",
         "hunyuan-dense",
@@ -1219,6 +1225,9 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
     // carry the key, because the converter writes the head width there). So the
     // architecture decides, and the key is read but not applied.
     if (arch == "jamba") cfg.rope_disabled = true;
+    // jais (JAIS-1) rotates nothing at all: its block calls the rope for no
+    // layer, and the file carries no rotary keys either.
+    if (arch == "jais") cfg.rope_disabled = true;
     uint64_t vocab = 0;
     if (!opt_u64(doc, keys("vocab_size"), &vocab)) {
         MetadataValue tokens;
@@ -1342,6 +1351,13 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
         cfg.activation = "gelu";
     }
     double number = 0.0;
+    // ALiBi: the bias ggml adds inside the softmax is slope(h) * -(query - key),
+    // with the slope derived from `max_bias`. bloom hardcodes 8.0 in its own
+    // `load_arch_hparams` (its comment calls it a TODO to become metadata), so a
+    // bloom file is biased whether or not it carries the key; jais reads it.
+    if (opt_double(doc, keys("attention.max_alibi_bias"), &number) && number > 0.0)
+        cfg.alibi_max_bias = number;
+    if (arch == "bloom") cfg.alibi_max_bias = 8.0;
     if (arch == "minicpm") {
         // MiniCPM scales the token embedding before the first block. Older GGUF
         // exports omit the key, in which case the original model used 12.0;
@@ -1443,6 +1459,15 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
             fail(ErrorCode::MISSING_REQUIRED_TENSOR,
                  "the attention norm and the final norm disagree about carrying a bias");
         cfg.norm_bias = attn_nb;
+        // bloom normalises the embedding once before the first block. Upstream
+        // requires both halves of that norm, so a file with only one is refused
+        // rather than run with a norm that is half applied.
+        const bool tok_norm_w = doc.tensor_by_name.count("token_embd_norm.weight") != 0;
+        const bool tok_norm_b = doc.tensor_by_name.count("token_embd_norm.bias") != 0;
+        if (tok_norm_w != tok_norm_b)
+            fail(ErrorCode::MISSING_REQUIRED_TENSOR,
+                 "token_embd_norm needs both its weight and its bias");
+        cfg.token_embd_norm = tok_norm_w;
         const bool up_b = doc.tensor_by_name.count(layer_name(probe, "ffn_up.bias")) != 0;
         const bool down_b = doc.tensor_by_name.count(layer_name(probe, "ffn_down.bias")) != 0;
         if (up_b != down_b)
@@ -1654,6 +1679,7 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
             {"codeshell", "gelu"},  // src/models/codeshell.cpp: LLM_FFN_GELU, SEQ
             {"starcoder2", "gelu"}, // src/models/starcoder2.cpp: LLM_FFN_GELU, SEQ
             {"pockettts", "gelu"},  // src/models/pockettts.cpp: LLM_FFN_GELU, SEQ
+            {"bloom", "gelu"},      // src/models/bloom.cpp: LLM_FFN_GELU, SEQ
         };
         auto it = seq_activation.find(arch);
         if (it == seq_activation.end())
@@ -1894,6 +1920,12 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
         }
     }
     expect("token_embd.weight");
+    // bloom's pre-block embedding norm: claimed here because it carries no
+    // `blk.N.` prefix, so the per-layer loop would never see it.
+    if (cfg.token_embd_norm) {
+        expect("token_embd_norm.weight");
+        expect("token_embd_norm.bias");
+    }
     expect("output_norm.weight");
     // A checkpoint without `output.weight` ties the output projection to the
     // token table. That is a supported layout, not a missing tensor: the maths
