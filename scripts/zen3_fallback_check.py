@@ -56,7 +56,8 @@ def backend_init_fields(path: Path) -> dict:
     return fields
 
 
-def simulated_checks(info: dict, trace: dict, requested_profile: str) -> dict:
+def simulated_checks(info: dict, trace: dict, requested_profile: str,
+                     real_zen3: bool = False) -> dict:
     notes = info.get("notes", "")
     backend = info.get("backend", "")
     return {
@@ -67,7 +68,11 @@ def simulated_checks(info: dict, trace: dict, requested_profile: str) -> dict:
         "notes_avx512_disabled": "AVX-512 dispatch disabled" in notes,
         "notes_fallback_selected": "Selected VNPU dispatch: Zen 3 AVX2 dual-pipe fallback" in notes,
         "trace_zen3_detected": trace.get("zen3_detected") is True,
-        "trace_detection_simulated": trace.get("zen3_detection_simulated") is True,
+        # `--test-simulate-zen3` cannot turn genuine detection into a
+        # simulation: on a real Zen 3 host the runtime reports the detection as
+        # real, and that is the correct answer, not a failure.
+        "trace_detection_simulated":
+            trace.get("zen3_detection_simulated") is (not real_zen3),
         "trace_fallback_selected": trace.get("zen3_fallback_selected") is True,
         "trace_requested_profile": trace.get("requested_profile") == requested_profile,
         "trace_selected_attempt": trace.get("selected_attempt") == "Zen 3 AVX2 dual-pipe fallback",
@@ -144,9 +149,11 @@ def main() -> int:
     }
 
     sim_auto_checks = simulated_checks(
-        last_json(sim_auto.stdout), backend_init_fields(sim_auto_trace), "zen3-auto")
+        last_json(sim_auto.stdout), backend_init_fields(sim_auto_trace), "zen3-auto",
+        real_zen3=host_zen3)
     sim_avx512_checks = simulated_checks(
-        last_json(sim_avx512.stdout), backend_init_fields(sim_avx512_trace), "avx512")
+        last_json(sim_avx512.stdout), backend_init_fields(sim_avx512_trace), "avx512",
+        real_zen3=host_zen3)
 
     checks = {
         "all_commands_exit_zero": command_rcs_ok,
@@ -187,22 +194,74 @@ def main() -> int:
         # made a byte comparison of the whole log fail immediately). The verdict
         # block is the part that records the check counts, and it is the part a
         # reader quotes.
-        stale = []
-        committed = JSON_PATH.read_text(encoding="utf-8") if JSON_PATH.exists() else ""
-        if committed != json_text:
-            stale.append(JSON_PATH.relative_to(ROOT))
+        committed_text = JSON_PATH.read_text(encoding="utf-8") if JSON_PATH.exists() else ""
         current_log = LOG_PATH.read_text(encoding="utf-8") if LOG_PATH.exists() else ""
         marker = "[verdict]\n"
         index = current_log.rfind(marker)
-        committed_verdict = current_log[index + len(marker):] if index >= 0 else ""
-        if index < 0 or committed_verdict != json_text:
-            stale.append(Path(str(LOG_PATH.relative_to(ROOT)) + " (verdict block)"))
-        if stale:
-            for path in stale:
+        log_verdict_text = current_log[index + len(marker):] if index >= 0 else ""
+
+        # Some of the verdict is a property of the *host*, not of the code: on a
+        # machine that really is Zen 3 the unit test runs two extra checks, and
+        # the non-simulated diagnostics are verified against genuine detection
+        # instead of against "not detected". Byte-comparing those on a
+        # different machine reports drift that is not there -- exactly what
+        # happened on the first CI run of this check, on a Zen 3 runner, while
+        # the file was correct.
+        # The detection-state check is the other derived value: on a real Zen 3
+        # host the simulator cannot make the detection synthetic, so the field
+        # holds the opposite (correct) answer there.
+        host_dependent = {"host_zen3_detected", "unit_checks", "non_simulated_checks"}
+
+        def drop_host_dependent(payload: dict) -> dict:
+            out: dict = {}
+            for key, value in payload.items():
+                if key in host_dependent:
+                    continue
+                if isinstance(value, dict):
+                    value = {k: v for k, v in value.items()
+                             if not k.endswith("trace_detection_simulated")}
+                out[key] = value
+            return out
+
+        def load(text: str) -> dict | None:
+            try:
+                return json.loads(text)
+            except (json.JSONDecodeError, TypeError):
+                return None
+
+        def comparable(payload: dict) -> dict:
+            return drop_host_dependent(payload)
+
+        committed = load(committed_text)
+        logged = load(log_verdict_text)
+        same_host = (committed or {}).get("host_zen3_detected") == host_zen3
+        if same_host:
+            problems = []
+            if committed_text != json_text:
+                problems.append(str(JSON_PATH.relative_to(ROOT)))
+            if index < 0 or log_verdict_text != json_text:
+                problems.append(str(Path(str(LOG_PATH.relative_to(ROOT)) + " (verdict block)")))
+        else:
+            # Different host class: compare what the host cannot influence and
+            # say what was skipped, so the line is not read as full verification.
+            problems = []
+            if committed is None or comparable(committed) != comparable(result):
+                problems.append(str(JSON_PATH.relative_to(ROOT)))
+            if logged is None or comparable(logged) != comparable(result):
+                problems.append(str(Path(str(LOG_PATH.relative_to(ROOT)) + " (verdict block)")))
+        if problems:
+            for path in problems:
                 print(f"{path} is stale; run make zen3-fallback", file=sys.stderr)
             return 1
-        print(f"zen3 fallback evidence is up to date ({result.get('status', '?')}, "
-              f"{result.get('unit_checks', -1)} unit checks)")
+        if same_host:
+            print(f"zen3 fallback evidence is up to date ({result.get('status', '?')}, "
+                  f"{result.get('unit_checks', -1)} unit checks)")
+        else:
+            print(f"zen3 fallback evidence matches on host-independent fields "
+                  f"({result.get('status', '?')}); the recorded run was on a "
+                  f"{'Zen 3' if (committed or {}).get('host_zen3_detected') else 'non-Zen-3'} "
+                  f"host and this one is not, so unit_checks and the non-simulated "
+                  f"diagnostics are not compared")
         return 0 if status == "pass" else 1
 
     JSON_PATH.write_text(json_text, encoding="utf-8")

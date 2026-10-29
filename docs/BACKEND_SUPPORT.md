@@ -94,6 +94,15 @@ Tests:
 - `make zen3-fallback` runs `scripts/zen3_fallback_check.py`; it writes
   `docs/evidence/zen3_fallback.json` and `docs/evidence/zen3_fallback.log`
   with the focused reproduction and machine-checkable verdict.
+- `make test` runs the same script with `--check`, so the committed evidence
+  cannot rot (it had: the JSON recorded 61 unit checks while the test had 64).
+  Part of the verdict is a property of the *host* — a real Zen 3 runs two extra
+  unit checks and verifies the non-simulated diagnostics against genuine
+  detection — so on a different host class the check compares the
+  host-independent fields and says which ones it skipped instead of reporting
+  drift that is not there. Verified both ways: a recorded-as-Zen-3 file on a
+  non-Zen-3 host passes with that message, and flipping a host-independent
+  check still fails.
 
 ## Backend responsibilities
 

@@ -201,7 +201,9 @@ def load_model(path: Path) -> dict[str, Any]:
         # A gate-free FFN cannot say which activation it means, so the
         # architecture has to. Read from llama.cpp's model files: both phi2 and
         # gpt-neox use `LLM_FFN_GELU` with `LLM_FFN_SEQ`.
-        seq_activation = {"phi2": "gelu", "gptneox": "gelu"}
+        seq_activation = {"phi2": "gelu", "gptneox": "gelu",
+                          "arcee": "relu_sq", "nemotron": "relu_sq",
+                          "jais2": "relu_sq"}
         if arch not in seq_activation:
             raise ReferenceError("gate-free feed-forward is only defined for phi2 and gptneox")
         cfg["activation"] = seq_activation[arch]
@@ -420,6 +422,28 @@ def expert_output(cfg: dict[str, Any], layer: int, expert: int,
     return matvec(data[base:base + per_expert], act, H, I)
 
 
+def pointwise(cfg: dict[str, Any], x: float) -> float:
+    """The un-gated activation, mirroring include/fm/activation.hpp.
+
+    One implementation for the gate-free feed-forward and for the gate branch of
+    the gated one, so the reference cannot disagree with the engine about which
+    activation a family uses.
+    """
+    kind = cfg["activation"]
+    if kind == "gelu":
+        return gelu(x)
+    if kind == "gelu_erf":
+        return 0.5 * x * (1.0 + math.erf(x / math.sqrt(2.0)))
+    if kind == "relu":
+        return max(0.0, x)
+    if kind == "relu_sq":
+        r = max(0.0, x)
+        return r * r
+    if kind == "softplus":
+        return math.log1p(math.exp(x))
+    return x / (1.0 + math.exp(-x))
+
+
 def gated(cfg: dict[str, Any], gate: float, up: float, layer: int) -> float:
     """The gated activation, including the two clamped variants.
 
@@ -447,9 +471,7 @@ def gated(cfg: dict[str, Any], gate: float, up: float, layer: int) -> float:
         # The graph fallback: silu first, then clamp its output.
         g = min(gate / (1.0 + math.exp(-gate)), bound)
         return g * u
-    if kind == "gelu":
-        return gelu(gate) * up
-    return gate / (1.0 + math.exp(-gate)) * up
+    return pointwise(cfg, gate) * up
 
 
 def softmax(values: list[float]) -> list[float]:
@@ -652,7 +674,7 @@ class Session:
                 if cfg["ffn_bias"]:
                     bias = self.tensor(p + "ffn_up.bias")
                     up = [up[i] + bias[i] for i in range(cfg["I"])]
-                act = [gelu(v) for v in up]
+                act = [pointwise(cfg, v) for v in up]
                 down = matvec(self.tensor(p + "ffn_down.weight"), act, H, cfg["I"])
                 if cfg["ffn_bias"]:
                     bias = self.tensor(p + "ffn_down.bias")

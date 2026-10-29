@@ -143,6 +143,11 @@ const char *tensor_role_name(TensorRole role);
 // and forgotten in the other.
 bool is_llama_family(const std::string &arch);
 
+// True when `kind` names an activation this build implements. Both the manifest
+// builder and the engine consult this one list, so an activation cannot be
+// half-added (reachable in one place, silently defaulted in the other).
+bool is_known_activation(const std::string &kind);
+
 struct TensorInfo {
     std::string name;
     std::vector<uint64_t> dims;

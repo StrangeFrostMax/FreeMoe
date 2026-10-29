@@ -7,7 +7,7 @@
 > attention sinks are implemented, and `auto` no longer dispatches AVX-512 on a
 > Zen 3 target. The measurements below are the state at `f704e4b` and are kept
 > as the baseline this work is measured against; current numbers live in
-> `docs/MODEL_COVERAGE_STATUS.md` (2555 checks, 27 architecture fixtures).
+> `docs/MODEL_COVERAGE_STATUS.md` (2649 checks, 31 architecture fixtures).
 >
 > What changed since the baseline, in the terms this document uses:
 >
@@ -174,12 +174,17 @@ code), then YaRN (+14, one rotary change), then the two recurrent families
 
 ### The 10 that stay hard
 
-`arcee gemma3n jais2 kimi-k3 minimax-m3 nemotron nemotron-h nemotron-h-moe
-openai-moe plm` — each needs a change to the block itself, not a variant of it:
-AltUp / per-layer embeddings (`gemma3n`), KDA plus the `SITU` timing
-nonlinearity (`kimi-k3`), clamped `SWIGLU_OAI_MOE` with attention sinks
-(`openai-moe`, `minimax-m3`), ReLU² layers with per-layer quirks
-(`nemotron*`), MLA plus `RELU` (`plm`).
+`gemma3n kimi-k3 minimax-m3 nemotron-h nemotron-h-moe openai-moe plm` — each
+needs a change to the block itself, not a variant of it: AltUp / per-layer
+embeddings (`gemma3n`), KDA plus the `SITU` timing nonlinearity (`kimi-k3`),
+clamped `SWIGLU_OAI_MOE` with attention sinks (`openai-moe`, `minimax-m3`),
+recurrent layers interleaved with attention (`nemotron-h*`), MLA plus `relu`
+no-gate (`plm`).
+
+`arcee`, `nemotron` and `jais2` used to be on this list and should not have
+been: their block *is* the llama block with a gate-free `relu²` FFN, which needs
+an entry in the gate-free activation table rather than a new layer. All three
+now have an adapter row, a fixture and an oracle golden.
 
 ### Caveats on this census
 
