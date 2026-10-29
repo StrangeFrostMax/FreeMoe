@@ -38,3 +38,4 @@ models/
 *.gguf
 !tests/fixtures/*.gguf
 !tests/malformed_models/*.gguf
+.llama-cpp/

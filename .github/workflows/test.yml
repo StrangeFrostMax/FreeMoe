@@ -67,6 +67,22 @@ jobs:
           grep -nE "^FAIL:|^\[FAIL\]|FAILED|Traceback|Error [0-9]+|error:|checks,|stale|is not compared|SKIP " test.log | head -30 |
             while IFS= read -r line; do echo "::error title=tests::$line"; done
           exit 1
+      # The tokenizer is the one component whose correctness cannot be shown by
+      # this repo's own fixtures: an encoder can be self-consistent and still
+      # disagree with every other runtime. These are llama.cpp's own expected
+      # token ids, from a tree pinned by revision so a moving upstream cannot
+      # change what "pass" means between runs. `--fail-on-skip` makes a
+      # vocabulary this build refuses a failure unless it is a documented
+      # exclusion.
+      - name: Tokenizer parity against llama.cpp golden vectors
+        env:
+          LLAMA_CPP_REV: 0893ec98f5eafad36a43a72cd1c3723d72b0d03a
+        run: |
+          set -o pipefail
+          curl -sSL "https://codeload.github.com/ggml-org/llama.cpp/tar.gz/${LLAMA_CPP_REV}" -o llama.tar.gz
+          mkdir -p .llama-cpp && tar xzf llama.tar.gz -C .llama-cpp --strip-components=1 \
+            --wildcards '*/models/ggml-vocab-*'
+          FREEMOE_VOCAB_DIR="$PWD/.llama-cpp/models" make test-tokenizer-parity 2>&1 | tee tokenizer.log
       - name: Fixture and table regeneration checks
         run: |
           python3 tools/gen_quant_tables.py --check

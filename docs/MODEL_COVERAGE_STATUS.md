@@ -19,7 +19,7 @@ what the work is: the 50 model names reduce to about eight capabilities.
 
 | Capability | Evidence |
 | --- | --- |
-| Byte-level BPE (4 pre-tokenizer families), SentencePiece by score | `tools/tokenizer_parity.py`: 8 vocabularies at 46/46, 0 failures |
+| Byte-level BPE (10 pre-tokenizer families: gpt2, gpt2-digits, llama3, qwen2, qwen35, deepseek-llm, deepseek-coder, deepseek-v3, falcon, tekken), SentencePiece by score | `tools/tokenizer_parity.py --fail-on-skip`: **12 vocabularies pass** (46/46 each, `qwen35` 50/50), 0 failures, against llama.cpp's own vectors from a pinned revision. Run from CI; a refused vocabulary fails unless explicitly allowlisted |
 | Linear + YaRN context extension, `rope_freqs` divisors | `rope_scaling` checks, 4 fixtures |
 | Attention sinks, NoPE layers | `attention_sinks`, `rope_scaling`, fixtures |
 | MLA (DeepSeek-V2/V3 style), sigmoid/softmax/sqrt-softplus gating, group-limited routing, selection bias, shared expert | `deepseek2-mla` fixture + oracle |

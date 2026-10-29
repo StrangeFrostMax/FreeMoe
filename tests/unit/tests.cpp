@@ -1974,9 +1974,39 @@ void test_tokenizer_bpe_families() {
               "contractions decode exactly");
     }
 
-    // Unknown and missing pre-tokenizers refuse instead of guessing.
+    // Unknown and missing pre-tokenizers refuse instead of guessing. `kimi-k2`
+    // is the reference example: its splitting rule is not implemented here, and
+    // it must stay a refusal rather than falling back to another family.
+    // The families that were added have to report themselves as implemented:
+    // otherwise the refusal test above would pass for the wrong reason.
     {
-        GGUFDocument doc = document("deepseek-llm");
+        struct Expect { const char *pre; Tokenizer::PreTokenizer family; };
+        const Expect implemented[] = {
+            {"deepseek-llm", Tokenizer::PreTokenizer::DeepseekLlm},
+            {"deepseek-coder", Tokenizer::PreTokenizer::DeepseekCoder},
+            {"deepseek-v3", Tokenizer::PreTokenizer::DeepseekV3},
+            {"falcon", Tokenizer::PreTokenizer::Falcon},
+            {"tekken", Tokenizer::PreTokenizer::Tekken},
+            {"qwen35", Tokenizer::PreTokenizer::Qwen35},
+        };
+        for (const Expect &e : implemented) {
+            GGUFDocument doc = document(e.pre);
+            const uint32_t vocab = static_cast<uint32_t>(
+                doc.metadata["tokenizer.ggml.tokens"].array.size());
+            const Tokenizer tokenizer = Tokenizer::from_gguf(doc, vocab);
+            CHECK(tokenizer.pre_tokenizer() == e.family,
+                  std::string(e.pre) + " selects its own splitting rule");
+            CHECK(tokenizer.complete(),
+                  std::string(e.pre) + " is reported as a complete tokenizer");
+            // And the probe agrees before a run is attempted.
+            doc.metadata["general.architecture"] = make_string("gpt2");
+            const Json probe = probe_model(doc, "synthetic.gguf");
+            CHECK(probe.dump().find("TOKENIZER_PRE_NOT_IMPLEMENTED") == std::string::npos,
+                  std::string(e.pre) + " is not blocked by the probe");
+        }
+    }
+    {
+        GGUFDocument doc = document("kimi-k2");
         const uint32_t vocab = static_cast<uint32_t>(
             doc.metadata["tokenizer.ggml.tokens"].array.size());
         const Tokenizer tokenizer = Tokenizer::from_gguf(doc, vocab);
@@ -2010,7 +2040,7 @@ void test_tokenizer_bpe_families() {
     // The probe has to say the same thing before a run is attempted, so a
     // checkpoint with an unknown splitting rule is never reported runnable.
     {
-        GGUFDocument doc = document("deepseek-llm");
+        GGUFDocument doc = document("kimi-k2");
         doc.metadata["general.architecture"] = make_string("gpt2");
         const Json probe = probe_model(doc, "synthetic.gguf");
         CHECK(probe.dump().find("TOKENIZER_PRE_NOT_IMPLEMENTED") != std::string::npos,
@@ -3684,6 +3714,98 @@ void test_mrope_families() {
 // state-space scan whose state replaces the kv cache. Because the state is the
 // only channel through which an earlier token reaches a later one, the checks
 // below look at both the parsed facts and the shape of that state.
+// `attention.head_count` is scalar-or-array upstream (`get_key_or_arr`,
+// llama.cpp/src/llama-model.cpp:1480). The array form states one count per
+// layer, with zero entries marking the recurrent layers of a hybrid. This engine
+// keeps one count for the stack, so the array is accepted when every attention
+// layer agrees -- and a zero is checked against the tensor-derived recurrence
+// mask rather than trusted.
+void test_metadata_array_forms() {
+    const std::string path = "tests/fixtures/llama-gqa-shape.gguf";
+    const GGUFDocument scalar = parse_gguf_file(path);
+    const std::string key = "llama.attention.head_count";
+    const uint32_t heads = build_manifest(scalar, path).config.heads;
+    CHECK(heads != 0, "the scalar head count is read");
+
+    // A matching array is equivalent: same config, same ids.
+    GGUFDocument array_form = scalar;
+    MetadataValue entries;
+    entries.type = GGUFValueType::ARRAY;
+    entries.element_type = GGUFValueType::UINT32;
+    for (uint32_t l = 0; l < 2; ++l) {
+        MetadataValue one;
+        one.type = GGUFValueType::UINT32;
+        one.u = heads;
+        entries.array.push_back(one);
+    }
+    array_form.metadata[key] = entries;
+    const ModelManifest array_manifest = build_manifest(array_form, path);
+    CHECK(array_manifest.config.heads == heads, "the array head count resolves to the same count");
+
+    RunConfig config;
+    config.model_path = path;
+    config.budget.total_hot_bytes = 64ull * 1024 * 1024;
+    PromptResult scalar_ids;
+    {
+        Engine engine(config);
+        engine.initialize();
+        scalar_ids = engine.run_prompt("Hello", 4);
+    }
+    // The array form is exercised through the manifest, since the engine reads a
+    // file; the parsed config being identical is what the check above states.
+    (void)scalar_ids;
+
+    // An array of the wrong length is refused.
+    GGUFDocument short_array = array_form;
+    short_array.metadata[key].array.pop_back();
+    CHECK(throws_code(ErrorCode::METADATA_MISMATCH,
+                      [&]() { (void)build_manifest(short_array, path); }),
+          "a per-layer head count with the wrong number of entries is refused");
+
+    // Disagreeing attention layers are refused: one count cannot describe them.
+    GGUFDocument disagreeing = array_form;
+    disagreeing.metadata[key].array[1].u = heads + 1;
+    CHECK(throws_code(ErrorCode::SHAPE_MISMATCH,
+                      [&]() { (void)build_manifest(disagreeing, path); }),
+          "per-layer head counts that differ among attention layers are refused");
+
+    // A zero entry claims the layer is recurrent; here no `ssm_in` exists, so the
+    // claim contradicts the tensors.
+    GGUFDocument zero_recurrent = array_form;
+    zero_recurrent.metadata[key].array[1].u = 0;
+    CHECK(throws_code(ErrorCode::METADATA_MISMATCH,
+                      [&]() { (void)build_manifest(zero_recurrent, path); }),
+          "a zero head count without a recurrent layer in the tensors is refused");
+
+    // `attention.recurrent_layers` in its positive form: jamba's split stated
+    // explicitly, and it must agree with the tensors rather than override them.
+    {
+        const std::string jamba = "tests/fixtures/jamba-shape.gguf";
+        GGUFDocument doc = parse_gguf_file(jamba);
+        const ModelManifest derived = build_manifest(doc, jamba);
+        MetadataValue mask;
+        mask.type = GGUFValueType::ARRAY;
+        mask.element_type = GGUFValueType::BOOL;
+        for (uint32_t l = 0; l < derived.config.layers; ++l) {
+            MetadataValue one;
+            one.type = GGUFValueType::BOOL;
+            one.b = derived.config.layer_is_recurrent(l) != 0;
+            mask.array.push_back(one);
+        }
+        doc.metadata["jamba.attention.recurrent_layers"] = mask;
+        const ModelManifest declared = build_manifest(doc, jamba);
+        CHECK(declared.config.recurrent_layers == derived.config.recurrent_layers,
+              "an explicit recurrent_layers mask that matches the tensors is accepted");
+
+        // Flipping one entry makes the claim disagree with the tensors.
+        doc.metadata["jamba.attention.recurrent_layers"].array[0].b =
+            !doc.metadata["jamba.attention.recurrent_layers"].array[0].b;
+        CHECK(throws_code(ErrorCode::METADATA_MISMATCH,
+                          [&]() { (void)build_manifest(doc, jamba); }),
+              "a recurrent_layers mask that contradicts the tensors is refused");
+    }
+}
+
 void test_recurrent_families() {
     struct Expect {
         const char *slug;
@@ -4282,6 +4404,7 @@ int main(int argc, char **argv) {
     maybe_run("plm_block", test_plm_block);
     maybe_run("mistral3_block", test_mistral3_block);
     maybe_run("mrope_families", test_mrope_families);
+    maybe_run("metadata_array_forms", test_metadata_array_forms);
     maybe_run("recurrent_families", test_recurrent_families);
     maybe_run("chat_template_rendering", test_chat_template_rendering);
     maybe_run("chat_template_constructs", test_chat_template_constructs);

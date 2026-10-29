@@ -887,7 +887,6 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
     std::vector<uint8_t> recurrence(cfg.layers, 0);
     for (uint32_t l = 0; l < cfg.layers; ++l)
         recurrence[l] = doc.tensor_by_name.count(layer_name(l, "ssm_in.weight")) != 0 ? 1 : 0;
-    uint32_t declared_recurrence = 0;
     {
         // llama.cpp reads the split from `attention.recurrent_layers` (a bool
         // array: minimax-01, qwen3next) or from a per-layer
@@ -908,7 +907,6 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
                              (recurrence[l] ? "a" : "no") + " blk." + std::to_string(l) +
                              ".ssm_in.weight is present");
             }
-            declared_recurrence = 1;
         };
         if (auto it = doc.metadata.find(arch + ".attention.recurrent_layers");
             it != doc.metadata.end() && it->second.is_array()) {
@@ -923,7 +921,6 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
             apply_mask(claimed, (arch + ".attention.head_count_kv").c_str());
         }
     }
-    (void)declared_recurrence;
     uint32_t first_recurrent = cfg.layers;
     uint32_t first_attention = cfg.layers;
     for (uint32_t l = 0; l < cfg.layers; ++l) {
@@ -1068,8 +1065,51 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
             fail(ErrorCode::METADATA_MISMATCH, "feed_forward_length must be positive");
     }
     if (has_attn) {
-        cfg.heads =
-            static_cast<uint32_t>(require_key("attention.head_count", "attention head count"));
+        // `attention.head_count` is scalar-or-array upstream
+        // (`get_key_or_arr`, llama-model.cpp:1480). The array form states one
+        // count per layer, with zero entries marking the recurrent layers of a
+        // hybrid. This engine keeps one head count for the stack, so the array is
+        // accepted when every attention layer agrees -- and a zero is checked
+        // against the tensor-derived mask, so a file cannot claim a recurrence
+        // split the tensors do not show.
+        const std::string heads_key = arch + ".attention.head_count";
+        auto heads_it = doc.metadata.find(heads_key);
+        if (heads_it != doc.metadata.end() && heads_it->second.is_array()) {
+            const auto &entries = heads_it->second.array;
+            if (entries.size() != cfg.layers)
+                fail(ErrorCode::METADATA_MISMATCH,
+                     heads_key + " has " + std::to_string(entries.size()) + " entries for " +
+                         std::to_string(cfg.layers) + " layers");
+            uint64_t agreed = 0;
+            bool set = false;
+            for (uint32_t l = 0; l < cfg.layers; ++l) {
+                const uint64_t count = entries[l].as_u64();
+                if (count == 0) {
+                    if (!recurrence[l])
+                        fail(ErrorCode::METADATA_MISMATCH,
+                             heads_key + " marks layer " + std::to_string(l) +
+                                 " as recurrent but blk." + std::to_string(l) +
+                                 ".ssm_in.weight is absent");
+                    continue;
+                }
+                if (recurrence[l])
+                    fail(ErrorCode::METADATA_MISMATCH,
+                         heads_key + " gives layer " + std::to_string(l) +
+                             " a head count but blk." + std::to_string(l) +
+                             ".ssm_in.weight makes it recurrent");
+                if (set && count != agreed)
+                    fail(ErrorCode::SHAPE_MISMATCH,
+                         "per-layer attention.head_count values differ among attention layers");
+                agreed = count;
+                set = true;
+            }
+            if (!set)
+                fail(ErrorCode::METADATA_MISMATCH, "no attention layer states a head count");
+            cfg.heads = static_cast<uint32_t>(agreed);
+        } else {
+            cfg.heads =
+                static_cast<uint32_t>(require_key("attention.head_count", "attention head count"));
+        }
         // Per-head kv counts can be a per-layer array, whose zero entries are the
         // recurrence mask handled above. Every attention layer must then agree on
         // the count: a cache sized per kv head cannot vary inside one stack.

@@ -82,6 +82,18 @@ $(BUILD)/obj/vnpu-selftest.o: third_party/vnpu/tools/selftest.cpp
 	@mkdir -p $(dir $@)
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -c $< -o $@
 
+# Tokenizer parity against llama.cpp's own golden vectors. The corpus is a
+# pinned llama.cpp tree (75 MB of test vocabularies), so it is never vendored
+# here: point FREEMOE_VOCAB_DIR at `<llama.cpp>/models`. A missing corpus is a
+# failure, not a skip -- a gate that passes by doing nothing is the defect this
+# target exists to prevent.
+LLAMA_CPP_REV ?= 0893ec98f5eafad36a43a72cd1c3723d72b0d03a
+
+test-tokenizer-parity: all
+	@test -n "$(FREEMOE_VOCAB_DIR)" || \
+	  { echo "FREEMOE_VOCAB_DIR is unset; point it at <llama.cpp>/models"; exit 1; }
+	python3 tools/tokenizer_parity.py --vocab-dir "$(FREEMOE_VOCAB_DIR)" --fail-on-skip
+
 test: all $(BUILD)/tests $(BUILD)/vnpu-selftest $(BUILD)/fuzz_gguf
 	@mkdir -p $(BUILD)/test-tmp
 	./$(BUILD)/tests

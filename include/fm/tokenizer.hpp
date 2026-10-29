@@ -33,6 +33,12 @@ public:
         Gpt2Digits,  // the same, with each digit split off first (StarCoder family)
         Llama3,      // contractions, [^\r\n\p{L}\p{N}]?\p{L}+, \p{N}{1,3}, punctuation runs
         Qwen2,       // as llama-3 but a single digit per token
+        Qwen35,      // as llama-3 but marks count as letters and one digit per token
+        DeepseekLlm,   // newline, letters, punctuation, trailing space, CJK, digit runs
+        DeepseekCoder, // newline, letters, punctuation, CJK, one digit per token
+        DeepseekV3,    // \p{N}{1,3}, CJK/kana, punct-then-letters, letter/mark runs
+        Falcon,        // punctuation runs first, then the GPT-2 rule, then 3 digits
+        Tekken,        // case-aware letter runs (uppercase/lowercase transitions)
         Unsupported, // recognised but not implemented: refuse instead of guessing
     };
 
