@@ -408,6 +408,30 @@ const char *ignorable_reason(const std::string &name) {
     return nullptr;
 }
 
+// llama.cpp renamed the sandwich-normalisation tensors. Current converters write
+// `post_attention_norm` / `post_ffw_norm`; older exports (and every fixture this
+// repo built before the rename) say `attn_post_norm` / `ffn_post_norm`. They are
+// the same tensors in the same place in the block, so the name is normalised at
+// parse time and everything downstream keeps one spelling.
+std::string canonical_layer_name(std::string name) {
+    static const std::map<std::string, std::string> renamed = {
+        {"post_attention_norm", "attn_post_norm"},
+        {"post_ffw_norm", "ffn_post_norm"},
+    };
+    const size_t dot = name.rfind('.');
+    if (dot == std::string::npos) return name;
+    std::string stem = name.substr(0, dot);
+    const std::string suffix = name.substr(dot + 1);
+    for (const auto &entry : renamed) {
+        const size_t at = stem.rfind("." + entry.first);
+        if (at != std::string::npos && at + 1 + entry.first.size() == stem.size()) {
+            stem.replace(at + 1, entry.first.size(), entry.second);
+            return stem + "." + suffix;
+        }
+    }
+    return name;
+}
+
 TensorRole role_from_name(const std::string &name, uint32_t &layer) {
     layer = 0;
     if (name == "token_embd.weight") return TensorRole::TOKEN_EMBD;
@@ -587,6 +611,7 @@ GGUFDocument parse_gguf(const uint8_t *data, size_t size) {
         t.relative_offset = c.u64("tensor offset");
         if (t.relative_offset % alignment != 0)
             fail(ErrorCode::MALFORMED_GGUF, "misaligned tensor offset for " + t.name);
+        t.name = canonical_layer_name(t.name);
         if (doc.tensor_by_name.count(t.name))
             fail(ErrorCode::MALFORMED_GGUF, "duplicate tensor name " + t.name);
         if (std::getenv("FM_GGUF_DEBUG"))
@@ -836,6 +861,19 @@ bool is_llama_family(const std::string &arch) {
         // jamba: the same recurrent block interleaved with attention layers in
         // one stack, and no rotary position on those attention layers at all.
         "jamba",
+        // Batch A: verified llama-block families (see tools/triage_upstream_archs.py).
+        "codeshell",
+        "cohere2",
+        "deci",
+        "hunyuan-dense",
+        "llama-embed",
+        "maincoder",
+        "nanbeige",
+        "paddleocr",
+        "pockettts",
+        "qwen",
+        "starcoder2",
+        "xverse",
     };
     return family.count(arch) != 0;
 }
@@ -1612,6 +1650,10 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
             {"nemotron", "relu_sq"},// src/models/nemotron.cpp: LLM_FFN_RELU_SQR, SEQ
             {"jais2", "relu_sq"},   // src/models/jais2.cpp: LLM_FFN_RELU_SQR, SEQ
             {"plm", "relu_sq"},     // src/models/plm.cpp: LLM_FFN_RELU_SQR, SEQ
+            // GeGLU with the up projection as the whole branch: no gate tensor.
+            {"codeshell", "gelu"},  // src/models/codeshell.cpp: LLM_FFN_GELU, SEQ
+            {"starcoder2", "gelu"}, // src/models/starcoder2.cpp: LLM_FFN_GELU, SEQ
+            {"pockettts", "gelu"},  // src/models/pockettts.cpp: LLM_FFN_GELU, SEQ
         };
         auto it = seq_activation.find(arch);
         if (it == seq_activation.end())
