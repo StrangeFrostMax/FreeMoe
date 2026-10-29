@@ -149,6 +149,7 @@ const char *tensor_role_name(TensorRole role) {
     case TensorRole::OUTPUT_NORM_BIAS: return "OUTPUT_NORM_BIAS";
     case TensorRole::FFN_UP_BIAS: return "FFN_UP_BIAS";
     case TensorRole::FFN_DOWN_BIAS: return "FFN_DOWN_BIAS";
+    case TensorRole::FFN_GATE_BIAS: return "FFN_GATE_BIAS";
     case TensorRole::OUTPUT_BIAS: return "OUTPUT_BIAS";
     case TensorRole::ATTN_Q_A: return "ATTN_Q_A";
     case TensorRole::ATTN_Q_A_NORM: return "ATTN_Q_A_NORM";
@@ -158,6 +159,25 @@ const char *tensor_role_name(TensorRole role) {
     case TensorRole::ATTN_K_B: return "ATTN_K_B";
     case TensorRole::ATTN_V_B: return "ATTN_V_B";
     case TensorRole::FFN_EXP_PROBS_B: return "FFN_EXP_PROBS_B";
+    case TensorRole::FFN_ROUTER_BIAS: return "FFN_ROUTER_BIAS";
+    case TensorRole::FFN_GATE_EXPS_BIAS: return "FFN_GATE_EXPS_BIAS";
+    case TensorRole::FFN_UP_EXPS_BIAS: return "FFN_UP_EXPS_BIAS";
+    case TensorRole::FFN_DOWN_EXPS_BIAS: return "FFN_DOWN_EXPS_BIAS";
+    case TensorRole::FFN_NORM_ADA_DOWN: return "FFN_NORM_ADA_DOWN";
+    case TensorRole::FFN_NORM_ADA_UP: return "FFN_NORM_ADA_UP";
+    case TensorRole::SSM_IN: return "SSM_IN";
+    case TensorRole::SSM_CONV1D: return "SSM_CONV1D";
+    case TensorRole::SSM_CONV1D_BIAS: return "SSM_CONV1D_BIAS";
+    case TensorRole::SSM_X: return "SSM_X";
+    case TensorRole::SSM_DT: return "SSM_DT";
+    case TensorRole::SSM_DT_BIAS: return "SSM_DT_BIAS";
+    case TensorRole::SSM_A: return "SSM_A";
+    case TensorRole::SSM_D: return "SSM_D";
+    case TensorRole::SSM_OUT: return "SSM_OUT";
+    case TensorRole::SSM_NORM: return "SSM_NORM";
+    case TensorRole::SSM_DT_NORM: return "SSM_DT_NORM";
+    case TensorRole::SSM_B_NORM: return "SSM_B_NORM";
+    case TensorRole::SSM_C_NORM: return "SSM_C_NORM";
     case TensorRole::IGNORED: return "IGNORED";
     }
     return "UNKNOWN";
@@ -444,6 +464,7 @@ TensorRole role_from_name(const std::string &name, uint32_t &layer) {
         {"ffn_norm.bias", TensorRole::FFN_NORM_BIAS},
         {"ffn_up.bias", TensorRole::FFN_UP_BIAS},
         {"ffn_down.bias", TensorRole::FFN_DOWN_BIAS},
+        {"ffn_gate.bias", TensorRole::FFN_GATE_BIAS},
         {"attn_q_a.weight", TensorRole::ATTN_Q_A},
         {"attn_q_a_norm.weight", TensorRole::ATTN_Q_A_NORM},
         {"attn_q_b.weight", TensorRole::ATTN_Q_B},
@@ -452,6 +473,27 @@ TensorRole role_from_name(const std::string &name, uint32_t &layer) {
         {"attn_k_b.weight", TensorRole::ATTN_K_B},
         {"attn_v_b.weight", TensorRole::ATTN_V_B},
         {"ffn_exp_probs_b.bias", TensorRole::FFN_EXP_PROBS_B},
+        {"ffn_gate_inp.bias", TensorRole::FFN_ROUTER_BIAS},
+        {"ffn_gate_exps.bias", TensorRole::FFN_GATE_EXPS_BIAS},
+        {"ffn_up_exps.bias", TensorRole::FFN_UP_EXPS_BIAS},
+        {"ffn_down_exps.bias", TensorRole::FFN_DOWN_EXPS_BIAS},
+        {"ffn_norm_ada_down.weight", TensorRole::FFN_NORM_ADA_DOWN},
+        {"ffn_norm_ada_up.weight", TensorRole::FFN_NORM_ADA_UP},
+        // llama.cpp's mamba tensors. `ssm_a` and `ssm_d` carry no `.weight`
+        // suffix upstream, so they are matched by their bare names.
+        {"ssm_in.weight", TensorRole::SSM_IN},
+        {"ssm_conv1d.weight", TensorRole::SSM_CONV1D},
+        {"ssm_conv1d.bias", TensorRole::SSM_CONV1D_BIAS},
+        {"ssm_x.weight", TensorRole::SSM_X},
+        {"ssm_dt.weight", TensorRole::SSM_DT},
+        {"ssm_dt.bias", TensorRole::SSM_DT_BIAS},
+        {"ssm_a", TensorRole::SSM_A},
+        {"ssm_d", TensorRole::SSM_D},
+        {"ssm_out.weight", TensorRole::SSM_OUT},
+        {"ssm_norm.weight", TensorRole::SSM_NORM},
+        {"ssm_dt_norm.weight", TensorRole::SSM_DT_NORM},
+        {"ssm_b_norm.weight", TensorRole::SSM_B_NORM},
+        {"ssm_c_norm.weight", TensorRole::SSM_C_NORM},
     };
     for (const auto &entry : suffixes)
         if (parse_layer_suffix(name, entry.first, layer)) return entry.second;
@@ -774,6 +816,26 @@ bool is_llama_family(const std::string &arch) {
         // models/nemotron.cpp, models/jais2.cpp, all LLM_FFN_RELU_SQR with
         // LLM_FFN_SEQ, i.e. a single up projection).
         "arcee", "nemotron", "jais2",
+        // gpt-oss: the llama block with attention sinks, a post-attention norm
+        // that feeds the MoE, `swiglu_oai` and per-expert projection biases.
+        "gpt-oss",
+        // plm: multi-head latent attention with a one-step q projection, a
+        // gate-free relu^2 FFN and a tied output head.
+        "plm",
+        // Text paths of the mRoPE families and the two clamped deepseek
+        // revisions; their graph is the block below, the differences are in the
+        // rotary sections and the clamp bounds, both read from the file.
+        "qwen3vl", "qwen3vlmoe", "deepseek4", "deepseek41",
+        // mistral3: the llama block with optional MLP biases, an optional
+        // adaptive RMSNorm driven by a sinusoidal delay embedding (whose MLP is
+        // a gelu_erf), and llama.cpp's per-position attention temperature.
+        "mistral3",
+        // mamba/mamba2: no attention at all. Each layer is a 1D convolution and
+        // a state-space scan over a rolling state, and a pure file has no FFN.
+        "mamba", "mamba2",
+        // jamba: the same recurrent block interleaved with attention layers in
+        // one stack, and no rotary position on those attention layers at all.
+        "jamba",
     };
     return family.count(arch) != 0;
 }
@@ -813,24 +875,200 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
 
     cfg.layers = static_cast<uint32_t>(require_key("block_count", "layer count"));
     cfg.hidden = static_cast<uint32_t>(require_key("embedding_length", "embedding length"));
-    cfg.intermediate =
-        static_cast<uint32_t>(require_key("feed_forward_length", "feed-forward length"));
-    cfg.heads = static_cast<uint32_t>(require_key("attention.head_count", "attention head count"));
-    uint64_t kv_heads = 0;
-    if (!opt_u64(doc, keys("attention.head_count_kv"), &kv_heads)) kv_heads = cfg.heads;
-    cfg.kv_heads = static_cast<uint32_t>(kv_heads);
-    uint64_t head_dim = 0;
-    if (!opt_u64(doc, keys("attention.key_length"), &head_dim)) {
-        if (cfg.heads == 0 || cfg.hidden % cfg.heads != 0)
-            fail(ErrorCode::SHAPE_MISMATCH, "cannot derive head dimension from embedding length");
-        head_dim = cfg.hidden / cfg.heads;
+
+    // --- recurrent (state-space) layers -------------------------------------
+    // A layer with `ssm_in` has no attention: llama.cpp's mamba block is a 1D
+    // convolution followed by a state-space scan. A *pure* mamba model is then
+    // all-recurrent and has no feed-forward either, while a hybrid stack
+    // (jamba, nemotron-h, falcon-h1) interleaves recurrent and attention layers.
+    // The tensors are the evidence, so the mask starts from them; metadata can
+    // only confirm it.
+    std::vector<uint8_t> recurrence(cfg.layers, 0);
+    for (uint32_t l = 0; l < cfg.layers; ++l)
+        recurrence[l] = doc.tensor_by_name.count(layer_name(l, "ssm_in.weight")) != 0 ? 1 : 0;
+    uint32_t declared_recurrence = 0;
+    {
+        // llama.cpp reads the split from `attention.recurrent_layers` (a bool
+        // array: minimax-01, qwen3next) or from a per-layer
+        // `attention.head_count_kv` whose zero entries mean the layer has no
+        // attention at all (jamba, nemotron-h). Whichever is present is only a
+        // claim; the tensors decide, and a claim that disagrees with them is an
+        // error rather than a preference.
+        auto apply_mask = [&](const std::vector<uint8_t> &claimed, const char *key) {
+            if (claimed.size() != cfg.layers)
+                fail(ErrorCode::METADATA_MISMATCH,
+                     std::string(key) + " has " + std::to_string(claimed.size()) +
+                         " entries for " + std::to_string(cfg.layers) + " layers");
+            for (uint32_t l = 0; l < cfg.layers; ++l) {
+                if (claimed[l] != recurrence[l])
+                    fail(ErrorCode::METADATA_MISMATCH,
+                         std::string(key) + " says layer " + std::to_string(l) + " is " +
+                             (claimed[l] ? "recurrent" : "an attention layer") + " but " +
+                             (recurrence[l] ? "a" : "no") + " blk." + std::to_string(l) +
+                             ".ssm_in.weight is present");
+            }
+            declared_recurrence = 1;
+        };
+        if (auto it = doc.metadata.find(arch + ".attention.recurrent_layers");
+            it != doc.metadata.end() && it->second.is_array()) {
+            std::vector<uint8_t> claimed;
+            for (const auto &entry : it->second.array) claimed.push_back(entry.as_bool() ? 1 : 0);
+            apply_mask(claimed, (arch + ".attention.recurrent_layers").c_str());
+        } else if (auto it = doc.metadata.find(arch + ".attention.head_count_kv");
+                   it != doc.metadata.end() && it->second.is_array()) {
+            std::vector<uint8_t> claimed;
+            for (const auto &entry : it->second.array)
+                claimed.push_back(entry.as_u64() == 0 ? 1 : 0);
+            apply_mask(claimed, (arch + ".attention.head_count_kv").c_str());
+        }
     }
-    cfg.head_dim = static_cast<uint32_t>(head_dim);
+    (void)declared_recurrence;
+    uint32_t first_recurrent = cfg.layers;
+    uint32_t first_attention = cfg.layers;
+    for (uint32_t l = 0; l < cfg.layers; ++l) {
+        if (recurrence[l]) {
+            if (first_recurrent == cfg.layers) first_recurrent = l;
+        } else if (first_attention == cfg.layers) {
+            first_attention = l;
+        }
+    }
+    const bool has_ssm = first_recurrent != cfg.layers;
+    const bool has_attn = first_attention != cfg.layers;
+    // Block facts are read from a layer that runs the block in question. In a
+    // hybrid the first such layer is not layer 0, so probing layer 0 would
+    // describe the wrong one.
+    const uint32_t probe = has_attn ? first_attention : 0;
+    cfg.recurrent_layers = recurrence;
+    if (has_ssm) {
+        cfg.ssm_conv = static_cast<uint32_t>(require_key("ssm.conv_kernel", "SSM convolution width"));
+        cfg.ssm_inner = static_cast<uint32_t>(require_key("ssm.inner_size", "SSM inner size"));
+        cfg.ssm_state = static_cast<uint32_t>(require_key("ssm.state_size", "SSM state size"));
+        cfg.ssm_dt_rank =
+            static_cast<uint32_t>(require_key("ssm.time_step_rank", "SSM time-step rank"));
+        uint64_t groups = 1;
+        if (opt_u64(doc, keys("ssm.group_count"), &groups) && groups > 1)
+            cfg.ssm_groups = static_cast<uint32_t>(groups);
+        opt_bool(doc, keys("ssm.dt_b_c_rms"), &cfg.ssm_dt_b_c_rms);
+        if (cfg.ssm_conv < 2 || cfg.ssm_inner == 0 || cfg.ssm_state == 0 || cfg.ssm_dt_rank == 0)
+            fail(ErrorCode::METADATA_MISMATCH,
+                 "an SSM layer needs a convolution width of at least 2 and non-zero sizes");
+        // mamba2 says so with a scalar decay: `ssm_a` is {1, n_head}, while
+        // mamba's is one row of `d_state` per channel.
+        const auto a_it = doc.tensor_by_name.find(layer_name(first_recurrent, "ssm_a"));
+        const bool scalar_a =
+            a_it != doc.tensor_by_name.end() && !doc.tensors[a_it->second].dims.empty() &&
+            doc.tensors[a_it->second].dims[0] == 1;
+        cfg.ssm_kind = scalar_a ? "mamba2" : "mamba";
+        // mamba2 channels the grouped B and C through the same convolution as
+        // the state, and normalises B, C and dt per group.
+        if (cfg.ssm_kind == "mamba2") {
+            cfg.ssm_vector_norms =
+                doc.tensor_by_name.count(layer_name(first_recurrent, "ssm_dt_norm.weight")) != 0;
+            if (doc.tensor_by_name.count(layer_name(first_recurrent, "ssm_norm.weight")) == 0)
+                fail(ErrorCode::MISSING_REQUIRED_TENSOR,
+                     "mamba2 needs its grouped norm (blk." + std::to_string(first_recurrent) +
+                         ".ssm_norm.weight)");
+            if (cfg.ssm_inner % cfg.ssm_groups != 0 || cfg.ssm_inner % cfg.ssm_dt_rank != 0)
+                fail(ErrorCode::SHAPE_MISMATCH,
+                     "the SSM inner size must divide into groups and heads");
+        } else {
+            cfg.ssm_vector_norms =
+                doc.tensor_by_name.count(layer_name(first_recurrent, "ssm_dt_norm.weight")) != 0;
+            // mamba-1's scan is one head per channel.
+            if (cfg.ssm_inner != 2 * cfg.hidden)
+                fail(ErrorCode::SHAPE_MISMATCH,
+                     "mamba expands the hidden width by exactly 2 (inner_size must be 2*hidden)");
+        }
+    }
+
+    // --- feed-forward presence, and how many layers route to experts --------
+    // Both are per-layer facts. A pure state-space model has no FFN at all; a
+    // hybrid puts one behind each layer; and jamba mixes dense and MoE blocks in
+    // one stack, which upstream expresses by making `ffn_gate_inp` optional per
+    // layer. The tensors are the evidence in every case.
+    cfg.ffn_layers.assign(cfg.layers, 0);
+    cfg.moe_layers.assign(cfg.layers, 0);
+    for (uint32_t l = 0; l < cfg.layers; ++l) {
+        const bool dense_ffn = doc.tensor_by_name.count(layer_name(l, "ffn_up.weight")) != 0 ||
+                               doc.tensor_by_name.count(layer_name(l, "ffn_gate_up.weight")) != 0;
+        const bool routed =
+            doc.tensor_by_name.count(layer_name(l, "ffn_up_exps.weight")) != 0 ||
+            doc.tensor_by_name.count(layer_name(l, "ffn_gate_exps.weight")) != 0 ||
+            doc.tensor_by_name.count(layer_name(l, "ffn_gate_up_exps.weight")) != 0 ||
+            doc.tensor_by_name.count(layer_name(l, "ffn_down_exps.weight")) != 0;
+        // The router has two spellings in the adapter's own table: llama.cpp's
+        // `ffn_gate_inp` and the reference adapter's `ffn_router`, which the
+        // loader renames to the same role. Both mean the same thing here.
+        const bool router = doc.tensor_by_name.count(layer_name(l, "ffn_gate_inp.weight")) != 0 ||
+                            doc.tensor_by_name.count(layer_name(l, "ffn_router.weight")) != 0;
+        cfg.ffn_layers[l] = (dense_ffn || routed) ? 1 : 0;
+        cfg.moe_layers[l] = router ? 1 : 0;
+        if (router && !routed)
+            fail(ErrorCode::MISSING_REQUIRED_TENSOR,
+                 "blk." + std::to_string(l) + " has a router but no routed experts");
+        if (routed && !router)
+            fail(ErrorCode::MISSING_REQUIRED_TENSOR,
+                 "blk." + std::to_string(l) + " has routed experts but no router");
+    }
+    cfg.has_ffn = false;
+    for (uint32_t l = 0; l < cfg.layers; ++l)
+        if (cfg.ffn_layers[l]) cfg.has_ffn = true;
+
+    // `feed_forward_length` is the dense width. It is required wherever a dense
+    // FFN exists -- which is every layer of a dense model, an attention layer of a
+    // hybrid, and even a recurrent layer whose stack has no attention at all.
+    {
+        bool dense_ffn = false;
+        for (uint32_t l = 0; l < cfg.layers; ++l)
+            if (cfg.ffn_layers[l] && !cfg.moe_layers[l]) dense_ffn = true;
+        uint64_t intermediate = 0;
+        if (opt_u64(doc, keys("feed_forward_length"), &intermediate))
+            cfg.intermediate = static_cast<uint32_t>(intermediate);
+        else if (dense_ffn)
+            fail(ErrorCode::METADATA_MISMATCH, "missing required metadata: feed_forward_length");
+        if (dense_ffn && cfg.intermediate == 0)
+            fail(ErrorCode::METADATA_MISMATCH, "feed_forward_length must be positive");
+    }
+    if (has_attn) {
+        cfg.heads =
+            static_cast<uint32_t>(require_key("attention.head_count", "attention head count"));
+        // Per-head kv counts can be a per-layer array, whose zero entries are the
+        // recurrence mask handled above. Every attention layer must then agree on
+        // the count: a cache sized per kv head cannot vary inside one stack.
+        uint64_t kv_heads = 0;
+        if (auto it = doc.metadata.find(arch + ".attention.head_count_kv");
+            it != doc.metadata.end() && it->second.is_array()) {
+            bool set = false;
+            for (const auto &entry : it->second.array) {
+                const uint64_t value = entry.as_u64();
+                if (value == 0) continue;
+                if (!set) {
+                    kv_heads = value;
+                    set = true;
+                } else if (value != kv_heads) {
+                    fail(ErrorCode::SHAPE_MISMATCH,
+                         "per-layer attention.head_count_kv values differ among attention layers");
+                }
+            }
+            if (!set) fail(ErrorCode::METADATA_MISMATCH, "no attention layer states a kv head count");
+        } else if (!opt_u64(doc, keys("attention.head_count_kv"), &kv_heads)) {
+            kv_heads = cfg.heads;
+        }
+        cfg.kv_heads = static_cast<uint32_t>(kv_heads);
+        uint64_t head_dim = 0;
+        if (!opt_u64(doc, keys("attention.key_length"), &head_dim)) {
+            if (cfg.heads == 0 || cfg.hidden % cfg.heads != 0)
+                fail(ErrorCode::SHAPE_MISMATCH,
+                     "cannot derive head dimension from embedding length");
+            head_dim = cfg.hidden / cfg.heads;
+        }
+        cfg.head_dim = static_cast<uint32_t>(head_dim);
+    }
     // --- multi-head latent attention ---------------------------------------
     // Detected from the tensors: only MLA files carry `attn_kv_a_mqa`, which is
     // the projection into the latent. `head_dim` is then the *key* width
     // (nope + rope) and `attention.value_length_mla` the value width.
-    if (doc.tensor_by_name.count(layer_name(0, "attn_kv_a_mqa.weight")) != 0) {
+    if (has_attn && doc.tensor_by_name.count(layer_name(probe, "attn_kv_a_mqa.weight")) != 0) {
         cfg.mla = true;
         uint64_t rank = 0;
         if (opt_u64(doc, keys("attention.q_lora_rank"), &rank)) cfg.q_lora_rank = static_cast<uint32_t>(rank);
@@ -845,7 +1083,7 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
         if (cfg.q_lora_rank == 0) {
             // The "lite" variant projects q in one step. That is a layout
             // difference only, so it is recorded and both are supported.
-            if (doc.tensor_by_name.count(layer_name(0, "attn_q_a.weight")) != 0)
+            if (doc.tensor_by_name.count(layer_name(probe, "attn_q_a.weight")) != 0)
                 fail(ErrorCode::METADATA_MISMATCH,
                      "q_lora_rank is zero but a low-rank q projection is present");
         }
@@ -858,8 +1096,13 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
     }
 
     uint64_t rope_dim = 0;
-    if (opt_u64(doc, keys("rope.dimension_count"), &rope_dim))
+    if (has_attn && opt_u64(doc, keys("rope.dimension_count"), &rope_dim))
         cfg.rope_dim = static_cast<uint32_t>(rope_dim);
+    // jamba's attention layers carry no rotary position: upstream's block never
+    // calls the rope, whatever `rope.dimension_count` says (converted files do
+    // carry the key, because the converter writes the head width there). So the
+    // architecture decides, and the key is read but not applied.
+    if (arch == "jamba") cfg.rope_disabled = true;
     uint64_t vocab = 0;
     if (!opt_u64(doc, keys("vocab_size"), &vocab)) {
         MetadataValue tokens;
@@ -941,6 +1184,18 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
         const bool shexp_down = has_any_layer("ffn_down_shexp.weight");
         const bool shexp_inp = has_any_layer("ffn_gate_inp_shexp.weight");
         cfg.expert_selection_bias = has_any_layer("ffn_exp_probs_b.bias");
+        // gpt-oss adds a bias to the router logits (before gating) and one to
+        // each expert projection. Both are tensor facts, and they are separate
+        // from the selection bias above, which is applied after gating.
+        cfg.expert_router_bias = has_any_layer("ffn_gate_inp.bias");
+        cfg.expert_projection_bias = has_any_layer("ffn_gate_exps.bias");
+        {
+            const bool up_b = has_any_layer("ffn_up_exps.bias");
+            const bool down_b = has_any_layer("ffn_down_exps.bias");
+            if (up_b != cfg.expert_projection_bias || down_b != cfg.expert_projection_bias)
+                fail(ErrorCode::MISSING_REQUIRED_TENSOR,
+                     "expert projection biases must be present on gate, up and down, or on none");
+        }
         if (shexp_gate || shexp_up || shexp_down || shexp_inp) {
             // The three projections are the branch; the per-token gate on top of
             // them is a qwen2moe addition, so it is optional and its presence is
@@ -997,6 +1252,12 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
                 fail(ErrorCode::METADATA_MISMATCH, "final_logit_softcapping must be positive");
             cfg.final_logit_softcap = number;
         }
+    }
+
+    // Sliding window. Any family may declare one; the window is a property of
+    // the file, not of one architecture, so it is read for every family rather
+    // than only for the ones that used to be the only users of it.
+    {
         uint64_t window = 0;
         if (opt_u64(doc, keys("attention.sliding_window"), &window))
             cfg.sliding_window = static_cast<uint32_t>(window);
@@ -1004,6 +1265,33 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
             // A window at least as wide as the context cannot change anything,
             // so treating it as "no window" is exact rather than approximate.
             cfg.sliding_window = 0;
+    }
+
+    // Per-layer window selection. `attention.sliding_window_pattern` is either an
+    // array of per-layer flags or an integer period; llama.cpp's period form
+    // marks every layer whose index is not a multiple of the period as windowed
+    // (dense_first), which is what gpt-oss relies on.
+    if (cfg.sliding_window != 0) {
+        if (auto it = doc.metadata.find(arch + ".attention.sliding_window_pattern");
+            it != doc.metadata.end()) {
+            if (it->second.is_array()) {
+                const auto &entries = it->second.array;
+                if (!entries.empty() && entries.size() != cfg.layers)
+                    fail(ErrorCode::METADATA_MISMATCH,
+                         "attention.sliding_window_pattern has " +
+                             std::to_string(entries.size()) + " entries for " +
+                             std::to_string(cfg.layers) + " layers");
+                for (const auto &entry : entries)
+                    cfg.swa_layers.push_back(entry.as_bool() ? 1 : 0);
+            } else {
+                const uint64_t period = it->second.as_u64();
+                if (period == 0)
+                    fail(ErrorCode::METADATA_MISMATCH,
+                         "attention.sliding_window_pattern must not be zero");
+                for (uint32_t layer = 0; layer < cfg.layers; ++layer)
+                    cfg.swa_layers.push_back((layer % period) != 0 ? 1 : 0);
+            }
+        }
     }
 
     if (opt_double(doc, keys("attention.layer_norm_rms_epsilon"), &number)) cfg.rms_eps = number;
@@ -1027,11 +1315,11 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
     // Biased norms, and the biases phi2 puts on the FFN, the attention output
     // and the logits. All of them are read from the tensors.
     {
-        const bool attn_nb = doc.tensor_by_name.count(layer_name(0, "attn_norm.bias")) != 0;
+        const bool attn_nb = doc.tensor_by_name.count(layer_name(probe, "attn_norm.bias")) != 0;
         const bool out_nb = doc.tensor_by_name.count("output_norm.bias") != 0;
         const bool ffn_present =
-            doc.tensor_by_name.count(layer_name(0, "ffn_norm.weight")) != 0;
-        const bool ffn_nb = doc.tensor_by_name.count(layer_name(0, "ffn_norm.bias")) != 0;
+            doc.tensor_by_name.count(layer_name(probe, "ffn_norm.weight")) != 0;
+        const bool ffn_nb = doc.tensor_by_name.count(layer_name(probe, "ffn_norm.bias")) != 0;
         if ((attn_nb || out_nb || ffn_nb) && !(attn_nb && out_nb && (!ffn_present || ffn_nb)))
             fail(ErrorCode::MISSING_REQUIRED_TENSOR,
                  "norm biases must be present on every norm, or on none");
@@ -1039,18 +1327,26 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
             fail(ErrorCode::MISSING_REQUIRED_TENSOR,
                  "the attention norm and the final norm disagree about carrying a bias");
         cfg.norm_bias = attn_nb;
-        const bool up_b = doc.tensor_by_name.count(layer_name(0, "ffn_up.bias")) != 0;
-        const bool down_b = doc.tensor_by_name.count(layer_name(0, "ffn_down.bias")) != 0;
+        const bool up_b = doc.tensor_by_name.count(layer_name(probe, "ffn_up.bias")) != 0;
+        const bool down_b = doc.tensor_by_name.count(layer_name(probe, "ffn_down.bias")) != 0;
         if (up_b != down_b)
             fail(ErrorCode::MISSING_REQUIRED_TENSOR,
                  "ffn_up and ffn_down must both carry a bias or neither");
         cfg.ffn_bias = up_b;
-        cfg.attn_output_bias = doc.tensor_by_name.count(layer_name(0, "attn_output.bias")) != 0;
+        cfg.ffn_gate_bias = doc.tensor_by_name.count(layer_name(probe, "ffn_gate.bias")) != 0;
+        cfg.attn_output_bias = doc.tensor_by_name.count(layer_name(probe, "attn_output.bias")) != 0;
         cfg.logit_bias = doc.tensor_by_name.count("output.bias") != 0;
         // A block with no FFN norm can only work if the FFN reuses the
-        // attention's normalised input: that is phi2's parallel residual.
-        if (!ffn_present) {
-            if (doc.tensor_by_name.count(layer_name(0, "attn_norm.weight")) == 0)
+        // attention's normalised input: that is phi2's parallel residual. A
+        // file that has a post-attention norm instead (gpt-oss) does not take
+        // this branch -- it normalises the residual, so it is an ordinary
+        // pre-norm block and the "parallel" reading would double-count.
+        const bool attn_post_present =
+            doc.tensor_by_name.count(layer_name(probe, "attn_post_norm.weight")) != 0;
+        // A recurrent layer has no FFN to normalise, so the absence of an
+        // ffn_norm there is not phi2's shared residual.
+        if (!ffn_present && !attn_post_present && has_attn) {
+            if (doc.tensor_by_name.count(layer_name(probe, "attn_norm.weight")) == 0)
                 fail(ErrorCode::MISSING_REQUIRED_TENSOR,
                      "no ffn_norm and no attn_norm: nothing normalises the FFN input");
             cfg.parallel_residual = true;
@@ -1059,10 +1355,10 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
         // activation itself is not representable in GGUF metadata, so it comes
         // from the architecture table -- the only such decision in this file,
         // and the reason each such architecture needs a parity fixture.
-        const bool has_gate = doc.tensor_by_name.count(layer_name(0, "ffn_gate.weight")) != 0;
+        const bool has_gate = doc.tensor_by_name.count(layer_name(probe, "ffn_gate.weight")) != 0;
         // A [hidden, 2*intermediate] up tensor is glm4's fused gate+up, not a
         // gate-free FFN, so the width decides between the two.
-        const auto up_it = doc.tensor_by_name.find(layer_name(0, "ffn_up.weight"));
+        const auto up_it = doc.tensor_by_name.find(layer_name(probe, "ffn_up.weight"));
         const bool up_present = up_it != doc.tensor_by_name.end();
         const bool fused_width =
             up_present && doc.tensors[up_it->second].dims.size() == 2 &&
@@ -1073,7 +1369,7 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
     // Attention sinks are a tensor fact. Every layer must carry them or none:
     // a file that has them on some layers only would silently mix two attention
     // definitions, which is a mapping error rather than a variant worth guessing.
-    if (doc.tensor_by_name.count(layer_name(0, "attn_sinks.weight")) != 0) {
+    if (doc.tensor_by_name.count(layer_name(probe, "attn_sinks.weight")) != 0) {
         for (uint32_t layer = 0; layer < cfg.layers; ++layer)
             if (doc.tensor_by_name.count(layer_name(layer, "attn_sinks.weight")) == 0)
                 fail(ErrorCode::MISSING_REQUIRED_TENSOR,
@@ -1095,9 +1391,9 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
     // error rather than a variant. Checking both keeps a wrong graph from being
     // run silently either way.
     const bool has_attn_sub_norm =
-        doc.tensor_by_name.count(layer_name(0, "attn_sub_norm.weight")) != 0;
+        doc.tensor_by_name.count(layer_name(probe, "attn_sub_norm.weight")) != 0;
     const bool has_ffn_sub_norm =
-        doc.tensor_by_name.count(layer_name(0, "ffn_sub_norm.weight")) != 0;
+        doc.tensor_by_name.count(layer_name(probe, "ffn_sub_norm.weight")) != 0;
     if (has_attn_sub_norm != has_ffn_sub_norm)
         fail(ErrorCode::MISSING_REQUIRED_TENSOR,
              "sub-norms must exist on both the attention and the FFN path; this "
@@ -1113,6 +1409,52 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
                     fail(ErrorCode::MISSING_REQUIRED_TENSOR,
                          "sub-norms are present on some layers only: " +
                              layer_name(layer, suffix));
+    }
+
+    // gpt-oss routes with `LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX_WEIGHT`: the
+    // router logits are the probabilities and the softmax happens over the
+    // selected experts only, which is `softmax-weight` here. It comes from the
+    // architecture because llama.cpp hard-codes it per model file rather than
+    // reading a key.
+    if (arch == "gpt-oss") cfg.expert_gating = "softmax-weight";
+
+    // mistral3's adaptive RMSNorm. The tensors are the evidence: the norm's MLP
+    // only exists in realtime checkpoints, and it is defined on a delay
+    // embedding whose length the file states.
+    {
+        const bool ada = doc.tensor_by_name.count(layer_name(probe, "ffn_norm_ada_down.weight")) != 0;
+        const bool ada_up = doc.tensor_by_name.count(layer_name(probe, "ffn_norm_ada_up.weight")) != 0;
+        if (ada != ada_up)
+            fail(ErrorCode::MISSING_REQUIRED_TENSOR,
+                 "the adaptive norm needs both of its projections (ffn_norm_ada_down/-up)");
+        cfg.ffn_norm_ada = ada;
+        if (ada) {
+            uint64_t delay = 0;
+            if (opt_u64(doc, keys("realtime_delay_tokens"), &delay))
+                cfg.realtime_delay = static_cast<uint32_t>(delay);
+            // The bottleneck width is a property of the file, not a key: it is
+            // read from the tensor so no metadata has to agree with it.
+            auto down = doc.tensor_by_name.find(layer_name(probe, "ffn_norm_ada_down.weight"));
+            const auto &dims = doc.tensors[down->second].dims;
+            if (dims.size() != 2 || dims[0] != cfg.hidden || dims[1] == 0)
+                fail(ErrorCode::SHAPE_MISMATCH,
+                     "ffn_norm_ada_down must be [hidden, bottleneck] with a positive bottleneck");
+        }
+    }
+    // The per-position attention temperature. Upstream reads the scale and then
+    // requires a floor; a file that sets one without the other cannot be run,
+    // and silently using 1.0 instead would change every logit.
+    {
+        double temp = 0.0;
+        if (opt_double(doc, keys("attention.temperature_scale"), &temp) && temp != 0.0) {
+            cfg.attn_temp_scale = temp;
+            double floor = 0.0;
+            if (!opt_double(doc, keys("rope.scaling.original_context_length"), &floor) || floor <= 0.0)
+                fail(ErrorCode::METADATA_MISMATCH,
+                     "attention.temperature_scale needs rope.scaling.original_context_length as "
+                     "the ramp floor");
+            cfg.attn_temp_floor = floor;
+        }
     }
 
     // Router renormalisation denominator. llama.cpp clamps it to the smallest F16
@@ -1168,8 +1510,8 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
     // absence of the separate ones is the evidence. A file carrying both is
     // ambiguous and refused rather than guessed.
     {
-        const bool fused = doc.tensor_by_name.count(layer_name(0, "ffn_gate_up_exps.weight")) != 0;
-        const bool separate = doc.tensor_by_name.count(layer_name(0, "ffn_gate_exps.weight")) != 0;
+        const bool fused = doc.tensor_by_name.count(layer_name(probe, "ffn_gate_up_exps.weight")) != 0;
+        const bool separate = doc.tensor_by_name.count(layer_name(probe, "ffn_gate_exps.weight")) != 0;
         if (fused && separate)
             fail(ErrorCode::METADATA_MISMATCH,
                  "both ffn_gate_up_exps and ffn_gate_exps are present; the expert layout is ambiguous");
@@ -1178,7 +1520,7 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
 
     // Per-pair rotary frequency divisors. Layer 0 carries them; later layers may
     // repeat them, so a file with the vector on layer 0 only is complete.
-    if (doc.tensor_by_name.count(layer_name(0, "rope_freqs.weight")) != 0)
+    if (doc.tensor_by_name.count(layer_name(probe, "rope_freqs.weight")) != 0)
         cfg.rope_freqs = true;
     if (cfg.ffn_no_gate) {
         // A gate-free FFN cannot be told from its tensors which activation it
@@ -1191,6 +1533,7 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
             {"arcee", "relu_sq"},   // src/models/arcee.cpp: LLM_FFN_RELU_SQR, SEQ
             {"nemotron", "relu_sq"},// src/models/nemotron.cpp: LLM_FFN_RELU_SQR, SEQ
             {"jais2", "relu_sq"},   // src/models/jais2.cpp: LLM_FFN_RELU_SQR, SEQ
+            {"plm", "relu_sq"},     // src/models/plm.cpp: LLM_FFN_RELU_SQR, SEQ
         };
         auto it = seq_activation.find(arch);
         if (it == seq_activation.end())
@@ -1239,6 +1582,19 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
                      " pairs, more than the rotary head width holds");
     }
 
+    // The mRoPE families cannot be run without their section split: upstream
+    // reads `rope.dimension_sections` as a *required* key for them, so a file
+    // that omits it is not a smaller model but a different one.
+    {
+        static const std::set<std::string> mrope_required = {
+            "qwen3vl", "qwen3vlmoe", "qwen35", "qwen35moe",
+        };
+        if (mrope_required.count(arch) != 0 &&
+            doc.metadata.find(arch + ".rope.dimension_sections") == doc.metadata.end())
+            fail(ErrorCode::METADATA_MISMATCH,
+                 arch + ".rope.dimension_sections is required for this architecture");
+    }
+
     // Context extension. The keys are read verbatim and the arithmetic is
     // derived in src/rope.cpp, so the derived values cannot drift from the file.
     std::string scaling_type;
@@ -1279,12 +1635,15 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
         cfg.chat_template = chat_template;
 
     // --- semantic checks that must fail closed rather than be approximated ---
-    if (cfg.heads == 0 || cfg.kv_heads == 0 || cfg.head_dim == 0 ||
-        cfg.heads % cfg.kv_heads != 0 || cfg.kv_heads > cfg.heads)
+    // A recurrent model has no attention, so it states no head counts at all.
+    if (cfg.ssm_kind.empty() &&
+        (cfg.heads == 0 || cfg.kv_heads == 0 || cfg.head_dim == 0 ||
+         cfg.heads % cfg.kv_heads != 0 || cfg.kv_heads > cfg.heads))
         fail(ErrorCode::SHAPE_MISMATCH, "grouped-query head counts are inconsistent");
     // MLA projects q through a bottleneck, so the per-head key width has no
     // reason to fill the embedding. Every other family keeps the identity.
-    if (!cfg.mla && static_cast<uint64_t>(cfg.heads) * cfg.head_dim != cfg.hidden)
+    if (cfg.ssm_kind.empty() && !cfg.mla &&
+        static_cast<uint64_t>(cfg.heads) * cfg.head_dim != cfg.hidden)
         fail(ErrorCode::SHAPE_MISMATCH,
              "attention head count times head dimension does not equal embedding length");
     if (cfg.rope_dim != 0 && (cfg.rope_dim % 2 != 0 || cfg.rope_dim > cfg.head_dim))
@@ -1300,20 +1659,31 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
     // Post-attention / post-FFN norms: present in gemma2/3 and glm4. The tensors
     // are the evidence, so this is read rather than assumed per architecture.
     {
-        const bool attn_post = doc.tensor_by_name.count(layer_name(0, "attn_post_norm.weight")) != 0;
-        const bool ffn_post = doc.tensor_by_name.count(layer_name(0, "ffn_post_norm.weight")) != 0;
-        if (attn_post != ffn_post)
+        const bool attn_post = doc.tensor_by_name.count(layer_name(probe, "attn_post_norm.weight")) != 0;
+        const bool ffn_post = doc.tensor_by_name.count(layer_name(probe, "ffn_post_norm.weight")) != 0;
+        const bool ffn_norm = doc.tensor_by_name.count(layer_name(probe, "ffn_norm.weight")) != 0;
+        if (attn_post && ffn_post) {
+            // gemma2/3 and glm4: both norms live inside the block, on the branch
+            // outputs, before the residual adds.
+            cfg.post_norms = true;
+        } else if (attn_post && !ffn_post && !ffn_norm) {
+            // gpt-oss: one post-attention norm, applied after the attention
+            // residual, and no separate FFN norm. Running the FFN on it is the
+            // ordinary pre-norm block with a different tensor name.
+            cfg.ffn_norm_is_post = true;
+        } else if (attn_post != ffn_post) {
             fail(ErrorCode::MISSING_REQUIRED_TENSOR,
                  "post-attention and post-FFN norms must both be present or both absent");
-        if (attn_post) cfg.post_norms = true;
+        }
     }
 
     // phi3 stores one fused q/k/v projection instead of three. Detect it from
     // the tensors, because the metadata does not say either way.
-    if (!cfg.mla) {
-        // MLA builds q from a low-rank pair, so it has neither shape.
-        const bool fused = doc.tensor_by_name.count(layer_name(0, "attn_qkv.weight")) != 0;
-        const bool split = doc.tensor_by_name.count(layer_name(0, "attn_q.weight")) != 0;
+    if (has_attn && !cfg.mla) {
+        // MLA builds q from a low-rank pair, so it has neither shape. A
+        // recurrent layer has no attention projection at all.
+        const bool fused = doc.tensor_by_name.count(layer_name(probe, "attn_qkv.weight")) != 0;
+        const bool split = doc.tensor_by_name.count(layer_name(probe, "attn_q.weight")) != 0;
         if (fused && split)
             fail(ErrorCode::METADATA_MISMATCH,
                  "checkpoint carries both a fused attn_qkv and split q/k/v projections");
@@ -1332,8 +1702,8 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
         bool wants_bias = false;
         if (opt_metadata(doc, arch + ".attention.qkv_bias", &declared)) wants_bias = declared.as_bool();
         const bool has_bias_tensors =
-            cfg.fused_qkv ? doc.tensor_by_name.count(layer_name(0, "attn_qkv.bias")) != 0
-                          : doc.tensor_by_name.count(layer_name(0, "attn_q.bias")) != 0;
+            cfg.fused_qkv ? doc.tensor_by_name.count(layer_name(probe, "attn_qkv.bias")) != 0
+                          : doc.tensor_by_name.count(layer_name(probe, "attn_q.bias")) != 0;
         if (wants_bias && !has_bias_tensors)
             fail(ErrorCode::MISSING_REQUIRED_TENSOR,
                  arch + ".attention.qkv_bias is set but blk.0.attn_q.bias is absent");
@@ -1348,8 +1718,8 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
     // evidence a file uses it, so presence drives the decision and the shape is
     // then validated: the scale is one head's worth, shared by every head.
     {
-        const bool has_q_norm = doc.tensor_by_name.count(layer_name(0, "attn_q_norm.weight")) != 0;
-        const bool has_k_norm = doc.tensor_by_name.count(layer_name(0, "attn_k_norm.weight")) != 0;
+        const bool has_q_norm = doc.tensor_by_name.count(layer_name(probe, "attn_q_norm.weight")) != 0;
+        const bool has_k_norm = doc.tensor_by_name.count(layer_name(probe, "attn_k_norm.weight")) != 0;
         if (has_q_norm != has_k_norm)
             fail(ErrorCode::MISSING_REQUIRED_TENSOR,
                  "q/k normalisation must be present on both q and k, not just one");
@@ -1364,9 +1734,9 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
     // glm4 keeps the FFN gate and up halves in a single tensor. Detected from
     // the shapes rather than the architecture name, because the same adapter
     // serves both layouts.
-    if (cfg.expert_count == 0 && !cfg.ffn_no_gate) {
-        const TensorInfo *up = m.tensor(layer_name(0, "ffn_up.weight"));
-        const bool has_gate = doc.tensor_by_name.count(layer_name(0, "ffn_gate.weight")) != 0;
+    if (cfg.expert_count == 0 && !cfg.ffn_no_gate && cfg.has_ffn) {
+        const TensorInfo *up = m.tensor(layer_name(probe, "ffn_up.weight"));
+        const bool has_gate = doc.tensor_by_name.count(layer_name(probe, "ffn_gate.weight")) != 0;
         if (!up)
             fail(ErrorCode::MISSING_REQUIRED_TENSOR, "missing required tensor blk.0.ffn_up.weight");
         if (!has_gate) {
@@ -1414,58 +1784,87 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
     if (cfg.norm_bias) expect("output_norm.bias");
     if (cfg.logit_bias) expect("output.bias");
     for (uint32_t l = 0; l < cfg.layers; ++l) {
-        for (const char *suffix : {"attn_norm.weight", "attn_output.weight"})
-            expect(layer_name(l, suffix));
-        if (!cfg.parallel_residual) expect(layer_name(l, "ffn_norm.weight"));
+        // Every layer opens with the block's entry norm, whatever kind of mixer
+        // follows it, so this is claimed before the two mixer branches split.
+        expect(layer_name(l, "attn_norm.weight"));
         if (cfg.norm_bias) expect(layer_name(l, "attn_norm.bias"));
-        if (cfg.attn_output_bias) expect(layer_name(l, "attn_output.bias"));
+        if (cfg.layer_is_recurrent(l)) {
+            // The recurrent block, in llama.cpp's tensor names. There is no
+            // attention projection and no rotary on such a layer.
+            for (const char *suffix : {"ssm_in.weight", "ssm_conv1d.weight",
+                                       "ssm_conv1d.bias", "ssm_dt.bias", "ssm_a", "ssm_d",
+                                       "ssm_out.weight"})
+                expect(layer_name(l, suffix));
+            // mamba-1 projects dt, B and C separately; mamba2 folds dt into
+            // `ssm_in`, so it has no `ssm_x` and no dt weight.
+            if (cfg.ssm_kind != "mamba2") {
+                expect(layer_name(l, "ssm_x.weight"));
+                expect(layer_name(l, "ssm_dt.weight"));
+            }
+            if (cfg.ssm_kind == "mamba2") expect(layer_name(l, "ssm_norm.weight"));
+            if (cfg.ssm_vector_norms)
+                for (const char *suffix : {"ssm_dt_norm.weight", "ssm_b_norm.weight",
+                                           "ssm_c_norm.weight"})
+                    expect(layer_name(l, suffix));
+        } else {
+            expect(layer_name(l, "attn_output.weight"));
+            if (cfg.attn_output_bias) expect(layer_name(l, "attn_output.bias"));
+            if (cfg.mla) {
+                // Keys and values never exist as weights: each head expands the
+                // per-token latent through its own slice of k_b / v_b.
+                if (cfg.q_lora_rank != 0)
+                    for (const char *suffix :
+                         {"attn_q_a.weight", "attn_q_a_norm.weight", "attn_q_b.weight"})
+                        expect(layer_name(l, suffix));
+                else
+                    expect(layer_name(l, "attn_q.weight"));
+                for (const char *suffix :
+                     {"attn_kv_a_mqa.weight", "attn_kv_a_norm.weight", "attn_k_b.weight",
+                      "attn_v_b.weight"})
+                    expect(layer_name(l, suffix));
+            } else if (cfg.fused_qkv) {
+                expect(layer_name(l, "attn_qkv.weight"));
+            } else {
+                for (const char *suffix : {"attn_q.weight", "attn_k.weight", "attn_v.weight"})
+                    expect(layer_name(l, suffix));
+            }
+            if (cfg.attn_qkv_bias) {
+                if (cfg.fused_qkv) {
+                    expect(layer_name(l, "attn_qkv.bias"));
+                } else {
+                    for (const char *suffix : {"attn_q.bias", "attn_k.bias", "attn_v.bias"})
+                        expect(layer_name(l, suffix));
+                }
+            }
+            if (cfg.qk_norm)
+                for (const char *suffix : {"attn_q_norm.weight", "attn_k_norm.weight"})
+                    expect(layer_name(l, suffix));
+            if (cfg.attn_sinks) expect(layer_name(l, "attn_sinks.weight"));
+            if (cfg.post_norms)
+                for (const char *suffix : {"attn_post_norm.weight", "ffn_post_norm.weight"})
+                    expect(layer_name(l, suffix));
+            if (cfg.sub_norms)
+                for (const char *suffix : {"attn_sub_norm.weight", "ffn_sub_norm.weight"})
+                    expect(layer_name(l, suffix));
+            if (cfg.rope_freqs) expect(layer_name(l, "rope_freqs.weight"));
+        }
+        // The feed-forward is a per-layer fact too: a pure state-space file has
+        // none, a hybrid has one behind both kinds of layer, and jamba mixes
+        // dense blocks with routed ones in a single stack.
+        if (!cfg.layer_has_ffn(l)) continue;
+        if (!cfg.parallel_residual && cfg.ffn_norm_is_post)
+            expect(layer_name(l, "attn_post_norm.weight"));
+        else if (!cfg.parallel_residual) expect(layer_name(l, "ffn_norm.weight"));
+        if (cfg.norm_bias && !cfg.parallel_residual) expect(layer_name(l, "ffn_norm.bias"));
         if (cfg.ffn_bias) {
             expect(layer_name(l, "ffn_up.bias"));
             expect(layer_name(l, "ffn_down.bias"));
         }
-        if (cfg.norm_bias && !cfg.parallel_residual) expect(layer_name(l, "ffn_norm.bias"));
-        if (cfg.mla) {
-            // Keys and values never exist as weights: each head expands the
-            // per-token latent through its own slice of k_b / v_b.
-            if (cfg.q_lora_rank != 0)
-                for (const char *suffix :
-                     {"attn_q_a.weight", "attn_q_a_norm.weight", "attn_q_b.weight"})
-                    expect(layer_name(l, suffix));
-            else
-                expect(layer_name(l, "attn_q.weight"));
-            for (const char *suffix :
-                 {"attn_kv_a_mqa.weight", "attn_kv_a_norm.weight", "attn_k_b.weight",
-                  "attn_v_b.weight"})
+        if (cfg.ffn_gate_bias) expect(layer_name(l, "ffn_gate.bias"));
+        if (cfg.ffn_norm_ada)
+            for (const char *suffix : {"ffn_norm_ada_down.weight", "ffn_norm_ada_up.weight"})
                 expect(layer_name(l, suffix));
-        } else if (cfg.fused_qkv) {
-            expect(layer_name(l, "attn_qkv.weight"));
-        } else {
-            for (const char *suffix : {"attn_q.weight", "attn_k.weight", "attn_v.weight"})
-                expect(layer_name(l, suffix));
-        }
-        if (cfg.attn_qkv_bias) {
-            if (cfg.fused_qkv) {
-                expect(layer_name(l, "attn_qkv.bias"));
-            } else {
-                for (const char *suffix : {"attn_q.bias", "attn_k.bias", "attn_v.bias"})
-                    expect(layer_name(l, suffix));
-            }
-        }
-        if (cfg.qk_norm)
-            for (const char *suffix : {"attn_q_norm.weight", "attn_k_norm.weight"})
-                expect(layer_name(l, suffix));
-        if (cfg.post_norms)
-            for (const char *suffix : {"attn_post_norm.weight", "ffn_post_norm.weight"})
-                expect(layer_name(l, suffix));
-        if (cfg.attn_sinks) expect(layer_name(l, "attn_sinks.weight"));
-        if (cfg.sub_norms)
-            for (const char *suffix : {"attn_sub_norm.weight", "ffn_sub_norm.weight"})
-                expect(layer_name(l, suffix));
-        if (cfg.rope_freqs) expect(layer_name(l, "rope_freqs.weight"));
-        // The leading `dense_lead` blocks carry a plain FFN even in an MoE
-        // model, so the branch is chosen per layer rather than per model.
-        const bool moe_layer = cfg.expert_count != 0 && l >= cfg.dense_lead;
-        if (moe_layer) {
+        if (cfg.layer_is_moe(l)) {
             if (cfg.fused_gate_up_exps) {
                 for (const char *suffix : {"ffn_gate_inp.weight", "ffn_gate_up_exps.weight",
                                            "ffn_down_exps.weight"})
@@ -1484,9 +1883,11 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
             // The bias only steers selection, so it is required on MoE layers
             // independently of whether a shared expert exists.
             if (cfg.expert_selection_bias) expect(layer_name(l, "ffn_exp_probs_b.bias"));
-        } else if (cfg.dense_lead != 0 && l < cfg.dense_lead) {
-            for (const char *suffix : {"ffn_gate.weight", "ffn_up.weight", "ffn_down.weight"})
-                expect(layer_name(l, suffix));
+            if (cfg.expert_router_bias) expect(layer_name(l, "ffn_gate_inp.bias"));
+            if (cfg.expert_projection_bias)
+                for (const char *suffix : {"ffn_gate_exps.bias", "ffn_up_exps.bias",
+                                           "ffn_down_exps.bias"})
+                    expect(layer_name(l, suffix));
         } else if (cfg.fused_gate_up) {
             for (const char *suffix : {"ffn_up.weight", "ffn_down.weight"})
                 expect(layer_name(l, suffix));
@@ -1565,14 +1966,53 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
     if (cfg.logit_bias) expect_dims(*m.tensor("output.bias"), {cfg.vocab});
     for (uint32_t l = 0; l < cfg.layers; ++l) {
         expect_dims(*m.tensor(layer_name(l, "attn_norm.weight")), {cfg.hidden});
-        if (!cfg.parallel_residual)
-            expect_dims(*m.tensor(layer_name(l, "ffn_norm.weight")), {cfg.hidden});
-        if (cfg.norm_bias) expect_dims(*m.tensor(layer_name(l, "attn_norm.bias")), {cfg.hidden});
+        if (cfg.layer_is_recurrent(l)) {
+            // The shapes the state layout and both scans are derived from. Each
+            // is checked against the metadata, so a file whose tensors and keys
+            // disagree is refused rather than run with one of the two.
+            const uint64_t conv_channels = cfg.ssm_conv_channels();
+            expect_dims(*m.tensor(layer_name(l, "ssm_in.weight")),
+                        {cfg.hidden, cfg.ssm_kind == "mamba2"
+                                         ? static_cast<uint64_t>(cfg.ssm_inner) + conv_channels +
+                                               cfg.ssm_dt_rank
+                                         : static_cast<uint64_t>(2) * cfg.ssm_inner});
+            expect_dims(*m.tensor(layer_name(l, "ssm_conv1d.weight")),
+                        {cfg.ssm_conv, conv_channels});
+            expect_dims(*m.tensor(layer_name(l, "ssm_conv1d.bias")), {conv_channels});
+            expect_dims(*m.tensor(layer_name(l, "ssm_dt.bias")),
+                        {cfg.ssm_kind == "mamba2" ? cfg.ssm_dt_rank : cfg.ssm_inner});
+            if (cfg.ssm_kind == "mamba2")
+                expect_dims(*m.tensor(layer_name(l, "ssm_a")), {1, cfg.ssm_dt_rank});
+            else
+                expect_dims(*m.tensor(layer_name(l, "ssm_a")), {cfg.ssm_state, cfg.ssm_inner});
+            expect_dims(*m.tensor(layer_name(l, "ssm_out.weight")),
+                        {cfg.ssm_inner, cfg.hidden});
+            if (cfg.ssm_kind == "mamba2") {
+                expect_dims(*m.tensor(layer_name(l, "ssm_d")), {1, cfg.ssm_dt_rank});
+                expect_dims(*m.tensor(layer_name(l, "ssm_norm.weight")),
+                            {cfg.ssm_inner / cfg.ssm_groups, cfg.ssm_groups});
+            } else {
+                expect_dims(*m.tensor(layer_name(l, "ssm_x.weight")),
+                            {cfg.ssm_inner,
+                             static_cast<uint64_t>(cfg.ssm_dt_rank) + 2 * cfg.ssm_state});
+                expect_dims(*m.tensor(layer_name(l, "ssm_dt.weight")),
+                            {cfg.ssm_dt_rank, cfg.ssm_inner});
+                expect_dims(*m.tensor(layer_name(l, "ssm_d")), {cfg.ssm_inner});
+            }
+        } else {
         if (cfg.attn_output_bias)
             expect_dims(*m.tensor(layer_name(l, "attn_output.bias")), {cfg.hidden});
         if (cfg.ffn_bias) {
             expect_dims(*m.tensor(layer_name(l, "ffn_up.bias")), {cfg.intermediate});
             expect_dims(*m.tensor(layer_name(l, "ffn_down.bias")), {cfg.hidden});
+        }
+        if (cfg.ffn_gate_bias)
+            expect_dims(*m.tensor(layer_name(l, "ffn_gate.bias")), {cfg.intermediate});
+        if (cfg.ffn_norm_ada) {
+            const TensorInfo *down = m.tensor(layer_name(l, "ffn_norm_ada_down.weight"));
+            expect_dims(*down, {cfg.hidden, down->dims.size() > 1 ? down->dims[1] : 0});
+            expect_dims(*m.tensor(layer_name(l, "ffn_norm_ada_up.weight")),
+                        {down->dims[1], cfg.hidden});
         }
         if (cfg.norm_bias && !cfg.parallel_residual)
             expect_dims(*m.tensor(layer_name(l, "ffn_norm.bias")), {cfg.hidden});
@@ -1639,7 +2079,30 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
                 expect_dims(*m.tensor(layer_name(l, "attn_v.bias")), {kv_dim});
             }
         }
-        const bool moe_layer = cfg.expert_count != 0 && l >= cfg.dense_lead;
+        }  // end of the attention shapes
+        // The entry norm's bias is on every layer; the feed-forward half is only
+        // on the layers that carry one (all of them, except in a pure mamba file).
+        if (cfg.norm_bias) expect_dims(*m.tensor(layer_name(l, "attn_norm.bias")), {cfg.hidden});
+        if (!cfg.layer_has_ffn(l)) continue;
+        if (!cfg.parallel_residual)
+            expect_dims(*m.tensor(layer_name(l, cfg.ffn_norm_is_post ? "attn_post_norm.weight"
+                                                                   : "ffn_norm.weight")),
+                        {cfg.hidden});
+        if (cfg.ffn_bias) {
+            expect_dims(*m.tensor(layer_name(l, "ffn_up.bias")), {cfg.intermediate});
+            expect_dims(*m.tensor(layer_name(l, "ffn_down.bias")), {cfg.hidden});
+        }
+        if (cfg.ffn_gate_bias)
+            expect_dims(*m.tensor(layer_name(l, "ffn_gate.bias")), {cfg.intermediate});
+        if (cfg.ffn_norm_ada) {
+            const TensorInfo *down = m.tensor(layer_name(l, "ffn_norm_ada_down.weight"));
+            expect_dims(*down, {cfg.hidden, down->dims.size() > 1 ? down->dims[1] : 0});
+            expect_dims(*m.tensor(layer_name(l, "ffn_norm_ada_up.weight")),
+                        {down->dims[1], cfg.hidden});
+        }
+        if (cfg.norm_bias && !cfg.parallel_residual)
+            expect_dims(*m.tensor(layer_name(l, "ffn_norm.bias")), {cfg.hidden});
+        const bool moe_layer = cfg.layer_is_moe(l);
         if (moe_layer) {
             const uint32_t ewidth = cfg.expert_width();
             expect_dims(*m.tensor(layer_name(l, "ffn_gate_inp.weight")),
@@ -1647,6 +2110,17 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
             if (cfg.expert_selection_bias)
                 expect_dims(*m.tensor(layer_name(l, "ffn_exp_probs_b.bias")),
                             {cfg.expert_count});
+            if (cfg.expert_router_bias)
+                expect_dims(*m.tensor(layer_name(l, "ffn_gate_inp.bias")), {cfg.expert_count});
+            if (cfg.expert_projection_bias) {
+                // One column per expert, matching the projection it biases.
+                expect_dims(*m.tensor(layer_name(l, "ffn_gate_exps.bias")),
+                            {ewidth, cfg.expert_count});
+                expect_dims(*m.tensor(layer_name(l, "ffn_up_exps.bias")),
+                            {ewidth, cfg.expert_count});
+                expect_dims(*m.tensor(layer_name(l, "ffn_down_exps.bias")),
+                            {cfg.hidden, cfg.expert_count});
+            }
             if (cfg.fused_gate_up_exps) {
                 // [hidden, 2*width, experts]: gate block then up block per expert.
                 expect_dims(*m.tensor(layer_name(l, "ffn_gate_up_exps.weight")),
@@ -1718,9 +2192,11 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
                 : std::array<std::string, 3>{"ffn_gate_exps.weight",
                                              "ffn_up_exps.weight",
                                              "ffn_down_exps.weight"};
-        // Only layers at or past the dense lead carry stacked experts; the
-        // leading blocks of a deepseek checkpoint are plain FFNs.
-        for (uint32_t l = cfg.dense_lead; l < cfg.layers; ++l) {
+        // Which layers carry stacked experts is per layer: the leading blocks of
+        // a deepseek checkpoint are plain FFNs, and a hybrid can place its
+        // experts on one kind of layer only.
+        for (uint32_t l = 0; l < cfg.layers; ++l) {
+            if (!cfg.layer_is_moe(l)) continue;
             // Each projection may use a different quantisation type (Q4_K gate
             // and up, Q6_K down is common), so their per-expert strides differ
             // legitimately. The record carries three independent extents and the
@@ -1764,9 +2240,11 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
         }
         for (auto &tensor : m.doc.tensors) {
             bool expert = false;
-            for (uint32_t l = cfg.dense_lead; l < cfg.layers && !expert; ++l)
+            for (uint32_t l = 0; l < cfg.layers && !expert; ++l) {
+                if (!cfg.layer_is_moe(l)) continue;
                 for (const auto &suffix : suffixes)
                     if (tensor.name == layer_name(l, suffix)) expert = true;
+            }
             tensor.expert_tensor = expert;
         }
         uint64_t expert_bytes = 0;

@@ -117,6 +117,7 @@ enum class TensorRole : uint32_t {
     OUTPUT_NORM_BIAS,
     FFN_UP_BIAS,
     FFN_DOWN_BIAS,
+    FFN_GATE_BIAS,
     OUTPUT_BIAS,
     // MLA: q through a low-rank bottleneck, and the kv latent that each head
     // expands with its own slice of k_b / v_b.
@@ -129,6 +130,36 @@ enum class TensorRole : uint32_t {
     ATTN_V_B,
     // ffn_exp_probs_b: added to the router output for *selection* only.
     FFN_EXP_PROBS_B,
+    // ffn_gate_inp.bias: added to the router *logits*, before the gating
+    // function, so it moves the probabilities of every expert (gpt-oss,
+    // minimax). Distinct from FFN_EXP_PROBS_B, which never reaches a weight.
+    FFN_ROUTER_BIAS,
+    // Per-expert bias columns on the routed projections. Each holds one bias
+    // vector per expert, so its shape is [width, n_expert]; this is what
+    // llama.cpp adds with `ggml_add_id(..., selected_experts)`.
+    FFN_GATE_EXPS_BIAS,
+    FFN_UP_EXPS_BIAS,
+    FFN_DOWN_EXPS_BIAS,
+    // mistral3's adaptive RMSNorm MLP: a two-projection gelu_erf over a
+    // sinusoidal delay embedding, applied to the normalised FFN input.
+    FFN_NORM_ADA_DOWN,
+    FFN_NORM_ADA_UP,
+    // Recurrent (state-space) layers: llama.cpp's mamba/mamba2 block. The state
+    // lives in the activation buffer, not in a kv cache, so these tensors carry
+    // the shapes the state layout is derived from.
+    SSM_IN,
+    SSM_CONV1D,
+    SSM_CONV1D_BIAS,
+    SSM_X,
+    SSM_DT,
+    SSM_DT_BIAS,
+    SSM_A,
+    SSM_D,
+    SSM_OUT,
+    SSM_NORM,
+    SSM_DT_NORM,
+    SSM_B_NORM,
+    SSM_C_NORM,
     // Tensors that are valid in the file but are not part of the main forward
     // pass (nextn/MTP heads, vision towers). They are named in the probe rather
     // than silently dropped.
@@ -297,8 +328,124 @@ struct ModelConfig {
     double final_logit_softcap = 0.0;
     // gemma2/3 apply an extra RMSNorm after attention and after the FFN.
     bool post_norms = false;
+    // --- recurrent (state-space) layers ---------------------------------------
+    // `ssm_kind` is "mamba" (one decay per channel, an element-wise A) or
+    // "mamba2" (a scalar decay per head and a grouped B/C). Empty means the file
+    // has no recurrent layers at all, which is every other family.
+    std::string ssm_kind;
+    uint32_t ssm_conv = 0;     // d_conv, the 1D convolution width
+    uint32_t ssm_inner = 0;    // d_inner, the expanded width the state lives in
+    uint32_t ssm_state = 0;    // d_state
+    uint32_t ssm_dt_rank = 0;  // dt_rank (mamba), n_head (mamba2)
+    uint32_t ssm_groups = 1;   // n_group, the B/C groups
+    bool ssm_dt_b_c_rms = false;
+    // falcon-mamba and jamba normalise dt, B and C before the state update. The
+    // tensors are the evidence, so this is read rather than assumed.
+    bool ssm_vector_norms = false;
+    // Per-layer recurrence. An empty list means every layer is recurrent, which
+    // is what a pure mamba file says by simply having no attention tensors. A
+    // hybrid stack (jamba, nemotron-h) states the split explicitly: in llama.cpp
+    // it is `attention.recurrent_layers` or a per-layer `attention.head_count_kv`
+    // whose zero entries mean "this layer has no attention at all".
+    std::vector<uint8_t> recurrent_layers;
+    // Per-layer feed-forward presence. A pure state-space model has none at all;
+    // a hybrid may put one behind either kind of layer, so this is a mask rather
+    // than a flag. Empty means every layer has one.
+    std::vector<uint8_t> ffn_layers;
+    bool has_ffn = true;
+    // Per-layer routed-expert presence. Upstream marks `ffn_gate_inp` as
+    // optional per layer, which is how a family can mix dense and MoE blocks
+    // (jamba does). Empty means "follow model_kind and dense_lead", which is what
+    // a uniform file says.
+    std::vector<uint8_t> moe_layers;
+    // jamba's attention layers carry no rotary position at all; upstream says so
+    // by not calling the rope in its block, and the file says so by carrying no
+    // `rope.dimension_count`.
+    bool rope_disabled = false;
+
+    bool layer_is_recurrent(uint32_t layer) const {
+        if (ssm_kind.empty()) return false;
+        if (recurrent_layers.empty()) return true;
+        return layer < recurrent_layers.size() && recurrent_layers[layer] != 0;
+    }
+    bool layer_has_ffn(uint32_t layer) const {
+        if (!has_ffn) return false;
+        if (ffn_layers.empty()) return true;
+        return layer < ffn_layers.size() && ffn_layers[layer] != 0;
+    }
+    bool layer_is_moe(uint32_t layer) const {
+        // A file with no per-layer mask (the native reference family) uses the
+        // model-wide rule: experts on every layer past the dense lead.
+        if (moe_layers.empty()) return model_kind == "moe" && layer >= dense_lead;
+        return layer < moe_layers.size() && moe_layers[layer] != 0;
+    }
+    // How many layers of each kind a stack has. The cache is laid out as one
+    // region per kind, so an attention layer indexes the attention region by its
+    // position among attention layers rather than by its own layer index.
+    uint32_t attention_layer_count() const {
+        uint32_t count = 0;
+        for (uint32_t l = 0; l < layers; ++l)
+            if (!layer_is_recurrent(l)) ++count;
+        return count;
+    }
+    uint32_t recurrent_layer_count() const {
+        uint32_t count = 0;
+        for (uint32_t l = 0; l < layers; ++l)
+            if (layer_is_recurrent(l)) ++count;
+        return count;
+    }
+    uint32_t attention_slot(uint32_t layer) const {
+        uint32_t slot = 0;
+        for (uint32_t l = 0; l < layer && l < layers; ++l)
+            if (!layer_is_recurrent(l)) ++slot;
+        return slot;
+    }
+    uint32_t recurrent_slot(uint32_t layer) const {
+        uint32_t slot = 0;
+        for (uint32_t l = 0; l < layer && l < layers; ++l)
+            if (layer_is_recurrent(l)) ++slot;
+        return slot;
+    }
+    // Floats of per-position cache the attention layers need, at `context`
+    // positions: one (key, value) pair per kv head per layer. The recurrent
+    // layers contribute nothing here; their rolling state is fixed size.
+    uint64_t attention_cache_floats(uint64_t context) const {
+        const uint64_t kv_dim = static_cast<uint64_t>(kv_heads) * head_dim;
+        return static_cast<uint64_t>(attention_layer_count()) * context * (kv_dim + v_dim());
+    }
+    uint64_t recurrent_state_floats() const {
+        return static_cast<uint64_t>(recurrent_layer_count()) * ssm_state_floats();
+    }
+    // The channels the 1D convolution runs over: the state width for mamba, and
+    // the state plus the grouped B and C for mamba2.
+    uint32_t ssm_conv_channels() const {
+        return ssm_kind == "mamba2" ? ssm_inner + 2 * ssm_groups * ssm_state : ssm_inner;
+    }
+    // Floats of recurrent state one recurrent layer needs: the convolution
+    // history (d_conv - 1 vectors) plus one state vector of d_state per channel.
+    uint64_t ssm_state_floats() const {
+        if (ssm_kind.empty()) return 0;
+        return static_cast<uint64_t>(ssm_conv - 1) * ssm_conv_channels() +
+               static_cast<uint64_t>(ssm_state) * ssm_inner;
+    }
+
+    // gpt-oss normalises *after* the attention residual and feeds that to the
+    // FFN, so its FFN norm is the tensor named `attn_post_norm` rather than
+    // `ffn_norm`. The arithmetic is the ordinary pre-norm block; only the tensor
+    // name differs, which is why this is a flag and not a second code path.
+    bool ffn_norm_is_post = false;
     // gemma2/3 restrict most layers to a sliding attention window.
     uint32_t sliding_window = 0;
+    // Per-layer window selection (`attention.sliding_window_pattern`). gpt-oss
+    // alternates full and windowed layers, so a single model-wide window would
+    // be wrong for half the block. Empty means "every layer uses the window",
+    // which is what the families with no pattern key do.
+    std::vector<uint8_t> swa_layers;
+    bool layer_uses_window(uint32_t layer) const {
+        if (sliding_window == 0) return false;
+        if (swa_layers.empty()) return true;
+        return layer < swa_layers.size() && swa_layers[layer] != 0;
+    }
     // phi3 fuses q, k and v into one projection (and one optional bias).
     bool fused_qkv = false;
     // glm4 stores the FFN gate and up halves in one tensor of
@@ -367,7 +514,22 @@ struct ModelConfig {
     bool parallel_residual = false;  // FFN runs on the attention's normalised input
     bool ffn_no_gate = false;       // up -> gelu -> down, with no gate projection
     bool ffn_bias = false;          // biases on ffn_up / ffn_down
+    // A bias on the gate projection is its own flag: mistral3 carries one and
+    // not the others, and adding it to the wrong projection changes every logit.
+    bool ffn_gate_bias = false;
     bool attn_output_bias = false;  // bias on attn_output
+    // mistral3's adaptive RMSNorm (voxtral realtime): the normalised FFN input
+    // is scaled by (1 + mlp(t_cond)), where t_cond is a sinusoidal embedding of
+    // the configured output delay and the mlp is a two-projection gelu_erf.
+    bool ffn_norm_ada = false;
+    uint32_t realtime_delay = 0;
+    // `attention.temperature_scale`: llama.cpp's per-position logit temperature.
+    // 0 disables it, which is what every file without the key gets.
+    double attn_temp_scale = 0.0;
+    // The floor of the temperature ramp, `realtime`/`temperature` files spell it
+    // as `rope.scaling.original_context_length`; it must be non-zero when the
+    // scale is set (upstream throws otherwise).
+    double attn_temp_floor = 0.0;
     bool logit_bias = false;        // bias on the output projection
 
     // --- multi-head latent attention (the deepseek family) ------------------
@@ -381,6 +543,15 @@ struct ModelConfig {
     // Leading dense blocks: the first N layers use a plain FFN, the rest MoE.
     uint32_t dense_lead = 0;
 
+    // MoE biases. Two different places, and conflating them changes the router:
+    //   * `ffn_gate_inp.bias` is added to the router *logits*, before the gating
+    //     function (llama.cpp build_moe_ffn: gate_inp_b);
+    //   * `ffn_exp_probs_b.bias` is added to the probabilities *after* gating and
+    //     only steers which experts are selected (deepseek V3).
+    bool expert_router_bias = false;
+    // Per-expert projection biases (`ffn_{gate,up,down}_exps.bias`, one column
+    // per expert). gpt-oss carries all three.
+    bool expert_projection_bias = false;
     // Router semantics. The gating function is not implied by "MoE": deepseek
     // V2 softmaxes, V3 and later use a sigmoid, and some families use
     // sqrt(softplus). A selection bias and group-limited routing change which

@@ -176,8 +176,21 @@ BudgetResult compute_budget(const ModelManifest &manifest, const BudgetConfig &c
     // a value of a different width than the key, so the two are summed.
     const uint64_t kv_dim = static_cast<uint64_t>(cfg.kv_heads) * cfg.head_dim;
     const uint64_t v_dim = cfg.v_dim();
-    b.kv_bytes = checked_mul(static_cast<uint64_t>(cfg.layers) * cfg.context,
-                             (kv_dim + v_dim) * sizeof(float), "KV cache");
+    if (!cfg.ssm_kind.empty()) {
+        // A recurrent layer keeps one rolling state instead of a per-position
+        // cache: the convolution history plus one state vector per channel. It is
+        // the same buffer, because the layer reads it through the same path, but
+        // the size does not grow with the context. A hybrid stack (jamba) has
+        // both halves in that buffer, so both are reserved.
+        const uint64_t attention_bytes = checked_mul(
+            cfg.attention_cache_floats(cfg.context), sizeof(float), "hybrid attention cache");
+        const uint64_t state_bytes =
+            checked_mul(cfg.recurrent_state_floats(), sizeof(float), "recurrent state");
+        b.kv_bytes = attention_bytes + state_bytes;
+    } else {
+        b.kv_bytes = checked_mul(static_cast<uint64_t>(cfg.layers) * cfg.context,
+                                 (kv_dim + v_dim) * sizeof(float), "KV cache");
+    }
     b.workspace_bytes = config.workspace_bytes;
     b.staging_bytes = config.staging_bytes;
     b.margin_bytes = config.margin_bytes;

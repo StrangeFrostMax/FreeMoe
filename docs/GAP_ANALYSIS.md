@@ -7,7 +7,7 @@
 > attention sinks are implemented, and `auto` no longer dispatches AVX-512 on a
 > Zen 3 target. The measurements below are the state at `f704e4b` and are kept
 > as the baseline this work is measured against; current numbers live in
-> `docs/MODEL_COVERAGE_STATUS.md` (2649 checks, 31 architecture fixtures).
+> `docs/MODEL_COVERAGE_STATUS.md` (2924 checks, 36 architecture fixtures).
 >
 > What changed since the baseline, in the terms this document uses:
 >
@@ -22,18 +22,32 @@
 >   structurally (`tools/gen_quant_tables.py --check`, no upstream checkout
 >   needed). Only `PTQ1_0` stays geometry-only: no verifiable layout exists, so
 >   it is refused by name rather than guessed.
-> * **C9 half closed.** `swiglu-oai` (gpt-oss, minimax-m3) and per-layer
->   `swiglu_clamp` (`deepseek4/4.1`, glm5-next) are implemented in
->   `include/fm/activation.hpp`, in both upstream clamp forms, along with the
->   fused `ffn_gate_up_exps` layout and the router's renormalisation floor.
+> * **C9 closed for the reachable families.** `swiglu-oai` is no longer a
+>   primitive with no user: `gpt-oss` runs it end to end (`gpt-oss` fixture, an
+>   oracle golden, a parity row and `gpt_oss_block`), together with the rest of
+>   what `models/openai-moe.cpp` does -- sinks, the post-attention norm used as
+>   the MoE's input norm, the biased router, per-expert projection biases,
+>   `softmax-weight` gating and alternating full/windowed layers. Per-layer
+>   `swiglu_clamp` stays covered by `activation_clamp_forms`; `deepseek4/4.1`
+>   remain unrowed because their graph carries far more than the clamp (DSA
+>   indexer, hyper-connections, MTP), not because the arithmetic is missing.
 >   `SITU` remains open -- it is unimplemented upstream too (`GGML_ABORT`).
->   `GEGLU_ERF` exists as a pointwise primitive and is pinned by
->   `pointwise_activations`, but no adapter row selects it yet, so it is a
->   primitive, not a supported family.
-> * **mRoPE primitive landed.** Sections are parsed, validated against the head
->   width, and drive a per-axis position selection in `RopePlan`; the text path
->   is unchanged by construction because all four axes carry the same position.
->   Wiring the six mRoPE architectures is now adapter work, not engine work.
+>   `GEGLU_ERF` is now reachable as well: `mistral3` builds its adaptive-norm MLP
+>   with exactly that activation (`LLM_FFN_GELU_ERF`, `LLM_FFN_SEQ`).
+> * **mRoPE is wired.** `qwen3vl` and `qwen3vlmoe` have fixtures, goldens and
+>   parity rows, the section split is a required key for those families as it is
+>   upstream, and the interleaved layout is chosen by architecture the way
+>   `llama_rope_type()` does. `qwen35`/`qwen35moe` remain blocked by their
+>   gated delta-net layers, which is a different scan from the mamba one below.
+> * **The recurrent block runs.** `mamba`, `mamba2` and the falcon-mamba
+>   `dt_b_c_rms` variant have fixtures, oracle goldens and parity rows: a 1D
+>   convolution plus the `ggml_ssm_scan` arithmetic, with the state sized and
+>   reserved per layer instead of a per-position cache. The **hybrid layout**
+>   runs as well (`jamba` fixture, golden and parity row): recurrent and
+>   attention layers interleaved in one stack, with the split, the feed-forward
+>   and the router all read per layer, and one cache region holding a
+>   per-position cache for the attention layers and a rolling state for the
+>   recurrent ones.
 > * **Adapter rows carry llama.cpp's tag vocabulary** (`inspect --tags`,
 >   `freemoe adapters`), so a failure can be compared with an upstream
 >   `llama_model_loader` message tensor by tensor.
@@ -171,6 +185,16 @@ capability that completes the most models given everything before it.
 Cost-effectiveness ordering is therefore: the 56 adapter rows first (no engine
 code), then YaRN (+14, one rotary change), then the two recurrent families
 (+17 together), then the small token-level primitives.
+
+Three of those buckets have since been closed and the table above is kept as the
+baseline it was measured at: **mRoPE** (`qwen3vl`, `qwen3vlmoe`), **attention
+sinks combined with `swiglu_oai`** (`gpt-oss`, and with it everything
+`minimax-m3` adds except the indexer), and **the generic recurrent block**
+(`mamba`, `mamba2`, `mamba-dtrms`). What each bucket still needs is now a
+different thing in each case: rows for the mRoPE families that have no other
+missing piece, an indexer/MLA-dense-tail graph for `deepseek4/41`, and the
+hybrid layout for the recurrent ones whose attention layers need a cache
+beside the state.
 
 ### The 10 that stay hard
 
@@ -333,8 +357,8 @@ fabricating a capability.
 | 5 | **Eviction-exercising benchmark config** (§A Phase 5/6) | Without it the cache-policy and prefetch gates cannot be evaluated at all | S |
 | 6 | **Batched prefill** (C2) | Largest throughput win at prompt length > 32; makes §10.2 metrics honest | L |
 | 7 | ~~**IQ1–IQ4 / MXFP4 decoders** (C7)~~ **done** | Unlocks quantised checkpoints of MoE families that are already supported | M |
-| 8 | **SITU, GEGLU_ERF** (C9 remainder) | The clamped SwiGLU half, `gate_up_exps`, sinks and the mRoPE primitive are done; these two activations are what is left of the +18 | S |
-| 9 | **One recurrent family** (delta-net or mamba) | +17 models, but introduces state, scan kernels and a new cache shape | XL |
+| 8 | ~~**GEGLU_ERF**~~ **done**; **SITU** (C9 remainder) | `gelu_erf` is reachable through `mistral3`; `SITU` is unimplemented upstream too (`GGML_ABORT`), so no file can be checked against it | S |
+| 9 | ~~**mamba/mamba2**~~ **done**; **gated delta-net** | The mamba scan, its state layout and the `dt_b_c_rms` norms now run with fixtures and goldens. Delta-net is a different scan (per-head matrix state) and is what `qwen35`, `qwen3next` and `kimi-linear` still need | L |
 | 10 | **Sampling** (C6), **SWA cache** (C3), **per-expert tensors** (C8), **deepseek41/clamp rule** (C5) | Completeness of things already claimed | S–M |
 | 11 | **GPU backend** (§A Phase 2) | Required for every VRAM gate; unstarted | XL |
 | 12 | **Serving layer**, speculative decoding, batching | Post-correctness | XL |

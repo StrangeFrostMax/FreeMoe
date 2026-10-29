@@ -45,6 +45,22 @@ def _f32_values(data: bytes) -> list[float]:
     return list(struct.unpack(f"<{count}f", data[: count * 4]))
 
 
+def _window_layers(md: dict[str, Any], arch: str, n_layer: int, window: int) -> list[bool]:
+    """Per-layer sliding-window flags, mirroring the engine's adapter.
+
+    `attention.sliding_window_pattern` is either a per-layer array or an integer
+    period; llama.cpp's period form marks every layer whose index is not a
+    multiple of the period as windowed. An empty list means "every layer".
+    """
+    value = md.get(f"{arch}.attention.sliding_window_pattern")
+    if window == 0 or value is None:
+        return []
+    if isinstance(value, list):
+        return [bool(v) for v in value]
+    period = int(value)
+    return [(layer % period) != 0 for layer in range(n_layer)]
+
+
 def load_model(path: Path) -> dict[str, Any]:
     """Reads a standard llama.cpp-style checkpoint (architecture-prefixed keys)."""
     doc = parse_gguf(Path(path).read_bytes())
@@ -69,15 +85,54 @@ def load_model(path: Path) -> dict[str, Any]:
 
     hidden = int(key("embedding_length"))
     n_layer = int(key("block_count"))
-    heads = int(key("attention.head_count"))
-    hd = int(key("attention.key_length", hidden // heads))
+    # Which layers are recurrent, read from the tensors exactly as the engine
+    # does: a layer with `ssm_in` has no attention, and the layers without one
+    # are an ordinary attention stack. A pure mamba file is all-recurrent; a
+    # hybrid (jamba) mixes the two, so every block fact below is read from a
+    # layer that actually runs that block.
+    recurrent = [f"blk.{l}.ssm_in.weight" in tensors for l in range(n_layer)]
+    has_ssm = any(recurrent)
+    has_attn = not all(recurrent)
+    probe = next(l for l in range(n_layer) if not recurrent[l]) if has_attn else 0
+    first_recr = next(l for l in range(n_layer) if recurrent[l]) if has_ssm else 0
+
+    def blk(name: str) -> str:
+        return f"blk.{probe}.{name}"
+
+    def has(name: str) -> bool:
+        return blk(name) in tensors
+
+    def blk_rec(name: str) -> str:
+        return f"blk.{first_recr}.{name}"
+
+    def moe_layer(layer: int) -> bool:
+        # Upstream makes `ffn_gate_inp` optional per layer, which is how one stack
+        # mixes dense and MoE blocks.
+        return f"blk.{layer}.ffn_gate_inp.weight" in tensors
+
+    def ffn_layer(layer: int) -> bool:
+        for suffix in ("ffn_up.weight", "ffn_gate_up.weight", "ffn_up_exps.weight",
+                       "ffn_gate_up_exps.weight", "ffn_down_exps.weight"):
+            if f"blk.{layer}.{suffix}" in tensors:
+                return True
+        return False
+
+    heads = int(key("attention.head_count")) if has_attn else 0
+    hd = int(key("attention.key_length", hidden // heads)) if has_attn else 0
+    kv_head_key = key("attention.head_count_kv", heads) if has_attn else 0
+    if isinstance(kv_head_key, list):
+        # Per-layer array form: zero entries are the recurrent layers.
+        values = {int(v) for v in kv_head_key if int(v) != 0}
+        if len(values) != 1:
+            raise ReferenceError("per-layer attention.head_count_kv values differ")
+        kv_head_key = values.pop()
     cfg = {
         "arch": arch,
         "H": hidden,
-        "I": int(key("feed_forward_length")),
+        "I": int(key("feed_forward_length")) if has_attn else 0,
         "L": int(key("block_count")),
         "heads": heads,
-        "kv_heads": int(key("attention.head_count_kv", heads)),
+        "kv_heads": int(kv_head_key) if has_attn else 0,
         "hd": hd,
         "V": int(key("vocab_size", len(md.get("tokenizer.ggml.tokens", [])))),
         "ctx": int(key("context_length")),
@@ -96,23 +151,37 @@ def load_model(path: Path) -> dict[str, Any]:
         "bos": int(md.get("tokenizer.ggml.bos_token_id", 1)),
         "eos": int(md.get("tokenizer.ggml.eos_token_id", 2)),
         # Presence of the per-head q/k scales is the evidence qwen3 uses them.
-        "qk_norm": "blk.0.attn_q_norm.weight" in tensors,
+        "qk_norm": has("attn_q_norm.weight"),
         # phi3 fuses q/k/v into one projection (and one optional bias).
-        "fused_qkv": "blk.0.attn_qkv.weight" in tensors,
+        "fused_qkv": has("attn_qkv.weight"),
         # glm4 keeps gate and up in one tensor: gate first, then up. The width is
         # the evidence -- phi2 also has no gate, but its up is [hidden, I].
-        "fused_gate_up": ("blk.0.ffn_gate.weight" not in tensors
-                          and "blk.0.ffn_up.weight" in tensors
-                          and "blk.0.ffn_gate_exps.weight" not in tensors
-                          and tensors["blk.0.ffn_up.weight"][0][1] == 2 * int(key("feed_forward_length"))),
+        "fused_gate_up": (has_attn
+                          and not has("ffn_gate.weight")
+                          and has("ffn_up.weight")
+                          and not has("ffn_gate_exps.weight")
+                          and tensors[blk("ffn_up.weight")][0][1] == 2 * int(key("feed_forward_length"))),
         # phi2's block: LayerNorm, biases on the norms/FFN/logits, a gate-free
         # GELU feed-forward fed by the attention norm, and one shared residual.
         # Every one of these is read from the tensors or the epsilon key.
         "layer_norm": f"{arch}.attention.layer_norm_epsilon" in md,
-        "norm_bias": "blk.0.attn_norm.bias" in tensors,
-        "parallel_residual": "blk.0.ffn_norm.weight" not in tensors,
-        "ffn_bias": "blk.0.ffn_up.bias" in tensors,
-        "attn_output_bias": "blk.0.attn_output.bias" in tensors,
+        "norm_bias": has("attn_norm.bias"),
+        # A block with neither an FFN norm nor a post-attention norm reuses the
+        # attention's normalised input (phi2). gpt-oss has the post-attention
+        # norm, so it is an ordinary pre-norm block.
+        "parallel_residual": (not has("ffn_norm.weight")
+                              and not has("attn_post_norm.weight")
+                              # a recurrent layer has no FFN to normalise
+                              and not has_ssm),
+        "ffn_bias": has("ffn_up.bias"),
+        "ffn_gate_bias": has("ffn_gate.bias"),
+        # mistral3's adaptive RMSNorm and its delay embedding.
+        "ffn_norm_ada": has("ffn_norm_ada_down.weight"),
+        "realtime_delay": int(key("realtime_delay_tokens", 0)),
+        # llama.cpp's per-position attention temperature.
+        "attn_temp_scale": float(key("attention.temperature_scale", 0.0)),
+        "attn_temp_floor": float(key("rope.scaling.original_context_length", 0.0)),
+        "attn_output_bias": has("attn_output.bias"),
         "logit_bias": "output.bias" in tensors,
         # gemma family: scaled embeddings, zero-centred norm scales, GeGLU.
         # A multiplier, not a flag: gemma uses sqrt(hidden), minicpm 12.0.
@@ -133,17 +202,47 @@ def load_model(path: Path) -> dict[str, Any]:
                                        "glm5-next", "hy-v4"),
         # Detected from the tensors, exactly as the engine's adapter does:
         # keying this off the architecture name silently skipped glm4's norms.
-        "post_norms": "blk.0.attn_post_norm.weight" in tensors,
+        # Both post-norms or neither: gpt-oss has the attention one alone,
+        # which is not a post-norm block at all but a re-named FFN norm.
+        "post_norms": (has("attn_post_norm.weight") and has("ffn_post_norm.weight")),
         # BitNet's SUBLN: an RMSNorm on the attention output before the output
         # projection, and one on the gated FFN output before the down
         # projection. Tensor-presence evidence, like every other structure here.
-        "sub_norms": "blk.0.attn_sub_norm.weight" in tensors,
+        "sub_norms": has("attn_sub_norm.weight"),
         # Optional one-element `*.scale` tensors that multiply a projection's
         # output; llama.cpp folds them into `build_lora_mm`, before any bias.
-        "proj_scales": "blk.0.attn_q.scale" in tensors,
+        "proj_scales": has("attn_q.scale"),
         "attn_softcap": float(key("attn_logit_softcapping", 0.0)),
         "final_softcap": float(key("final_logit_softcapping", 0.0)),
         "window": int(key("attention.sliding_window", 0)),
+        # Per-layer window selection, from `attention.sliding_window_pattern`.
+        # gpt-oss alternates full and windowed layers, so one model-wide window
+        # would describe half the block wrongly. Empty means "every layer".
+        "window_layers": _window_layers(md, arch, n_layer, int(key("attention.sliding_window", 0))),
+        # gpt-oss feeds the FFN from its post-attention norm and has no ffn_norm
+        # tensor of its own.
+        "ffn_norm_is_post": (has("attn_post_norm.weight") and not has("ffn_norm.weight")),
+        # Two distinct MoE biases, in two distinct places.
+        "router_bias": any(f"blk.{l}.ffn_gate_inp.bias" in tensors for l in range(n_layer)),
+        "expert_proj_bias": any(f"blk.{l}.ffn_gate_exps.bias" in tensors
+                                for l in range(n_layer)),
+        # --- recurrent (state-space) layers -----------------------------------
+        # A file with `ssm_in` has no attention; a pure mamba file has no FFN
+        # either. Both facts are read from the tensors, as they are in the
+        # adapter.
+        "ssm_kind": ("mamba2" if (blk_rec("ssm_a") in tensors and
+                                  tensors[blk_rec("ssm_a")][0][0] == 1)
+                     else "mamba" if has_ssm else ""),
+        "ssm_conv": int(key("ssm.conv_kernel", 0)),
+        "ssm_inner": int(key("ssm.inner_size", 0)),
+        "ssm_state": int(key("ssm.state_size", 0)),
+        "ssm_dt_rank": int(key("ssm.time_step_rank", 0)),
+        "ssm_groups": max(1, int(key("ssm.group_count", 1))),
+        "ssm_vector_norms": blk_rec("ssm_dt_norm.weight") in tensors,
+        "recurrent": recurrent,
+        "moe_layers": [moe_layer(l) for l in range(n_layer)],
+        "ffn_layers": [ffn_layer(l) for l in range(n_layer)],
+        "has_ffn": any(ffn_layer(l) for l in range(n_layer)),
         "tensors": tensors,
         # Routing semantics straight from the checkpoint. Renormalising over the
         # selected experts is only equivalent to a full softmax when every expert
@@ -152,10 +251,10 @@ def load_model(path: Path) -> dict[str, Any]:
         "top_k": int(key("expert_used_count", 0)),
         # Routed experts and the shared expert can each be narrower than the
         # dense FFN, so the three widths are separate.
-        "I_exp": int(key("expert_feed_forward_length",
-                         key("feed_forward_length"))),
-        "I_shexp": int(key("expert_shared_feed_forward_length",
-                           key("feed_forward_length"))),
+        "I_exp": 0 if not has_attn else int(key("expert_feed_forward_length",
+                                           key("feed_forward_length"))),
+        "I_shexp": 0 if not has_attn else int(key("expert_shared_feed_forward_length",
+                                             key("feed_forward_length"))),
         # Evidence, not architecture name: the tensors are what the forward pass
         # reads, so their presence is what decides whether the branch runs. Every
         # one of these is scanned over *all* layers: a deepseek checkpoint's
@@ -170,21 +269,21 @@ def load_model(path: Path) -> dict[str, Any]:
         # Attention sinks: a per-head logit that the softmax denominator includes
         # and the value sum never reads. Detected from the tensor, like every
         # other structural fact.
-        "attn_sinks": "blk.0.attn_sinks.weight" in tensors,
+        "attn_sinks": has("attn_sinks.weight"),
         # SmolLM3 keeps every fourth layer unrotated.
         "no_rope_step": 4 if arch == "smollm3" else 0,
         # Per-pair rotary frequency divisors; layer 0 is authoritative.
-        "rope_freqs": ("blk.0.rope_freqs.weight" in tensors
-                       and tensors["blk.0.rope_freqs.weight"][1]),
-        "mla": "blk.0.attn_kv_a_mqa.weight" in tensors,
+        "rope_freqs": (has("rope_freqs.weight") and tensors[blk("rope_freqs.weight")][1]),
+        "mla": has("attn_kv_a_mqa.weight"),
         "q_lora_rank": int(key("attention.q_lora_rank", 0)),
         "kv_lora_rank": int(key("attention.kv_lora_rank", 0)),
         "head_v": int(key("attention.value_length_mla", hd)),
         "dense_lead": int(key("leading_dense_block_count", 0)),
         # Router semantics: the gating function, the selection bias and
         # group-limited routing all change which experts run.
-        "gating": {1: "softmax", 2: "sigmoid", 3: "softmax-weight",
-                   4: "sqrt-softplus"}.get(int(key("expert_gating_func", 1)), "softmax"),
+        "gating": ("softmax-weight" if arch == "gpt-oss" else
+                   {1: "softmax", 2: "sigmoid", 3: "softmax-weight",
+                    4: "sqrt-softplus"}.get(int(key("expert_gating_func", 1)), "softmax")),
         "selection_bias": any(f"blk.{l}.ffn_exp_probs_b.bias" in tensors
                               for l in range(n_layer)),
         "expert_groups": int(key("expert_group_count", 0)),
@@ -195,24 +294,39 @@ def load_model(path: Path) -> dict[str, Any]:
     # A block with up/down but no gate has no gated activation. GGUF cannot say
     # which activation, so phi2's GELU is applied and anything else is refused --
     # the same rule the engine's adapter enforces.
-    cfg["ffn_no_gate"] = (cfg["experts"] == 0 and "blk.0.ffn_gate.weight" not in tensors
-                          and "blk.0.ffn_up.weight" in tensors and not cfg["fused_gate_up"])
+    cfg["ffn_no_gate"] = (cfg["experts"] == 0 and not has("ffn_gate.weight")
+                          and has("ffn_up.weight") and not cfg["fused_gate_up"])
+    # jamba applies no rotation at all: upstream's block never calls the rope, so
+    # a file of that architecture is not rotated at head width by default.
+    cfg["rope_disabled"] = arch == "jamba"
     if cfg["ffn_no_gate"]:
         # A gate-free FFN cannot say which activation it means, so the
         # architecture has to. Read from llama.cpp's model files: both phi2 and
         # gpt-neox use `LLM_FFN_GELU` with `LLM_FFN_SEQ`.
         seq_activation = {"phi2": "gelu", "gptneox": "gelu",
                           "arcee": "relu_sq", "nemotron": "relu_sq",
-                          "jais2": "relu_sq"}
+                          "jais2": "relu_sq", "plm": "relu_sq"}
         if arch not in seq_activation:
             raise ReferenceError("gate-free feed-forward is only defined for phi2 and gptneox")
         cfg["activation"] = seq_activation[arch]
-    if cfg["heads"] * cfg["hd"] != cfg["H"]:
-        raise ReferenceError("heads * head_dim != hidden")
-    if cfg["kv_heads"] > cfg["heads"] or cfg["heads"] % cfg["kv_heads"]:
-        raise ReferenceError("inconsistent grouped-query head counts")
-    if cfg["rope_dim"] % 2 or cfg["rope_dim"] > cfg["hd"]:
-        raise ReferenceError("invalid rotary dimension")
+    # llama.cpp reads the section split as a required key for these families.
+    # On a single text sequence every axis carries the same position, so the
+    # split does not change a number here; what it does change is that a file
+    # without it is a different model and must not load.
+    if arch in ("qwen3vl", "qwen3vlmoe", "qwen35", "qwen35moe") and \
+            f"{arch}.rope.dimension_sections" not in md:
+        raise ReferenceError(f"{arch} requires rope.dimension_sections")
+    if has_attn:
+        if cfg["heads"] * cfg["hd"] != cfg["H"]:
+            raise ReferenceError("heads * head_dim != hidden")
+        if cfg["kv_heads"] > cfg["heads"] or cfg["heads"] % cfg["kv_heads"]:
+            raise ReferenceError("inconsistent grouped-query head counts")
+        if cfg["rope_dim"] % 2 or cfg["rope_dim"] > cfg["hd"]:
+            raise ReferenceError("invalid rotary dimension")
+    if has_ssm and (cfg["ssm_conv"] < 2 or not (cfg["ssm_inner"] and cfg["ssm_state"] and
+                                                cfg["ssm_dt_rank"])):
+        raise ReferenceError("an SSM layer needs a convolution width of at least 2 "
+                             "and non-zero sizes")
     if cfg["activation"] == "silu" and any(v > 1e-6 for v in cfg["swiglu_clamp"]):
         cfg["activation"] = "silu-clamp"
         cfg["activation_limit"] = max(cfg["swiglu_clamp"])
@@ -415,11 +529,24 @@ def expert_output(cfg: dict[str, Any], layer: int, expert: int,
             base = expert * per_expert
             out.append(matvec(data[base:base + per_expert], x, out_dim, in_dim))
         gate_vals, up_vals = out
+    if cfg["expert_proj_bias"]:
+        # Per-expert bias columns, added after each matmul and before the
+        # activation — llama.cpp's `ggml_add_id(..., selected_experts)`.
+        for name, values in ((prefix + "ffn_gate_exps.bias", gate_vals),
+                             (prefix + "ffn_up_exps.bias", up_vals)):
+            _, bias = tensors[name]
+            for i in range(I):
+                values[i] += bias[expert * I + i]
     act = [gated(cfg, gate_vals[i], up_vals[i], layer) for i in range(I)]
     dims, data = tensors[prefix + "ffn_down_exps.weight"]
     per_expert = H * I
     base = expert * per_expert
-    return matvec(data[base:base + per_expert], act, H, I)
+    out = matvec(data[base:base + per_expert], act, H, I)
+    if cfg["expert_proj_bias"]:
+        _, bias = tensors[prefix + "ffn_down_exps.bias"]
+        for i in range(H):
+            out[i] += bias[expert * H + i]
+    return out
 
 
 def pointwise(cfg: dict[str, Any], x: float) -> float:
@@ -442,6 +569,15 @@ def pointwise(cfg: dict[str, Any], x: float) -> float:
     if kind == "softplus":
         return math.log1p(math.exp(x))
     return x / (1.0 + math.exp(-x))
+
+
+def silu(v: float) -> float:
+    return v / (1.0 + math.exp(-v))
+
+
+def softplus(v: float) -> float:
+    """`ggml_compute_softplus_f32`: the identity above 20, where exp overflows."""
+    return v if v > 20.0 else math.log1p(math.exp(v))
 
 
 def gated(cfg: dict[str, Any], gate: float, up: float, layer: int) -> float:
@@ -497,17 +633,135 @@ class Session:
         ]
         self.kv_dim = kv_dim
         self.tensors = cfg["tensors"]
+        # One rolling recurrent state per layer: the convolution history
+        # (d_conv - 1 columns) followed by one state vector per channel.
+        self.ssm: list[dict[str, Any]] = [{} for _ in range(cfg["L"])]
 
     def tensor(self, name: str) -> list[float]:
         if name not in self.tensors:
             raise ReferenceError(f"missing tensor {name}")
         return self.tensors[name][1]
 
+    def ssm_block(self, layer: int, p: str, h: list[float]) -> list[float]:
+        """One llama.cpp mamba/mamba2 block, for a single token.
+
+        Mirrors the engine: the projection splits into the gate half and the
+        convolved half, the convolution slides a window of `d_conv` columns (the
+        history followed by this token), and the scan updates one state vector
+        per channel. mamba-1 decays each state element by its own A row; mamba2
+        decays the whole head by a scalar and normalises B, C and dt per group.
+        """
+        cfg = self.cfg
+        H = cfg["H"]
+        inner, d_state = cfg["ssm_inner"], cfg["ssm_state"]
+        d_conv, groups = cfg["ssm_conv"], cfg["ssm_groups"]
+        kind = cfg["ssm_kind"]
+        mamba2 = kind == "mamba2"
+        conv_channels = inner + 2 * groups * d_state if mamba2 else inner
+        in_dim = inner + conv_channels + cfg["ssm_dt_rank"] if mamba2 else 2 * inner
+        st = self.ssm[layer]
+        if not st:
+            st["conv"] = [[0.0] * conv_channels for _ in range(d_conv - 1)]
+            st["state"] = [[0.0] * d_state for _ in range(inner)]
+
+        projected = matvec(self.tensor(p + "ssm_in.weight"), h, in_dim, H)
+        z = projected[:inner]
+        if mamba2:
+            conv_in = projected[inner:inner + conv_channels]
+            # mamba2 projects dt directly from ssm_in and stores only its bias,
+            # so there is no ssm_dt weight here (llama.cpp models/mamba2.cpp).
+            dt = projected[inner + conv_channels:]
+        else:
+            conv_in = projected[inner:]
+            dt = None
+
+        # ggml_ssm_conv: each output channel dots the sliding window with its
+        # own d_conv kernel column.
+        kernel = self.tensor(p + "ssm_conv1d.weight")
+        bias = self.tensor(p + "ssm_conv1d.bias")
+        history = st["conv"]
+        convolved = [0.0] * conv_channels
+        for i in range(conv_channels):
+            acc = 0.0
+            for k in range(d_conv):
+                value = history[k][i] if k < d_conv - 1 else conv_in[i]
+                acc += value * kernel[k + d_conv * i]
+            convolved[i] = silu(acc + bias[i])
+        if d_conv > 1:
+            st["conv"] = [[conv_in[i] for i in range(conv_channels)]] if d_conv == 2 else \
+                history[1:] + [[conv_in[i] for i in range(conv_channels)]]
+
+        state = st["state"]
+        A = self.tensor(p + "ssm_a")
+        D = self.tensor(p + "ssm_d")
+        y = [0.0] * inner
+        if mamba2:
+            dt_bias = self.tensor(p + "ssm_dt.bias")
+            if cfg["ssm_vector_norms"]:
+                dt = rmsnorm(dt, self.tensor(p + "ssm_dt_norm.weight"), cfg["eps"])
+            dt = [dt[i] + dt_bias[i] for i in range(cfg["ssm_dt_rank"])]
+            head_dim = inner // cfg["ssm_dt_rank"]
+            per_group = cfg["ssm_dt_rank"] // groups
+            B = convolved[inner:inner + groups * d_state]
+            C = convolved[inner + groups * d_state:inner + 2 * groups * d_state]
+            for head in range(cfg["ssm_dt_rank"]):
+                dt_sp = softplus(dt[head])
+                dA = math.exp(dt_sp * A[head])
+                g = head // per_group
+                for i in range(head_dim):
+                    ii = i + head * head_dim
+                    x_dt = convolved[ii] * dt_sp
+                    acc = 0.0
+                    for k in range(d_state):
+                        value = state[ii][k] * dA + B[k + g * d_state] * x_dt
+                        state[ii][k] = value
+                        acc += value * C[k + g * d_state]
+                    y[ii] = acc + convolved[ii] * D[head]
+            y = [silu(z[i]) * y[i] for i in range(inner)]
+            # The grouped RMSNorm after the scan.
+            norm_w = self.tensor(p + "ssm_norm.weight")
+            width = inner // groups
+            out = list(y)
+            for g in range(groups):
+                base = g * width
+                scale = 1.0 / math.sqrt(sum(v * v for v in out[base:base + width]) / width
+                                        + cfg["eps"])
+                for i in range(width):
+                    out[base + i] = out[base + i] * scale * norm_w[i + width * g]
+            y = out
+        else:
+            dt_rank = cfg["ssm_dt_rank"]
+            dbc = matvec(self.tensor(p + "ssm_x.weight"), convolved, dt_rank + 2 * d_state, inner)
+            if cfg["ssm_vector_norms"]:
+                # falcon-mamba and jamba: RMS norm on dt, B and C before the scan.
+                dbc[:dt_rank] = rmsnorm(dbc[:dt_rank], self.tensor(p + "ssm_dt_norm.weight"),
+                                        cfg["eps"])
+                dbc[dt_rank:dt_rank + d_state] = rmsnorm(
+                    dbc[dt_rank:dt_rank + d_state], self.tensor(p + "ssm_b_norm.weight"), cfg["eps"])
+                dbc[dt_rank + d_state:] = rmsnorm(
+                    dbc[dt_rank + d_state:], self.tensor(p + "ssm_c_norm.weight"), cfg["eps"])
+            B = dbc[dt_rank:dt_rank + d_state]
+            C = dbc[dt_rank + d_state:dt_rank + 2 * d_state]
+            dt = matvec(self.tensor(p + "ssm_dt.weight"), dbc[:dt_rank], inner, dt_rank)
+            dt_bias = self.tensor(p + "ssm_dt.bias")
+            for channel in range(inner):
+                dt_sp = softplus(dt[channel] + dt_bias[channel])
+                x_dt = convolved[channel] * dt_sp
+                acc = 0.0
+                for k in range(d_state):
+                    dA = math.exp(dt_sp * A[channel * d_state + k])
+                    value = state[channel][k] * dA + B[k] * x_dt
+                    state[channel][k] = value
+                    acc += value * C[k]
+                y[channel] = acc + convolved[channel] * D[channel]
+            y = [silu(z[i]) * y[i] for i in range(inner)]
+        return matvec(self.tensor(p + "ssm_out.weight"), y, H, inner)
+
     def step(self, token: int) -> list[float]:
         cfg = self.cfg
         H, hd, heads, kv_heads = cfg["H"], cfg["hd"], cfg["heads"], cfg["kv_heads"]
         kv_dim = kv_heads * hd
-        group = heads // kv_heads
+        group = heads // kv_heads if kv_heads else 1
         embd = self.tensor("token_embd.weight")
         x = [embd[token * H + i] for i in range(H)]
         if cfg["embedding_scale"] != 1.0:
@@ -527,147 +781,187 @@ class Session:
             if TRACE is not None:
                 TRACE[f"h.L{layer}"] = list(h)
             attn_normed = list(h) if cfg["parallel_residual"] else None
-            if cfg["mla"]:
-                # Multi-head latent attention, expanded per head. See the engine's
-                # comment: k_b / v_b are linear, so expanding here is the same
-                # arithmetic as llama.cpp's absorbed form.
-                latent = cfg["kv_lora_rank"]
-                nope = hd - cfg["rope_dim"]
-                head_v = cfg["head_v"]
-                if cfg["q_lora_rank"]:
-                    qa = matvec(self.tensor(p + "attn_q_a.weight"), h, cfg["q_lora_rank"], H)
-                    qa = rmsnorm(qa, self.tensor(p + "attn_q_a_norm.weight"), cfg["eps"])
-                    q = matvec(self.tensor(p + "attn_q_b.weight"), qa, heads * hd,
-                               cfg["q_lora_rank"])
-                else:
-                    q = matvec(self.tensor(p + "attn_q.weight"), h, heads * hd, H)
-                kvpe = matvec(self.tensor(p + "attn_kv_a_mqa.weight"), h,
-                              latent + cfg["rope_dim"], H)
-                ckv = rmsnorm(kvpe[:latent], self.tensor(p + "attn_kv_a_norm.weight"), cfg["eps"])
-                kpe = kvpe[latent:]
-                # Rotary on the trailing rope slice of each query head, and on
-                # the shared k_pe.
-                q = rope_mla(q, heads, hd, hd - cfg["rope_dim"], cfg["rope_dim"], self.pos,
-                             cfg["theta"], cfg["rope_scale"], cfg["rope_freqs"])
-                kpe = rope_mla(kpe, 1, cfg["rope_dim"], 0, cfg["rope_dim"], self.pos,
-                               cfg["theta"], cfg["rope_scale"], cfg["rope_freqs"])
-                kb = self.tensor(p + "attn_k_b.weight")
-                vb = self.tensor(p + "attn_v_b.weight")
-                k_vec: list[float] = []
-                v_vec: list[float] = []
-                for head in range(heads):
-                    k_head = list(kpe)
-                    kb_head = head * nope * latent
-                    for o in range(nope):
-                        # ggml stores k_b as [nope, kv_lora_rank, heads] with the
-                        # first axis fastest, so (o, i, head) is at
-                        # o + nope*(i + latent*head).
-                        k_head.insert(o, sum(kb[kb_head + i * nope + o] * ckv[i]
-                                             for i in range(latent)))
-                    k_vec.extend(k_head)
-                    for o in range(head_v):
-                        base_o = (head * head_v + o) * latent
-                        v_vec.append(sum(vb[base_o + i] * ckv[i] for i in range(latent)))
-                k = k_vec
-                v = v_vec
-            elif cfg["fused_qkv"]:
-                fused = matvec(self.tensor(p + "attn_qkv.weight"), h, H + 2 * kv_dim, H)
-                if cfg["qkv_bias"]:
-                    bias = self.tensor(p + "attn_qkv.bias")
-                    fused = [fused[i] + bias[i] for i in range(H + 2 * kv_dim)]
-                q = fused[:H]
-                k = fused[H:H + kv_dim]
-                v = fused[H + kv_dim:]
+            if cfg["recurrent"][layer]:
+                delta = self.ssm_block(layer, p, h)
+                if TRACE is not None:
+                    TRACE[f"ssm.L{layer}"] = (sum(h), sum(delta))
+                x = [x[i] + delta[i] for i in range(H)]
+                if not cfg["ffn_layers"][layer]:
+                    continue
+                h = norm_of(x, p + "ffn_norm")
             else:
-                q = matvec(self.tensor(p + "attn_q.weight"), h, H, H)
-                k = matvec(self.tensor(p + "attn_k.weight"), h, kv_dim, H)
-                v = matvec(self.tensor(p + "attn_v.weight"), h, kv_dim, H)
+                if cfg["mla"]:
+                    # Multi-head latent attention, expanded per head. See the engine's
+                    # comment: k_b / v_b are linear, so expanding here is the same
+                    # arithmetic as llama.cpp's absorbed form.
+                    latent = cfg["kv_lora_rank"]
+                    nope = hd - cfg["rope_dim"]
+                    head_v = cfg["head_v"]
+                    if cfg["q_lora_rank"]:
+                        qa = matvec(self.tensor(p + "attn_q_a.weight"), h, cfg["q_lora_rank"], H)
+                        qa = rmsnorm(qa, self.tensor(p + "attn_q_a_norm.weight"), cfg["eps"])
+                        q = matvec(self.tensor(p + "attn_q_b.weight"), qa, heads * hd,
+                                   cfg["q_lora_rank"])
+                    else:
+                        q = matvec(self.tensor(p + "attn_q.weight"), h, heads * hd, H)
+                    kvpe = matvec(self.tensor(p + "attn_kv_a_mqa.weight"), h,
+                                  latent + cfg["rope_dim"], H)
+                    ckv = rmsnorm(kvpe[:latent], self.tensor(p + "attn_kv_a_norm.weight"), cfg["eps"])
+                    kpe = kvpe[latent:]
+                    # Rotary on the trailing rope slice of each query head, and on
+                    # the shared k_pe.
+                    q = rope_mla(q, heads, hd, hd - cfg["rope_dim"], cfg["rope_dim"], self.pos,
+                                 cfg["theta"], cfg["rope_scale"], cfg["rope_freqs"])
+                    kpe = rope_mla(kpe, 1, cfg["rope_dim"], 0, cfg["rope_dim"], self.pos,
+                                   cfg["theta"], cfg["rope_scale"], cfg["rope_freqs"])
+                    kb = self.tensor(p + "attn_k_b.weight")
+                    vb = self.tensor(p + "attn_v_b.weight")
+                    k_vec: list[float] = []
+                    v_vec: list[float] = []
+                    for head in range(heads):
+                        k_head = list(kpe)
+                        kb_head = head * nope * latent
+                        for o in range(nope):
+                            # ggml stores k_b as [nope, kv_lora_rank, heads] with the
+                            # first axis fastest, so (o, i, head) is at
+                            # o + nope*(i + latent*head).
+                            k_head.insert(o, sum(kb[kb_head + i * nope + o] * ckv[i]
+                                                 for i in range(latent)))
+                        k_vec.extend(k_head)
+                        for o in range(head_v):
+                            base_o = (head * head_v + o) * latent
+                            v_vec.append(sum(vb[base_o + i] * ckv[i] for i in range(latent)))
+                    k = k_vec
+                    v = v_vec
+                elif cfg["fused_qkv"]:
+                    fused = matvec(self.tensor(p + "attn_qkv.weight"), h, H + 2 * kv_dim, H)
+                    if cfg["qkv_bias"]:
+                        bias = self.tensor(p + "attn_qkv.bias")
+                        fused = [fused[i] + bias[i] for i in range(H + 2 * kv_dim)]
+                    q = fused[:H]
+                    k = fused[H:H + kv_dim]
+                    v = fused[H + kv_dim:]
+                else:
+                    q = matvec(self.tensor(p + "attn_q.weight"), h, H, H)
+                    k = matvec(self.tensor(p + "attn_k.weight"), h, kv_dim, H)
+                    v = matvec(self.tensor(p + "attn_v.weight"), h, kv_dim, H)
+                    if cfg["proj_scales"]:
+                        # Before the bias and before RoPE, exactly as build_lora_mm
+                        # folds the scale into the projection.
+                        sq = self.tensor(p + "attn_q.scale")[0]
+                        sk = self.tensor(p + "attn_k.scale")[0]
+                        sv = self.tensor(p + "attn_v.scale")[0]
+                        q = [v * sq for v in q]
+                        k = [v * sk for v in k]
+                        v = [v * sv for v in v]
+                    if cfg["qkv_bias"]:
+                        bq = self.tensor(p + "attn_q.bias")
+                        bk = self.tensor(p + "attn_k.bias")
+                        bv = self.tensor(p + "attn_v.bias")
+                        q = [q[i] + bq[i] for i in range(H)]
+                        k = [k[i] + bk[i] for i in range(kv_dim)]
+                        v = [v[i] + bv[i] for i in range(kv_dim)]
+                if not cfg["mla"]:
+                    if cfg["qk_norm"]:
+                        q = head_rmsnorm(q, heads, self.tensor(p + "attn_q_norm.weight"), cfg["eps"])
+                        k = head_rmsnorm(k, kv_heads, self.tensor(p + "attn_k_norm.weight"), cfg["eps"])
+                    step = cfg["no_rope_step"]
+                    # jamba rotates nothing at all: upstream's attention layer
+                    # never calls the rope.
+                    if not cfg["rope_disabled"] and (step == 0 or (layer + 1) % step != 0):
+                        rope_half(q, hd, heads, self.pos, cfg["rope_dim"], cfg["theta"],
+                                  cfg["rope_scale"], cfg["rope_freqs"])
+                        rope_half(k, hd, kv_heads, self.pos, cfg["rope_dim"], cfg["theta"],
+                                  cfg["rope_scale"], cfg["rope_freqs"])
+                if cfg["attn_temp_scale"] != 0.0:
+                    # llama.cpp's per-position attention temperature: a multiplier on
+                    # every query component, applied after the rotation.
+                    temp = (math.log(math.floor(self.pos / cfg["attn_temp_floor"]) + 1.0) *
+                            cfg["attn_temp_scale"] + 1.0)
+                    q = [v * temp for v in q]
+                if TRACE is not None:
+                    TRACE["pos"] = self.pos
+                    TRACE[f"q.L{layer}"] = list(q)
+                    TRACE[f"k.L{layer}"] = list(k)
+                    TRACE[f"v.L{layer}"] = list(v)
+                self.cache[layer].append((k, v))
+
+                head_v = cfg["head_v"] if cfg["mla"] else hd
+                attention = [0.0] * (heads * head_v)
+                scale = 1.0 / math.sqrt(hd)
+                for head in range(heads):
+                    qb = head * hd
+                    kvb = (head // group) * hd
+                    vb = (head // group) * head_v
+                    cache = self.cache[layer]
+                    window = cfg["window"]
+                    layers = cfg["window_layers"]
+                    windowed = (layers[layer] if layers else True) if window else False
+                    first = (0 if (not windowed or self.pos < window)
+                             else self.pos + 1 - window)
+                    scores = []
+                    for t_index in range(first, len(cache)):
+                        kt = cache[t_index][0]
+                        dot = sum(q[qb + j] * kt[kvb + j] for j in range(hd)) * scale
+                        if cfg["attn_softcap"] > 0.0:
+                            dot = cfg["attn_softcap"] * math.tanh(dot / cfg["attn_softcap"])
+                        scores.append(dot)
+                    if cfg["attn_sinks"]:
+                        # Append the sink logit, then ignore its probability.
+                        scores = scores + [self.tensor(p + "attn_sinks.weight")[head]]
+                    probs = softmax(scores)
+                    acc = [0.0] * head_v
+                    for offset, t_index in enumerate(range(first, len(cache))):
+                        vt = cache[t_index][1]
+                        p_i = probs[offset]
+                        for j in range(head_v):
+                            acc[j] += p_i * vt[vb + j]
+                    ab = head * head_v
+                    attention[ab:ab + head_v] = acc
+                if TRACE is not None:
+                    TRACE[f"attn.L{layer}"] = list(attention)
+                if cfg["sub_norms"]:
+                    # Inside the block: the head mix is normalised before the output
+                    # projection, which is not what a post-norm does.
+                    attention = rmsnorm(attention, self.tensor(p + "attn_sub_norm.weight"),
+                                        cfg["eps"], cfg["norm_add_one"])
+                attn_out = matvec(self.tensor(p + "attn_output.weight"), attention, H,
+                                  heads * head_v)
                 if cfg["proj_scales"]:
-                    # Before the bias and before RoPE, exactly as build_lora_mm
-                    # folds the scale into the projection.
-                    sq = self.tensor(p + "attn_q.scale")[0]
-                    sk = self.tensor(p + "attn_k.scale")[0]
-                    sv = self.tensor(p + "attn_v.scale")[0]
-                    q = [v * sq for v in q]
-                    k = [v * sk for v in k]
-                    v = [v * sv for v in v]
-                if cfg["qkv_bias"]:
-                    bq = self.tensor(p + "attn_q.bias")
-                    bk = self.tensor(p + "attn_k.bias")
-                    bv = self.tensor(p + "attn_v.bias")
-                    q = [q[i] + bq[i] for i in range(H)]
-                    k = [k[i] + bk[i] for i in range(kv_dim)]
-                    v = [v[i] + bv[i] for i in range(kv_dim)]
-            if not cfg["mla"]:
-                if cfg["qk_norm"]:
-                    q = head_rmsnorm(q, heads, self.tensor(p + "attn_q_norm.weight"), cfg["eps"])
-                    k = head_rmsnorm(k, kv_heads, self.tensor(p + "attn_k_norm.weight"), cfg["eps"])
-                step = cfg["no_rope_step"]
-                if step == 0 or (layer + 1) % step != 0:
-                    rope_half(q, hd, heads, self.pos, cfg["rope_dim"], cfg["theta"],
-                              cfg["rope_scale"], cfg["rope_freqs"])
-                    rope_half(k, hd, kv_heads, self.pos, cfg["rope_dim"], cfg["theta"],
-                              cfg["rope_scale"], cfg["rope_freqs"])
-            if TRACE is not None:
-                TRACE["pos"] = self.pos
-                TRACE[f"q.L{layer}"] = list(q)
-                TRACE[f"k.L{layer}"] = list(k)
-                TRACE[f"v.L{layer}"] = list(v)
-            self.cache[layer].append((k, v))
+                    s = self.tensor(p + "attn_output.scale")[0]
+                    attn_out = [v * s for v in attn_out]
+                if cfg["attn_output_bias"]:
+                    bias = self.tensor(p + "attn_output.bias")
+                    attn_out = [attn_out[i] + bias[i] for i in range(H)]
+                if cfg["post_norms"]:
+                    attn_out = rmsnorm(attn_out, self.tensor(p + "attn_post_norm.weight"),
+                                       cfg["eps"], cfg["norm_add_one"])
+                x = [x[i] + attn_out[i] for i in range(H)]
 
-            head_v = cfg["head_v"] if cfg["mla"] else hd
-            attention = [0.0] * (heads * head_v)
-            scale = 1.0 / math.sqrt(hd)
-            for head in range(heads):
-                qb = head * hd
-                kvb = (head // group) * hd
-                vb = (head // group) * head_v
-                cache = self.cache[layer]
-                window = cfg["window"]
-                first = 0 if (window == 0 or self.pos < window) else self.pos + 1 - window
-                scores = []
-                for t_index in range(first, len(cache)):
-                    kt = cache[t_index][0]
-                    dot = sum(q[qb + j] * kt[kvb + j] for j in range(hd)) * scale
-                    if cfg["attn_softcap"] > 0.0:
-                        dot = cfg["attn_softcap"] * math.tanh(dot / cfg["attn_softcap"])
-                    scores.append(dot)
-                if cfg["attn_sinks"]:
-                    # Append the sink logit, then ignore its probability.
-                    scores = scores + [self.tensor(p + "attn_sinks.weight")[head]]
-                probs = softmax(scores)
-                acc = [0.0] * head_v
-                for offset, t_index in enumerate(range(first, len(cache))):
-                    vt = cache[t_index][1]
-                    p_i = probs[offset]
-                    for j in range(head_v):
-                        acc[j] += p_i * vt[vb + j]
-                ab = head * head_v
-                attention[ab:ab + head_v] = acc
+                if TRACE is not None:
+                    TRACE[f"attn_out.L{layer}"] = list(attn_out)
+                    TRACE[f"xpost.L{layer}"] = list(x)
+                h = attn_normed if cfg["parallel_residual"] else norm_of(
+                    x, p + ("attn_post_norm" if cfg["ffn_norm_is_post"] else "ffn_norm"))
+                if cfg["ffn_norm_ada"]:
+                    # mistral3's adaptive RMSNorm: h *= 1 + up(gelu_erf(down · t)),
+                    # with t the sinusoidal embedding of the configured delay -- a
+                    # session constant, not a per-token value.
+                    half = H // 2
+                    t_cond = [0.0] * H
+                    for i in range(half):
+                        freq = math.exp(-math.log(10000.0) * i / half) * cfg["realtime_delay"]
+                        t_cond[i] = math.cos(freq)
+                        t_cond[half + i] = math.sin(freq)
+                    dims, data = self.tensors[p + "ffn_norm_ada_down.weight"]
+                    bottleneck = dims[1]
+                    ada = matvec(data, t_cond, bottleneck, H)
+                    ada = [0.5 * v * (1.0 + math.erf(v / math.sqrt(2.0))) for v in ada]
+                    dims, data = self.tensors[p + "ffn_norm_ada_up.weight"]
+                    scale = matvec(data, ada, H, bottleneck)
+                    h = [h[j] * (1.0 + scale[j]) for j in range(H)]
             if TRACE is not None:
-                TRACE[f"attn.L{layer}"] = list(attention)
-            if cfg["sub_norms"]:
-                # Inside the block: the head mix is normalised before the output
-                # projection, which is not what a post-norm does.
-                attention = rmsnorm(attention, self.tensor(p + "attn_sub_norm.weight"),
-                                    cfg["eps"], cfg["norm_add_one"])
-            attn_out = matvec(self.tensor(p + "attn_output.weight"), attention, H,
-                              heads * head_v)
-            if cfg["proj_scales"]:
-                s = self.tensor(p + "attn_output.scale")[0]
-                attn_out = [v * s for v in attn_out]
-            if cfg["attn_output_bias"]:
-                bias = self.tensor(p + "attn_output.bias")
-                attn_out = [attn_out[i] + bias[i] for i in range(H)]
-            if cfg["post_norms"]:
-                attn_out = rmsnorm(attn_out, self.tensor(p + "attn_post_norm.weight"),
-                                   cfg["eps"], cfg["norm_add_one"])
-            x = [x[i] + attn_out[i] for i in range(H)]
-
-            if TRACE is not None:
-                TRACE[f"attn_out.L{layer}"] = list(attn_out)
-                TRACE[f"xpost.L{layer}"] = list(x)
-            h = attn_normed if cfg["parallel_residual"] else norm_of(x, p + "ffn_norm")
+                TRACE[f"x.L{layer}"] = list(x)
             if cfg["ffn_no_gate"]:
                 # phi2: up -> gelu -> down, with a bias on both projections.
                 up = matvec(self.tensor(p + "ffn_up.weight"), h, cfg["I"], H)
@@ -679,12 +973,15 @@ class Session:
                 if cfg["ffn_bias"]:
                     bias = self.tensor(p + "ffn_down.bias")
                     down = [down[i] + bias[i] for i in range(H)]
-            elif cfg["experts"] and layer >= cfg["dense_lead"]:
+            elif cfg["moe_layers"][layer]:
                 # Router -> gating function -> optional selection bias -> optional
                 # group mask -> top-k -> combine. Which function turns logits into
                 # probabilities is a per-family fact, so the checkpoint says.
                 logits = matvec(self.tensor(p + "ffn_gate_inp.weight"), h,
                                 cfg["experts"], H)
+                if cfg["router_bias"]:
+                    bias = self.tensor(p + "ffn_gate_inp.bias")
+                    logits = [logits[i] + bias[i] for i in range(cfg["experts"])]
                 gating = cfg["gating"]
                 if gating == "sigmoid":
                     probs = [1.0 / (1.0 + math.exp(-v)) for v in logits]
@@ -730,6 +1027,12 @@ class Session:
                 else:
                     gate = matvec(self.tensor(p + "ffn_gate.weight"), h, cfg["I"], H)
                     up = matvec(self.tensor(p + "ffn_up.weight"), h, cfg["I"], H)
+                if cfg["ffn_gate_bias"]:
+                    bias = self.tensor(p + "ffn_gate.bias")
+                    gate = [gate[i] + bias[i] for i in range(cfg["I"])]
+                if cfg["ffn_bias"]:
+                    bias = self.tensor(p + "ffn_up.bias")
+                    up = [up[i] + bias[i] for i in range(cfg["I"])]
                 if cfg["proj_scales"]:
                     sg = self.tensor(p + "ffn_gate.scale")[0]
                     su = self.tensor(p + "ffn_up.scale")[0]
@@ -743,6 +1046,9 @@ class Session:
                     act = rmsnorm(act, self.tensor(p + "ffn_sub_norm.weight"),
                                   cfg["eps"], cfg["norm_add_one"])
                 down = matvec(self.tensor(p + "ffn_down.weight"), act, H, cfg["I"])
+                if cfg["ffn_bias"]:
+                    bias = self.tensor(p + "ffn_down.bias")
+                    down = [down[i] + bias[i] for i in range(H)]
                 if cfg["proj_scales"]:
                     sd = self.tensor(p + "ffn_down.scale")[0]
                     down = [v * sd for v in down]
@@ -771,6 +1077,8 @@ class Session:
             if TRACE is not None:
                 TRACE[f"ffn.L{layer}"] = list(down)
             x = [x[i] + down[i] for i in range(H)]
+            if TRACE is not None:
+                TRACE[f"end.L{layer}"] = list(x)
 
         final = norm_of(x, "output_norm")
         out_name = "output.weight" if "output.weight" in self.tensors else "token_embd.weight"
