@@ -89,6 +89,26 @@ Vision towers, audio (`wavtokenizer`, `pockettts`), OCR, embeddings-only
 encoders and diffusion heads are not causal text decoders. Rows marked "text
 path" above mean exactly that: the language model runs, the tower does not.
 
+## Notes
+
+* **A pre-existing cache bug, found while wiring the hybrid and fixed in the
+  same change.** The attention value gather still indexed the per-position cache
+  by *layer* index after the key write and the key gather had moved to the
+  layer's position among attention layers. In a model where every layer is an
+  attention layer the two indices are identical, so nothing showed; in a
+  hybrid they diverge and the gather read a region nothing had written, which is
+  zeros. `jamba`'s logits were off by ~2.0 absolute before the fix and agree with
+  the oracle to ~1e-6 after it. The parity row is what holds it.
+* **The remaining gaps, stated rather than implied.** `falcon-h1` runs its two
+  mixers in parallel inside every layer instead of interleaving them, and
+  `nemotron_h`, `granite-hybrid` and `plamo2` still need their own adapter rows
+  and block details; the hybrid layout itself runs. `qwen35` needs the gated
+  delta-net scan (a per-head matrix state, not the mamba one). `deepseek4` and
+  `deepseek41` remain unrowed because their graph carries the DSA indexer,
+  hyper-connections and an MTP head, none of which this build models. None of
+  these is a wiring detail behind a working path: each is a block this build
+  does not have, and the tables above say so per architecture.
+
 ## What this page is not
 
 * No vendor checkpoint has been executed. The fixtures are synthetic, shaped
