@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
+import re
 import struct
 import sys
 from pathlib import Path
@@ -40,6 +42,19 @@ GEOMETRY = {
     14: (256, 210),
     15: (256, 292),
     20: (32, 18),   # IQ4_NL: f16 scale + 16 nibble bytes
+    # IQ family: grid-indexed codecs on the 256-element super-block. The block
+    # sizes follow from the field widths in ggml-common.h.
+    16: (256, 66),   # IQ2_XXS  f16 d + 32 grid/sign words
+    17: (256, 74),   # IQ2_XS   ... + 8 scale bytes
+    18: (256, 98),   # IQ3_XXS  f16 d + 64 index bytes + 32 scale/sign bytes
+    19: (256, 50),   # IQ1_S    f16 d + 32 index bytes + 8 index/scale words
+    21: (256, 110),  # IQ3_S    + 8 high-bit bytes + 32 sign bytes + 4 scale bytes
+    22: (256, 82),   # IQ2_S    + 8 high-bit bytes + 8 scale bytes
+    23: (256, 136),  # IQ4_XS   f16 d + u16 high scales + 4 low + 128 nibbles
+    29: (256, 56),   # IQ1_M    no header scale: it is packed into the tail
+    # FP4 formats: a per-block exponent scale over E2M1 nibbles.
+    39: (32, 17),    # MXFP4  one E8M0 byte + 16 nibble bytes
+    40: (64, 36),    # NVFP4  four UE4M3 sub-block scales + 32 nibble bytes
     # Ternary family. 34/35 carry the fp16 scale last; 41/42/142 carry it first.
     34: (256, 54),  # TQ1_0  base-3 trits, 5 per byte
     35: (256, 66),  # TQ2_0  2-bit trits
@@ -357,11 +372,242 @@ def pq2_0(b):
     return _two_bit(b, 0, 128)
 
 
+# --- IQ family -------------------------------------------------------------
+# The grids are data, not logic: they are parsed out of the generated
+# src/quant_tables.cpp so this file does not carry a second copy. The decode
+# logic below is written from the published block layout independently of
+# src/quant.cpp.
+
+
+def _load_grids() -> dict[str, list[int]]:
+    text = (ROOT / "src" / "quant_tables.cpp").read_text()
+    grids: dict[str, list[int]] = {}
+    for match in re.finditer(
+        r"const \w+ (\w+)\[\d+\] = \{(.*?)\n\};", text, re.S
+    ):
+        name = match.group(1)
+        body = re.sub(r"//[^\n]*", "", match.group(2))
+        grids[name] = [int(tok, 0) for tok in re.split(r"[,\s]+", body.strip()) if tok]
+    return grids
+
+
+_GRIDS = _load_grids()
+
+
+def _grid(name: str, index: int, width: int) -> list[int]:
+    return list(_GRIDS[name][index].to_bytes(width, "little"))
+
+
+def _fp4_code(code: int) -> int:
+    """E2M1 magnitudes 0,1,2,3,4,6,8,12 with bit 3 as the sign."""
+    magnitude = (0, 1, 2, 3, 4, 6, 8, 12)[code & 7]
+    return -magnitude if code & 8 else magnitude
+
+
+def _e8m0_half(x: int) -> float:
+    """E8M0 exponent doubled value, halved: 2^(x-128), with denormals below 2."""
+    if x < 2:
+        return math.ldexp(0.5, -127 + x)
+    return math.ldexp(1.0, x - 128)
+
+
+def _ue4m3_half(x: int) -> float:
+    if x in (0, 0x7F):
+        return 0.0
+    exponent = (x >> 3) & 0xF
+    mantissa = x & 7
+    if exponent == 0:
+        raw = math.ldexp(float(mantissa), -9)
+    else:
+        raw = math.ldexp(1.0 + mantissa / 8.0, exponent - 7)
+    return raw * 0.5
+
+
+def mxfp4(b):
+    """32 elements: one E8M0 byte, then 16 packed E2M1 nibbles."""
+    d = _e8m0_half(b[0])
+    out = []
+    for j in range(16):
+        out.append(_fp4_code(b[1 + j] & 0x0F) * d)
+    for j in range(16):
+        out.append(_fp4_code(b[1 + j] >> 4) * d)
+    return out
+
+
+def nvfp4(b):
+    """64 elements: four UE4M3 sub-block scales, then 32 packed nibbles."""
+    out = []
+    for s in range(4):
+        d = _ue4m3_half(b[s])
+        sub = b[4 + s * 8 : 12 + s * 8]
+        out.extend(_fp4_code(byte & 0x0F) * d for byte in sub)
+        out.extend(_fp4_code(byte >> 4) * d for byte in sub)
+    return out
+
+
+def _signs(byte: int) -> list[int]:
+    """kvalues_iq2xs is a bitmask over the eight grid positions."""
+    return [(-1 if byte & (1 << j) else 1) for j in range(8)]
+
+
+def iq2_xxs(b):
+    """Eight 32-weight blocks; grid index and sign bits share each 8-byte step."""
+    d = rd_half(b, 0)
+    out = []
+    for ib in range(8):
+        word0 = struct.unpack_from("<I", b, 2 + 8 * ib)[0]
+        word1 = struct.unpack_from("<I", b, 2 + 8 * ib + 4)[0]
+        indices = list(word0.to_bytes(4, "little"))
+        db = d * (0.5 + (word1 >> 28)) * 0.25
+        for l in range(4):
+            grid = _grid("iq2xxs_grid", indices[l], 8)
+            signs = _GRIDS["ksigns_iq2xs"][(word1 >> (7 * l)) & 127]
+            out.extend(db * g * s for g, s in zip(grid, _signs(signs)))
+    return out
+
+
+def iq2_xs(b):
+    d = rd_half(b, 0)
+    out = []
+    for ib in range(8):
+        scale = b[2 + 64 + ib]
+        db = (d * (0.5 + (scale & 0x0F)) * 0.25, d * (0.5 + (scale >> 4)) * 0.25)
+        for l in range(4):
+            code = struct.unpack_from("<H", b, 2 + 2 * (4 * ib + l))[0]
+            grid = _grid("iq2xs_grid", code & 511, 8)
+            signs = _GRIDS["ksigns_iq2xs"][code >> 9]
+            out.extend(db[l // 2] * g * s for g, s in zip(grid, _signs(signs)))
+    return out
+
+
+def iq2_s(b):
+    d = rd_half(b, 0)
+    qs = 2
+    qh = qs + 64
+    scales = qh + 8
+    signs_base = qs + 32
+    out = []
+    for ib in range(8):
+        db = (d * (0.5 + (b[scales + ib] & 0x0F)) * 0.25,
+              d * (0.5 + (b[scales + ib] >> 4)) * 0.25)
+        for l in range(4):
+            index = b[qs + 4 * ib + l] | ((b[qh + ib] << (8 - 2 * l)) & 0x300)
+            grid = _grid("iq2s_grid", index, 8)
+            sign_byte = b[signs_base + 4 * ib + l]
+            out.extend(db[l // 2] * g * s for g, s in zip(grid, _signs(sign_byte)))
+    return out
+
+
+def iq3_xxs(b):
+    d = rd_half(b, 0)
+    qs = 2
+    words = qs + 64
+    out = []
+    for ib in range(8):
+        aux = struct.unpack_from("<I", b, words + 4 * ib)[0]
+        db = d * (0.5 + (aux >> 28)) * 0.5
+        for l in range(4):
+            signs = _GRIDS["ksigns_iq2xs"][(aux >> (7 * l)) & 127]
+            grid1 = _grid("iq3xxs_grid", b[qs + 8 * ib + 2 * l], 4)
+            grid2 = _grid("iq3xxs_grid", b[qs + 8 * ib + 2 * l + 1], 4)
+            mask = _signs(signs)
+            out.extend(db * grid1[j] * mask[j] for j in range(4))
+            out.extend(db * grid2[j] * mask[j + 4] for j in range(4))
+    return out
+
+
+def iq3_s(b):
+    d = rd_half(b, 0)
+    qs = 2
+    qh = qs + 64
+    signs = qh + 8
+    scales = signs + 32
+    out = []
+    for pair in range(4):
+        db = (d * (1 + 2 * (b[scales + pair] & 0x0F)), d * (1 + 2 * (b[scales + pair] >> 4)))
+        for half in range(2):
+            high = b[qh + 2 * pair + half]
+            sg = signs + 4 * (2 * pair + half)  # four sign bytes per 32 weights
+            base = qs + 16 * pair + 8 * half
+            for l in range(4):
+                i1 = b[base + 2 * l] | ((high << (8 - 2 * l)) & 256)
+                i2 = b[base + 2 * l + 1] | ((high << (7 - 2 * l)) & 256)
+                grid1 = _grid("iq3s_grid", i1, 4)
+                grid2 = _grid("iq3s_grid", i2, 4)
+                mask = _signs(b[sg + l])
+                out.extend(db[half] * grid1[j] * mask[j] for j in range(4))
+                out.extend(db[half] * grid2[j] * mask[j + 4] for j in range(4))
+    return out
+
+
+def iq1_s(b):
+    d = rd_half(b, 0)
+    qs = 2
+    qh = qs + 32
+    out = []
+    for ib in range(8):
+        h = struct.unpack_from("<H", b, qh + 2 * ib)[0]
+        dl = d * (2 * ((h >> 12) & 7) + 1)
+        delta = -0.125 if h & 0x8000 else 0.125
+        for l in range(4):
+            index = b[qs + 4 * ib + l] | (((h >> (3 * l)) & 7) << 8)
+            grid = struct.unpack("<8b", _GRIDS["iq1s_grid"][index].to_bytes(8, "little"))
+            out.extend(dl * (g + delta) for g in grid)
+    return out
+
+
+def iq1_m(b):
+    qs = 0
+    qh = 32
+    sc = qh + 16
+    words = [struct.unpack_from("<H", b, sc + 2 * i)[0] for i in range(4)]
+    bits = (words[0] >> 12) | ((words[1] >> 8) & 0x00F0) | ((words[2] >> 4) & 0x0F00) | (words[3] & 0xF000)
+    d = struct.unpack("<e", struct.pack("<H", bits))[0]
+    out = []
+    for ib in range(8):
+        s = words[ib // 2]
+        dl1 = d * (2 * ((s >> (6 * (ib % 2))) & 7) + 1)
+        dl2 = d * (2 * ((s >> (6 * (ib % 2) + 3)) & 7) + 1)
+        h0 = b[qh + 2 * ib]
+        h1 = b[qh + 2 * ib + 1]
+        idx = [b[qs + 4 * ib + 0] | ((h0 << 8) & 0x700),
+               b[qs + 4 * ib + 1] | ((h0 << 4) & 0x700),
+               b[qs + 4 * ib + 2] | ((h1 << 8) & 0x700),
+               b[qs + 4 * ib + 3] | ((h1 << 4) & 0x700)]
+        delta = [-0.125 if h0 & 0x08 else 0.125,
+                 -0.125 if h0 & 0x80 else 0.125,
+                 -0.125 if h1 & 0x08 else 0.125,
+                 -0.125 if h1 & 0x80 else 0.125]
+        for l in range(4):
+            grid = struct.unpack("<8b", _GRIDS["iq1s_grid"][idx[l]].to_bytes(8, "little"))
+            dl = dl1 if l < 2 else dl2
+            out.extend(dl * (g + delta[l]) for g in grid)
+    return out
+
+
+def iq4_xs(b):
+    d = rd_half(b, 0)
+    scales_h = struct.unpack_from("<H", b, 2)[0]
+    scales_l = b[4:8]
+    qs = 8
+    out = []
+    for ib in range(8):
+        low = (scales_l[ib // 2] >> (4 * (ib % 2))) & 0x0F
+        high = (scales_h >> (2 * ib)) & 3
+        dl = d * ((low | (high << 4)) - 32)
+        block = b[qs + 16 * ib : qs + 16 * ib + 16]
+        out.extend(dl * KVALUES_IQ4NL[byte & 0x0F] for byte in block)
+        out.extend(dl * KVALUES_IQ4NL[byte >> 4] for byte in block)
+    return out
+
+
 DECODERS = {
     30: bf16, 2: q4_0, 3: q4_1, 6: q5_0, 7: q5_1, 8: q8_0, 9: q8_1,
     10: q2_k, 11: q3_k, 12: q4_k, 13: q5_k, 14: q6_k, 15: q8_k,
     20: iq4_nl, 24: i8, 25: i16, 26: i32, 27: i64, 28: f64,
     34: tq1_0, 35: tq2_0, 41: q1_0, 42: q2_0, 142: pq2_0,
+    16: iq2_xxs, 17: iq2_xs, 18: iq3_xxs, 19: iq1_s, 21: iq3_s, 22: iq2_s,
+    23: iq4_xs, 29: iq1_m, 39: mxfp4, 40: nvfp4,
 }
 
 
@@ -426,6 +672,23 @@ def make_block(type_id: int, rng_state: int) -> tuple[bytes, int]:
         raw[64:66] = half_scale
     elif type_id in (41, 42, 142):  # Q1_0 / Q2_0 / PQ2_0: scale first
         raw[0:2] = half_scale
+    elif type_id in (16, 17, 18, 19, 21, 22, 23):  # IQ family: f16 scale first
+        raw[0:2] = half_scale
+    elif type_id == 29:  # IQ1_M: the fp16 scale is scattered across four words
+        # 0x2ACD is roughly 0.05; the nibbles that do not carry the scale keep
+        # their pseudo-random 3-bit block scales.
+        bits = 0x2ACD
+        words = [struct.unpack_from("<H", raw, 48 + 2 * i)[0] for i in range(4)]
+        words[0] = (words[0] & 0x0FFF) | (bits & 0xF000)
+        words[1] = (words[1] & 0xF0FF) | (((bits >> 4) & 0x0F) << 8)
+        words[2] = (words[2] & 0xFF0F) | (((bits >> 8) & 0x0F) << 4)
+        words[3] = (words[3] & 0x0FFF) | ((bits & 0x000F) << 12)
+        for i, word in enumerate(words):
+            struct.pack_into("<H", raw, 48 + 2 * i, word)
+    elif type_id == 39:  # MXFP4: one E8M0 exponent byte
+        raw[0] = 130
+    elif type_id == 40:  # NVFP4: four UE4M3 sub-block scales
+        raw[0:4] = bytes([120, 124, 116, 126])
     if type_id == 24:  # I8
         struct.pack_into("<b", raw, 0, -73)
     elif type_id == 25:  # I16

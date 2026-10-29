@@ -1,8 +1,8 @@
 {
   "schema": "freemoe.quant-reference.v1",
   "generator": "tools/quant_reference.py",
-  "sha256": "88cf231306c16e8d168b5cee13fc5b463195eca377591d24ea58d2dfbc295577",
-  "bytes": 12137,
+  "sha256": "17b8b51a1296281d33f5a2b57276cf407ea222181c01e2c3a3031dad754e302e",
+  "bytes": 21558,
   "cases": [
     {
       "type_id": 0,
@@ -75,9 +75,44 @@
       "elements": 256
     },
     {
+      "type_id": 16,
+      "block_bytes": 66,
+      "elements": 256
+    },
+    {
+      "type_id": 17,
+      "block_bytes": 74,
+      "elements": 256
+    },
+    {
+      "type_id": 18,
+      "block_bytes": 98,
+      "elements": 256
+    },
+    {
+      "type_id": 19,
+      "block_bytes": 50,
+      "elements": 256
+    },
+    {
       "type_id": 20,
       "block_bytes": 18,
       "elements": 32
+    },
+    {
+      "type_id": 21,
+      "block_bytes": 110,
+      "elements": 256
+    },
+    {
+      "type_id": 22,
+      "block_bytes": 82,
+      "elements": 256
+    },
+    {
+      "type_id": 23,
+      "block_bytes": 136,
+      "elements": 256
     },
     {
       "type_id": 24,
@@ -105,6 +140,11 @@
       "elements": 1
     },
     {
+      "type_id": 29,
+      "block_bytes": 56,
+      "elements": 256
+    },
+    {
       "type_id": 30,
       "block_bytes": 2,
       "elements": 1
@@ -118,6 +158,16 @@
       "type_id": 35,
       "block_bytes": 66,
       "elements": 256
+    },
+    {
+      "type_id": 39,
+      "block_bytes": 17,
+      "elements": 32
+    },
+    {
+      "type_id": 40,
+      "block_bytes": 36,
+      "elements": 64
     },
     {
       "type_id": 41,

@@ -18,8 +18,9 @@ OUR_LIB_SRCS := \
   src/io.cpp \
   src/backend.cpp \
   src/kernels.cpp \
-  src/quant.cpp \
+  src/quant.cpp src/quant_tables.cpp \
   src/rope.cpp \
+  src/adapter.cpp \
   src/support.cpp \
   src/tokenizer.cpp \
   src/unicode.cpp \
@@ -57,7 +58,7 @@ $(BUILD)/vnpu-selftest: $(SELFTEST_OBJS) $(VNPU_OBJS)
 	@mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) $^ -o $@ $(LDFLAGS)
 
-$(BUILD)/fuzz_gguf: $(FUZZ_MAIN) src/common.cpp src/gguf.cpp src/quant.cpp src/rope.cpp src/kernels.cpp src/backend.cpp $(VNPU_SRCS)
+$(BUILD)/fuzz_gguf: $(FUZZ_MAIN) src/common.cpp src/gguf.cpp src/quant.cpp src/quant_tables.cpp src/rope.cpp src/adapter.cpp src/kernels.cpp src/backend.cpp $(VNPU_SRCS)
 	@mkdir -p $(dir $@)
 	$(CXX) $(FUZZ_FLAGS) $(CPPFLAGS) $^ -o $@ $(LDFLAGS)
 
