@@ -1581,30 +1581,47 @@ static MetadataValue make_string(const std::string &value) {
 }
 
 void test_tokenizer_real_vocabularies() {
-    auto sentencepiece_doc = [](bool with_byte_fallback) {
+    const std::string marker = "\xe2\x96\x81";  // U+2581
+    auto sentencepiece_doc = [&marker](bool with_byte_fallback) {
         GGUFDocument doc;
         doc.metadata["tokenizer.ggml.model"] = make_string("llama");
         MetadataValue tokens;
         tokens.type = GGUFValueType::ARRAY;
-        auto add = [&](const std::string &piece) {
+        MetadataValue scores;
+        scores.type = GGUFValueType::ARRAY;
+        // Score model: a piece is worth -(its length). Longer pieces therefore win
+        // where they exist, which is what makes the merge order observable.
+        auto add = [&](const std::string &piece, double score) {
             tokens.array.push_back(make_string(piece));
+            MetadataValue value;
+            value.type = GGUFValueType::FLOAT32;
+            value.f = score;
+            scores.array.push_back(value);
         };
-        add("<unk>");                        // 0
-        add("<s>");                          // 1
-        add("</s>");                         // 2
-        add(std::string("\xe2\x96\x81") + "the");   // 3  " the"
-        add(std::string("\xe2\x96\x81") + "cat");   // 4  " cat"
-        add("cat");                          // 5
-        add("s");                            // 6
-        add(std::string("\xe2\x96\x81") + "sat");   // 7
+        add("<unk>", 0.0);                   // 0
+        add("<s>", 0.0);                     // 1
+        add("</s>", 0.0);                    // 2
+        // Every piece the merge chain needs must exist: the algorithm only joins
+        // two symbols whose concatenation is already in the table, so a table
+        // without intermediate pieces cannot build a word (and would silently
+        // fall back to bytes).
+        for (const char *word : {"the", "cat", "sat"}) {
+            const std::string w = word;
+            add(marker, -1.0);                              // U+2581 alone
+            for (size_t n = 1; n <= w.size(); ++n) {
+                add(marker + w.substr(0, n), -static_cast<double>(n + 1));
+                if (n < w.size()) add(w.substr(0, n), -static_cast<double>(n + 10));
+            }
+        }
         // The byte-fallback pieces make arbitrary text representable.
         for (int i = 0; i < 256; ++i) {
             if (!with_byte_fallback) continue;
             char buf[8];
             std::snprintf(buf, sizeof(buf), "<0x%02X>", i);
-            add(buf);
+            add(buf, 0.0);
         }
         doc.metadata["tokenizer.ggml.tokens"] = tokens;
+        doc.metadata["tokenizer.ggml.scores"] = scores;
         return doc;
     };
 
@@ -1623,7 +1640,8 @@ void test_tokenizer_real_vocabularies() {
               "decode inverts encode including the leading space");
         // The leading word boundary is part of the piece, so dropping the BOS
         // must not disturb the text.
-        CHECK(tokenizer.decode({3, 4, 7}, 1, 2) == " the cat sat",
+        const std::vector<int32_t> body(ids.begin() + 1, ids.end());
+        CHECK(tokenizer.decode(body, 1, 2) == " the cat sat",
               "decoding bare pieces reproduces the sentence");
         // An unseen character must survive via byte fallback rather than being
         // dropped or replaced.
@@ -1852,6 +1870,113 @@ void test_tokenizer_bpe_families() {
 
 // The Unicode classes drive word boundaries, so they are checked directly. A
 // wrong class silently changes token ids, which no round-trip test can catch.
+// SentencePiece segmentation is score-based. The two behaviours that separate it
+// from longest-match are: a merge only happens when the *concatenation* is a
+// piece (so the best-scoring pair wins even if a longer piece exists across the
+// same text), and the dummy space prefix is added unconditionally, including for
+// input that already begins with a space.
+void test_tokenizer_sentencepiece() {
+    const std::string marker = "\xe2\x96\x81";
+    auto build = [&marker](const std::vector<std::pair<std::string, double>> &table) {
+        GGUFDocument doc;
+        doc.metadata["tokenizer.ggml.model"] = make_string("llama");
+        MetadataValue tokens;
+        tokens.type = GGUFValueType::ARRAY;
+        MetadataValue scores;
+        scores.type = GGUFValueType::ARRAY;
+        for (const auto &[piece, score] : table) {
+            tokens.array.push_back(make_string(piece));
+            MetadataValue value;
+            value.type = GGUFValueType::FLOAT32;
+            value.f = score;
+            scores.array.push_back(value);
+        }
+        for (int i = 0; i < 256; ++i) {
+            char buf[8];
+            std::snprintf(buf, sizeof(buf), "<0x%02X>", i);
+            tokens.array.push_back(make_string(buf));
+            MetadataValue value;
+            value.type = GGUFValueType::FLOAT32;
+            value.f = 0.0;
+            scores.array.push_back(value);
+        }
+        doc.metadata["tokenizer.ggml.tokens"] = tokens;
+        doc.metadata["tokenizer.ggml.scores"] = scores;
+        return doc;
+    };
+
+    {
+        // "abcd" with pieces a, b, c, d, ab, abc, cd, bcd. Longest-match takes
+        // "abc" + "d"; score-based merging takes "cd" first (high score), then
+        // "bcd", giving "a" + "bcd". The expected id sequence is what makes the
+        // difference visible -- both segmentations round-trip.
+        const std::vector<std::pair<std::string, double>> table = {
+            {"<unk>", 0.0}, {"<s>", 0.0}, {"</s>", 0.0},
+            {"a", -5.0}, {"b", -5.0}, {"c", -5.0}, {"d", -5.0},
+            {"ab", -4.0}, {"abc", -3.0}, {"cd", -1.0}, {"bcd", -2.0},
+        };
+        GGUFDocument doc = build(table);
+        const uint32_t vocab = static_cast<uint32_t>(doc.metadata["tokenizer.ggml.tokens"].array.size());
+        const Tokenizer tokenizer = Tokenizer::from_gguf(doc, vocab);
+        const std::vector<int32_t> ids = tokenizer.encode("abcd", 1, false);
+        // The table has no space piece, so the prefixed space falls back to bytes;
+        // drop those to inspect how the word itself was segmented.
+        std::vector<int32_t> word;
+        for (int32_t id : ids) {
+            if (tokenizer.piece(static_cast<uint32_t>(id)).rfind("<0x", 0) == 0) continue;
+            word.push_back(id);
+        }
+        CHECK(word.size() == 2, "score-based segmentation splits abcd into two pieces");
+        if (word.size() == 2) {
+            CHECK(tokenizer.piece(static_cast<uint32_t>(word[0])) == "a",
+                  "the split is a + bcd, not the longest-match abc + d");
+            CHECK(tokenizer.piece(static_cast<uint32_t>(word[1])) == "bcd",
+                  "the second half is the piece built by merging b with cd");
+        }
+    }
+    {
+        // The dummy prefix is unconditional: " a" is escaped as two markers plus
+        // "a", so the whole input is one piece. A tokenizer that skipped the
+        // prefix for leading whitespace would emit two pieces here.
+        const std::vector<std::pair<std::string, double>> table = {
+            {"<unk>", 0.0}, {"<s>", 0.0}, {"</s>", 0.0},
+            {marker, -3.0}, {marker + marker, -2.0}, {"a", -5.0},
+            {marker + "a", -4.0}, {marker + marker + "a", -1.0},
+        };
+        GGUFDocument doc = build(table);
+        const uint32_t vocab = static_cast<uint32_t>(doc.metadata["tokenizer.ggml.tokens"].array.size());
+        const Tokenizer tokenizer = Tokenizer::from_gguf(doc, vocab);
+        const std::vector<int32_t> ids = tokenizer.encode(" a", 1, false);
+        CHECK(ids.size() == 1, "a leading space yields exactly one piece");
+        if (!ids.empty())
+            CHECK(tokenizer.piece(static_cast<uint32_t>(ids[0])) == marker + marker + "a",
+                  "the dummy prefix is added even when the text starts with a space");
+        // No prefix without the flag.
+        GGUFDocument plain_doc = build(table);
+        MetadataValue no_prefix;
+        no_prefix.type = GGUFValueType::BOOL;
+        no_prefix.b = false;
+        plain_doc.metadata["tokenizer.ggml.add_space_prefix"] = no_prefix;
+        const Tokenizer plain = Tokenizer::from_gguf(plain_doc, vocab);
+        const std::vector<int32_t> plain_ids = plain.encode(" a", 1, false);
+        CHECK(plain_ids.size() == 1 && plain.piece(static_cast<uint32_t>(plain_ids[0])) == marker + "a",
+              "add_space_prefix=false leaves the text as written");
+    }
+    {
+        // An empty prompt encodes to nothing at all: no dummy prefix for empty
+        // input, matching the reference's documented behaviour.
+        const std::vector<std::pair<std::string, double>> table = {
+            {"<unk>", 0.0}, {"<s>", 0.0}, {"</s>", 0.0}, {marker, -1.0},
+        };
+        GGUFDocument doc = build(table);
+        const uint32_t vocab = static_cast<uint32_t>(doc.metadata["tokenizer.ggml.tokens"].array.size());
+        const Tokenizer tokenizer = Tokenizer::from_gguf(doc, vocab);
+        CHECK(tokenizer.encode("", 1, false).empty(), "empty text encodes to no ids");
+        CHECK(tokenizer.encode("", 1, true) == std::vector<int32_t>{1},
+              "empty text with BOS is just the BOS id");
+    }
+}
+
 void test_unicode_classes() {
     using namespace fm::unicode;
     const struct {
@@ -2099,6 +2224,53 @@ void test_rope_scaling() {
     CHECK(std::fabs(lc - std::cos(5.0 * std::pow(10000.0, -2.0 * 2.0 / 8.0) / 2.0) * 1.25) < 1e-9,
           "linear scaling divides every angle by the factor");
 
+    // Per-pair frequency divisors: pair 0 is unchanged (factor 1), pair 1 is
+    // halved. The reference divides the frequency, so the angle for pair 1 must
+    // be the unscaled angle over the factor, not the angle times it.
+    {
+        ModelConfig plain_cfg;
+        plain_cfg.context = 64;
+        plain_cfg.rope_theta = 10000.0;
+        plain_cfg.rope_n_ctx_orig = 64.0;
+        resolve_rope_scaling(plain_cfg);
+        const float factors[4] = {1.0F, 3.0F, 1.5F, 2.0F};
+        RopePlan with_factors;
+        with_factors.init(plain_cfg, 8);
+        with_factors.freq_factors = factors;
+        RopePlan without;
+        without.init(plain_cfg, 8);
+        double c_scaled = 0.0, s_scaled = 0.0, c_plain = 0.0, s_plain = 0.0;
+        with_factors.rotation(1, 3.0, c_scaled, s_scaled);
+        without.rotation(1, 3.0, c_plain, s_plain);
+        const double freq1 = std::pow(10000.0, -2.0 * 1.0 / 8.0);
+        CHECK(std::fabs(c_scaled - std::cos(3.0 * freq1 / 3.0)) < 1e-9,
+              "a frequency factor divides that pair's frequency");
+        CHECK(std::fabs(c_scaled - c_plain) > 1e-3,
+              "the factor changes the angle rather than being ignored");
+        double c_zero = 0.0, s_zero = 0.0, c_zero_plain = 0.0, s_zero_plain = 0.0;
+        with_factors.rotation(0, 3.0, c_zero, s_zero);
+        without.rotation(0, 3.0, c_zero_plain, s_zero_plain);
+        CHECK(std::fabs(c_zero - c_zero_plain) < 1e-12,
+              "a factor of 1 leaves that pair untouched");
+    }
+    {
+        // SmolLM3's NoPE rule is an architecture property upstream, not metadata.
+        const std::string nope_path = "tests/fixtures/smollm3-nope-shape.gguf";
+        const ModelManifest manifest = build_manifest(parse_gguf_file(nope_path), nope_path);
+        CHECK(manifest.config.architecture == "smollm3", "the smollm3 adapter is selected");
+        CHECK(manifest.config.no_rope_layer_step == 4,
+              "SmolLM3 sets the every-fourth-layer NoPE step");
+        CHECK(manifest.config.layers == 4, "the fixture has enough layers to exercise it");
+    }
+    {
+        const std::string freq_path = "tests/fixtures/llama-ropfreqs-shape.gguf";
+        const ModelManifest manifest =
+            build_manifest(parse_gguf_file(freq_path), freq_path);
+        CHECK(manifest.config.rope_freqs, "rope_freqs tensors enable the divisors");
+        CHECK(manifest.tensor("blk.0.rope_freqs.weight") != nullptr &&
+                  manifest.tensor("blk.0.rope_freqs.weight")->role == TensorRole::ROPE_FREQS,
+              "the divisors get their own tensor role");
+    }
     // The fixture's raw keys have to reach the config, or the engine would run
     // exactly the unscaled arithmetic above and still look fine.
     const std::string path = "tests/fixtures/llama-yarn-shape.gguf";
@@ -2149,13 +2321,40 @@ void test_rope_scaling() {
           "yarn without an original context is rejected");
 }
 
+// Attention sinks: the softmax denominator gains one learnable logit per head and
+// the value sum never reads it. Parity alone would catch a missing sink, but not
+// a sink read from the wrong head or applied to the wrong head count, so the
+// dimensions and the all-layers rule are checked directly here.
+void test_attention_sinks() {
+    const std::string path = "tests/fixtures/llama-sinks-shape.gguf";
+    const GGUFDocument doc = parse_gguf_file(path);
+    const ModelManifest manifest = build_manifest(doc, path);
+    CHECK(manifest.config.attn_sinks, "a checkpoint with attn_sinks tensors enables sinks");
+    CHECK(manifest.tensor("blk.0.attn_sinks.weight") != nullptr,
+          "the sink tensor is mapped by the adapter");
+    if (manifest.tensor("blk.0.attn_sinks.weight"))
+        CHECK(manifest.tensor("blk.0.attn_sinks.weight")->role == TensorRole::ATTN_SINKS,
+              "the sink tensor gets its own role");
+    // A file with the tensor cut off one layer is a mapping error, not a variant:
+    // the layers would then use two different attention definitions.
+    GGUFDocument partial = doc;
+    partial.tensor_by_name.erase("blk.1.attn_sinks.weight");
+    CHECK(throws_code(ErrorCode::MISSING_REQUIRED_TENSOR,
+                      [&]() { (void)build_manifest(partial, path); }),
+          "a partially sunk checkpoint is refused rather than half-applied");
+    // The probe reports it, so a reader can see which attention definition runs.
+    const Json probe = probe_model(doc, path);
+    CHECK(probe.dump().find("attn_sinks") != std::string::npos,
+          "the probe reports attention sinks");
+}
+
 void test_architecture_parity() {
     const std::vector<std::string> slugs = {"llama-gqa", "qwen2-bias", "qwen3-qknorm", "gemma",
                                            "gemma2", "phi3-fused", "minicpm", "qwen3moe",
                                            "glm4", "qwen2moe", "phi2-layernorm",
                                            "deepseek2-mla", "internlm2", "exaone", "orion",
                                            "gptneox", "stablelm", "llama-yarn", "qwen2-linear",
-                                           "llama-yarn-mscale"};
+                                           "llama-yarn-mscale", "llama-sinks", "llama-ropfreqs", "smollm3-nope"};
     for (const std::string &slug : slugs) {
         const std::string model = "tests/fixtures/" + slug + "-shape.gguf";
         ArchGolden golden = read_arch_golden("tests/golden/" + slug + "_reference.txt");
@@ -2733,9 +2932,11 @@ int main(int argc, char **argv) {
     maybe_run("tokenizer_real_vocabularies", test_tokenizer_real_vocabularies);
     maybe_run("tokenizer_bpe_merges", test_tokenizer_bpe_merges);
     maybe_run("tokenizer_bpe_families", test_tokenizer_bpe_families);
+    maybe_run("tokenizer_sentencepiece", test_tokenizer_sentencepiece);
     maybe_run("unicode_classes", test_unicode_classes);
     maybe_run("model_map_and_tied_output", test_model_map_and_tied_output);
     maybe_run("rope_scaling", test_rope_scaling);
+    maybe_run("attention_sinks", test_attention_sinks);
     maybe_run("architecture_parity", test_architecture_parity);
     maybe_run("rotated_and_ternary_blockers", test_rotated_and_ternary_blockers);
     maybe_run("minicpm_scales", test_minicpm_scales);

@@ -53,12 +53,15 @@ each family, the tool records what a specific file contains.
 | `phi2`: LayerNorm with biases, gate-free GELU FFN, one shared residual | WORKS |
 | `deepseek2`: MLA (low-rank q, kv latent, per-head `k_b`/`v_b` expansion), dense-lead blocks, sigmoid/softmax/sqrt-softplus gating, selection bias, group-limited routing, shared expert without a scalar gate | WORKS |
 | Long context: `rope.scaling.type` `linear` and `yarn` (factor, original context, per-dimension ramp, magnitude scale incl. `yarn_log_multiplier`) | WORKS |
+| `smollm3`: the llama block with every fourth layer's rotary step removed (NoPE) | WORKS |
+| Attention sinks (`blk.N.attn_sinks.weight`): one extra softmax logit per head, included in the denominator and never read | WORKS |
+| Per-pair rotary frequency divisors (`blk.N.rope_freqs.weight`): those pairs advance slower, layer 0's vector serves every layer | WORKS |
 | `rope.scaling.type = longrope` (per-layer short/long factors, phi-3-small) | **MISSING**, refused by name |
 | Generation stops at the checkpoint's own `eos_token_id` | WORKS |
 | Chat templates: a restricted Jinja interpreter over the checkpoint's own `tokenizer.chat_template` | WORKS (see below) |
 | Built-in templates for 11 marker families + evidence-based selection from the token table | WORKS |
 | `internlm2`, `exaone`, `orion`, `gptneox`, `stablelm` adapters | WORKS |
-| `glm4-moe`, `minicpm3`, and the remaining 157 architectures in llama.cpp's `src/models/` | **MISSING** |
+| `glm4-moe`, `minicpm3`, and the remaining architectures in llama.cpp's `src/models/` | **MISSING** — see `docs/MODEL_COVERAGE_STATUS.md` for the per-model reason |
 | PrismML rotated weight basis (`prism.hadamard.*`) and Hadamard activation transform | **MISSING**, hard blocker |
 | Hybrid linear attention (`ssm_*`, `conv1d` state) | **MISSING**, hard blocker |
 | Shared-expert MoE (`expert_shared_count`) | **MISSING**, refused rather than dropped |
@@ -358,14 +361,20 @@ vocabularies it ships (`models/ggml-vocab-*.gguf` + `.inp`/`.out`):
 python3 tools/tokenizer_parity.py --vocab-dir /path/to/llama.cpp/models
 ```
 
-Last run: `gpt-2`, `llama-bpe`, `qwen2`, `starcoder`, `refact`, `command-r` all
-match on **46/46** cases each. `mpt` matches 39/46 — every mismatch is a
-whitespace-only string whose reference vector uses the raw-space token while the
-rest of the same file uses the GPT-2 escaped form; the code path is the one that
-passes `gpt-2` outright, so the vectors are inconsistent rather than the encoder.
-`llama-spm` and `phi-3` match 29/46: those are SentencePiece files, and
-SentencePiece segmentation here is still greedy longest-match rather than
-score-based.
+Last run: `gpt-2`, `llama-bpe`, `llama-spm`, `phi-3`, `qwen2`, `starcoder`,
+`refact`, `command-r` all match on **46/46** cases each. `mpt` matches 39/46 —
+every mismatch is a whitespace-only string whose reference vector uses the
+raw-space token while the rest of the same file uses the GPT-2 escaped form; the
+code path is the one that passes `gpt-2` outright, so the vectors are
+inconsistent rather than the encoder.
+
+SentencePiece vocabularies are segmented the way the reference does it, by
+score, not by longest match: every UTF-8 character starts as a symbol, and the
+highest-scoring adjacent pair whose concatenation is a piece is merged until
+nothing merges. The dummy space prefix is added unconditionally — including for
+text that already starts with a space, which is why `" hello"` starts with two
+markers — because that is what the reference does and the difference is visible
+in the expected vectors.
 
 Unicode categories come from tables generated from Python's `unicodedata`
 (`tools/gen_unicode_tables.py`), because a wrong category silently moves a word

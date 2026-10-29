@@ -49,6 +49,9 @@ struct RopePlan {
     double corr_low = 0.0;
     double corr_high = 0.0;
     double mscale = 1.0;
+    // Per-pair frequency divisors (`rope_freqs.weight`), or null for the usual
+    // case where every pair uses its own base frequency unchanged.
+    const float *freq_factors = nullptr;
 
     // `n_dims` is the number of rotated dimensions, which for most families is
     // the head width but is smaller when `rope.dimension_count` says so.

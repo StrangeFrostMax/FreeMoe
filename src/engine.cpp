@@ -361,6 +361,10 @@ void Engine::rope_half(std::vector<float> &q, uint32_t q_heads, std::vector<floa
     // derived once per call rather than once per pair.
     RopePlan plan;
     plan.init(c, rotate);
+    // Layer 0 carries the divisors and llama.cpp duplicates them, so one vector
+    // describes every layer. Dividing by them stretches those pairs' positions,
+    // which is how granite/llama4-style checkpoints extend context without YaRN.
+    if (c.rope_freqs) plan.freq_factors = weights("blk.0.rope_freqs.weight");
     // Query and key can have different head counts under grouped-query
     // attention, so each vector is walked independently.
     for (uint32_t h = 0; h < std::max(q_heads, k_heads); ++h) {
@@ -707,6 +711,7 @@ std::vector<float> Engine::forward_token(int32_t token, uint64_t position,
             // checkpoints carry YaRN.
             RopePlan plan;
             plan.init(c, c.rope_dim);
+            if (c.rope_freqs) plan.freq_factors = weights("blk.0.rope_freqs.weight");
             auto rope_part = [&](std::vector<float> &vec, uint32_t heads, uint32_t stride,
                                  uint32_t offset, const std::string &name) {
                 // Rotary positions, applied to the rope slice only: the trailing
@@ -825,7 +830,12 @@ std::vector<float> Engine::forward_token(int32_t token, uint64_t position,
             head_norm(q, c.heads, q_scale, "qk_norm.q.L" + std::to_string(layer));
             head_norm(k, c.kv_heads, k_scale, "qk_norm.k.L" + std::to_string(layer));
         }
-        if (!c.mla) rope_half(q, c.heads, k, c.kv_heads, position);
+        // NoPE layers (SmolLM3) skip the rotation entirely: their keys stay as the
+        // projection produced them, and the position information reaches the model
+        // through the layers that do rotate.
+        const bool rotate = c.no_rope_layer_step == 0 ||
+                            (layer + 1) % c.no_rope_layer_step != 0;
+        if (!c.mla && rotate) rope_half(q, c.heads, k, c.kv_heads, position);
 
         size_t current_base = (static_cast<size_t>(layer) * c.context + position) * kv_stride;
         std::memcpy(kv_ + current_base, k.data(), static_cast<size_t>(kv_dim) * sizeof(float));
@@ -861,6 +871,15 @@ std::vector<float> Engine::forward_token(int32_t token, uint64_t position,
                     value = c.attn_logit_softcap *
                             std::tanh(value / c.attn_logit_softcap);
                 score_floats.push_back(static_cast<float>(value));
+            }
+            // Attention sink: the reference appends one extra learnable logit per
+            // head to the softmax and then discards its probability, so the
+            // denominator includes exp(sink) and the head can attend to nothing.
+            // Appending it to the vector and dropping the last entry is exactly
+            // that -- no separate normalisation path to drift.
+            if (c.attn_sinks) {
+                const float *sinks = norm_weights(prefix + "attn_sinks.weight");
+                score_floats.push_back(sinks[head]);
             }
             std::vector<float> probs = softmax(score_floats);
             std::vector<double> acc(c.head_v_dim(), 0.0);

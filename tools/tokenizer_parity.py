@@ -49,8 +49,6 @@ SEPARATOR = "\n__ggml_vocab_test__\n"
 # Vocabularies whose mismatch is understood and is not a BPE defect. See the
 # module docstring; --strict turns these back into failures.
 KNOWN = {
-    "llama-spm": "SentencePiece score-based segmentation is not implemented",
-    "phi-3": "SentencePiece score-based segmentation is not implemented",
     "mpt": "reference vectors mix raw-space and escaped-space forms",
 }
 

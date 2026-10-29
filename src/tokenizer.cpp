@@ -7,10 +7,11 @@
 //     per piece. Tokens shaped `<0xNN>` are byte fallbacks.
 //   * GPT-2 style BPE (`"gpt2"`): a token table plus an ordered merge list.
 //
-// SentencePiece encoding is greedy longest-match over the piece table with
-// byte fallback. That is deterministic and inverts decode exactly; it is not a
-// full unigram Viterbi search, and the class says so rather than pretending to
-// be identical to llama.cpp's sampler for ambiguous segmentations.
+// SentencePiece encoding uses the piece scores: the reference merges the
+// adjacent pair with the best piece score until nothing more merges. Greedy
+// longest-match over the same table produces different ids on ordinary text,
+// because a long low-score piece can beat the two high-score pieces the model
+// was trained on.
 //
 // BPE encoding is the real algorithm: a family-specific pre-tokeniser cuts the
 // text into words, every byte is mapped through the byte-level alphabet, and
@@ -27,6 +28,9 @@
 // of dropping or guessing bytes.
 
 #include "fm/tokenizer.hpp"
+
+#include <queue>
+#include <map>
 
 #include "fm/unicode.hpp"
 
@@ -414,6 +418,16 @@ Tokenizer Tokenizer::from_gguf(const GGUFDocument &doc, uint32_t vocab) {
     for (int byte = 0; byte < 256; ++byte)
         tokenizer.byte_text_[byte] = unicode::byte_to_utf8(static_cast<unsigned char>(byte));
 
+    // SentencePiece normalization options. The defaults are the reference's for
+    // `LLAMA_VOCAB_TYPE_SPM` (prefix a space, keep runs as written); a file may
+    // override either.
+    auto bool_key = [&doc](const char *key, bool fallback) {
+        auto it = doc.metadata.find(key);
+        if (it == doc.metadata.end() || it->second.type != GGUFValueType::BOOL) return fallback;
+        return it->second.b;
+    };
+    tokenizer.spm_add_space_prefix_ = bool_key("tokenizer.ggml.add_space_prefix", true);
+
     auto scores_it = doc.metadata.find("tokenizer.ggml.scores");
     if (scores_it != doc.metadata.end() && scores_it->second.is_array()) {
         for (const auto &score : scores_it->second.array)
@@ -461,8 +475,6 @@ Tokenizer Tokenizer::from_gguf(const GGUFDocument &doc, uint32_t vocab) {
         if (normalised.size() == 1)
             tokenizer.byte_covered_[static_cast<unsigned char>(normalised[0])] = true;
         tokenizer.piece_to_id_.emplace(normalised, static_cast<int32_t>(id));
-        tokenizer.by_first_byte_[static_cast<unsigned char>(normalised[0])].push_back(
-            static_cast<int32_t>(id));
         tokenizer.max_piece_bytes_ =
             std::max<uint32_t>(tokenizer.max_piece_bytes_, static_cast<uint32_t>(normalised.size()));
     }
@@ -609,41 +621,151 @@ std::vector<int32_t> Tokenizer::encode(const std::string &text, uint32_t bos_id,
         return ids;
     }
     if (kind_ == Kind::Bpe) return encode_bpe(text, bos_id, add_bos);
+    return encode_sentencepiece(text, bos_id, add_bos);
+}
 
-    // SentencePiece prepends a space; the marker then reads as a word boundary.
-    std::string body = (kind_ == Kind::SentencePiece) ? (" " + text) : text;
+std::string Tokenizer::normalize_spm(const std::string &text) const {
+    // The reference's SentencePiece path: prepend a space (unconditionally -- the
+    // dummy prefix is what makes a word's first piece carry the boundary) and
+    // then escape every space 1:1 as U+2581. We keep raw spaces, which is the
+    // same string with a different marker, because pieces are normalised that
+    // way on load.
+    //
+    // Two details that look like nitpicks and are not:
+    //  * the prefix is added even when the text already starts with a space, so
+    //    " hello" escapes to three markers' worth of text, not two;
+    //  * spaces are not collapsed. `remove_extra_whitespaces` never reaches this
+    //    path upstream (only the fragment normalizer uses it), so honouring it
+    //    here would disagree with the reference on inputs with runs of spaces.
+    if (!spm_add_space_prefix_ || text.empty()) return text;
+    return " " + text;
+}
+
+std::vector<int32_t> Tokenizer::encode_sentencepiece(const std::string &text, uint32_t bos_id,
+                                                     bool add_bos) const {
+    // The reference's `llm_tokenizer_spm_session`: every UTF-8 character starts as
+    // its own symbol, then the highest-scoring adjacent pair whose concatenation
+    // is a vocabulary piece is merged, repeatedly. Score is the *piece's* score,
+    // so a long low-score piece loses to two high-score pieces -- which is the
+    // whole difference from longest-match.
+    struct Symbol {
+        size_t offset = 0;
+        size_t length = 0;
+        int32_t prev = -1;
+        int32_t next = -1;
+    };
+    struct Bigram {
+        int32_t left = -1;
+        int32_t right = -1;
+        float score = 0.0F;
+        size_t size = 0;
+        // priority_queue is a max-heap under this order: highest score first, and
+        // on a tie the leftmost pair, matching the reference's comparator.
+        bool operator<(const Bigram &other) const {
+            return score < other.score || (score == other.score && left > other.left);
+        }
+    };
+
+    const std::string body = normalize_spm(text);
     std::vector<int32_t> ids;
     if (add_bos) ids.push_back(static_cast<int32_t>(bos_id));
+    if (body.empty()) return ids;
 
-    size_t pos = 0;
-    while (pos < body.size()) {
-        int32_t best_id = -1;
-        size_t best_len = 0;
-        auto candidates = by_first_byte_.find(static_cast<unsigned char>(body[pos]));
-        if (candidates != by_first_byte_.end()) {
-            for (int32_t id : candidates->second) {
-                const std::string normalised =
-                    kind_ == Kind::SentencePiece ? unmark_spaces(pieces_[id]) : pieces_[id];
-                if (normalised.size() <= best_len) continue;
-                if (body.compare(pos, normalised.size(), normalised) != 0) continue;
-                best_len = normalised.size();
-                best_id = id;
-            }
-        }
-        if (best_id < 0) {
-            // Byte fallback keeps unseen characters representable instead of
-            // silently dropping them.
-            const unsigned char byte = static_cast<unsigned char>(body[pos]);
-            if (byte_ids_[byte] < 0)
-                fail(ErrorCode::INVALID_TOKENIZER,
-                     "no tokenizer piece and no byte fallback for byte " +
-                         std::to_string(static_cast<int>(byte)));
-            ids.push_back(byte_ids_[byte]);
-            ++pos;
+    std::vector<Symbol> symbols;
+    symbols.reserve(body.size());
+    for (size_t offs = 0; offs < body.size();) {
+        const unsigned char lead = static_cast<unsigned char>(body[offs]);
+        size_t len = 1;
+        if ((lead & 0xE0) == 0xC0) len = 2;
+        else if ((lead & 0xF0) == 0xE0) len = 3;
+        else if ((lead & 0xF8) == 0xF0) len = 4;
+        len = std::min(len, body.size() - offs);
+        Symbol sym;
+        sym.offset = offs;
+        sym.length = len;
+        sym.prev = static_cast<int32_t>(symbols.size()) - 1;
+        sym.next = offs + len == body.size() ? -1 : static_cast<int32_t>(symbols.size()) + 1;
+        symbols.push_back(sym);
+        offs += len;
+    }
+
+    std::priority_queue<Bigram> queue;
+    // Merged text -> the two symbols it came from, so a symbol that is not itself
+    // a piece can still be decomposed instead of falling back to bytes.
+    std::map<std::string, std::pair<int32_t, int32_t>> history;
+
+    auto try_add = [&](int32_t left, int32_t right) {
+        if (left < 0 || right < 0) return;
+        const std::string joined = body.substr(symbols[left].offset,
+                                               symbols[left].length + symbols[right].length);
+        auto it = piece_to_id_.find(joined);
+        if (it == piece_to_id_.end()) return;
+        if (static_cast<size_t>(it->second) >= scores_.size()) return;
+        Bigram bigram;
+        bigram.left = left;
+        bigram.right = right;
+        bigram.score = scores_[static_cast<size_t>(it->second)];
+        bigram.size = joined.size();
+        queue.push(bigram);
+        history[joined] = {left, right};
+    };
+
+    for (size_t i = 1; i < symbols.size(); ++i)
+        try_add(static_cast<int32_t>(i) - 1, static_cast<int32_t>(i));
+
+    while (!queue.empty()) {
+        const Bigram bigram = queue.top();
+        queue.pop();
+        Symbol &left = symbols[static_cast<size_t>(bigram.left)];
+        Symbol &right = symbols[static_cast<size_t>(bigram.right)];
+        // One of the two may have been merged into a neighbour since this entry
+        // was queued; the reference skips those rather than re-deriving them.
+        if (left.length == 0 || right.length == 0 || left.length + right.length != bigram.size)
+            continue;
+        left.length += right.length;
+        right.length = 0;
+        left.next = right.next;
+        if (right.next >= 0) symbols[static_cast<size_t>(right.next)].prev = bigram.left;
+        try_add(left.prev, bigram.left);
+        try_add(bigram.left, left.next);
+    }
+
+    // Emit: a merged symbol is a piece by construction; anything left is either a
+    // single character that is a piece, a decomposable merge, or raw bytes.
+    std::vector<int32_t> order;
+    for (int32_t i = symbols.empty() ? -1 : 0; i != -1; i = symbols[static_cast<size_t>(i)].next)
+        order.push_back(i);
+    std::vector<const Symbol *> todo;
+    for (int32_t index : order) todo.push_back(&symbols[static_cast<size_t>(index)]);
+    std::reverse(todo.begin(), todo.end());  // pop order == left-to-right
+    while (!todo.empty()) {
+        const Symbol &cur = *todo.back();
+        todo.pop_back();
+        const std::string text = body.substr(cur.offset, cur.length);
+        auto it = piece_to_id_.find(text);
+        if (it != piece_to_id_.end()) {
+            ids.push_back(it->second);
             continue;
         }
-        ids.push_back(best_id);
-        pos += best_len;
+        auto hist = history.find(text);
+        if (hist != history.end()) {
+            // Push right then left so the stack pops left-to-right.
+            todo.push_back(&symbols[static_cast<size_t>(hist->second.second)]);
+            todo.push_back(&symbols[static_cast<size_t>(hist->second.first)]);
+            continue;
+        }
+        if (!has_byte_fallback_)
+            fail(ErrorCode::INVALID_TOKENIZER,
+                 "SentencePiece segment '" + text +
+                     "' is not a piece and the vocabulary has no <0xNN> byte fallback");
+        for (char c : text) {
+            const int32_t id = byte_ids_[static_cast<unsigned char>(c)];
+            if (id < 0)
+                fail(ErrorCode::INVALID_TOKENIZER,
+                     "no byte-fallback token for byte " +
+                         std::to_string(static_cast<int>(static_cast<unsigned char>(c))));
+            ids.push_back(id);
+        }
     }
     return ids;
 }

@@ -118,6 +118,8 @@ const char *tensor_role_name(TensorRole role) {
     case TensorRole::ATTN_V_BIAS: return "ATTN_V_BIAS";
     case TensorRole::ATTN_OUTPUT_BIAS: return "ATTN_OUTPUT_BIAS";
     case TensorRole::ATTN_Q_NORM: return "ATTN_Q_NORM";
+    case TensorRole::ATTN_SINKS: return "ATTN_SINKS";
+    case TensorRole::ROPE_FREQS: return "ROPE_FREQS";
     case TensorRole::ATTN_K_NORM: return "ATTN_K_NORM";
     case TensorRole::ATTN_POST_NORM: return "ATTN_POST_NORM";
     case TensorRole::FFN_POST_NORM: return "FFN_POST_NORM";
@@ -397,6 +399,8 @@ TensorRole role_from_name(const std::string &name, uint32_t &layer) {
         {"attn_v.bias", TensorRole::ATTN_V_BIAS},
         {"attn_output.bias", TensorRole::ATTN_OUTPUT_BIAS},
         {"attn_q_norm.weight", TensorRole::ATTN_Q_NORM},
+        {"attn_sinks.weight", TensorRole::ATTN_SINKS},
+        {"rope_freqs.weight", TensorRole::ROPE_FREQS},
         {"attn_k_norm.weight", TensorRole::ATTN_K_NORM},
         {"attn_post_norm.weight", TensorRole::ATTN_POST_NORM},
         {"ffn_post_norm.weight", TensorRole::FFN_POST_NORM},
@@ -668,7 +672,7 @@ bool is_llama_family(const std::string &arch) {
         "llama", "qwen2", "qwen3", "smollm", "smollm2", "tinyllama",
         "gemma", "gemma2", "gemma3", "phi3", "minicpm", "qwen3moe", "glm4",
         "qwen2moe", "phi2", "deepseek2", "internlm2", "orion", "exaone", "gptneox",
-        "stablelm",
+        "stablelm", "smollm3",
     };
     return family.count(arch) != 0;
 }
@@ -1007,6 +1011,26 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
         if (!has_gate && up_present && cfg.expert_count == 0 && !fused_width)
             cfg.ffn_no_gate = true;
     }
+    // Attention sinks are a tensor fact. Every layer must carry them or none:
+    // a file that has them on some layers only would silently mix two attention
+    // definitions, which is a mapping error rather than a variant worth guessing.
+    if (doc.tensor_by_name.count(layer_name(0, "attn_sinks.weight")) != 0) {
+        for (uint32_t layer = 0; layer < cfg.layers; ++layer)
+            if (doc.tensor_by_name.count(layer_name(layer, "attn_sinks.weight")) == 0)
+                fail(ErrorCode::MISSING_REQUIRED_TENSOR,
+                     "attention sinks are present on some layers only; every layer "
+                     "must define them");
+        cfg.attn_sinks = true;
+    }
+    // SmolLM3 interleaves NoPE layers: llama.cpp sets `n_no_rope_layer_step = 4`
+    // for that architecture alone, so the rule is the architecture's, not the
+    // file's. Every fourth layer (1-based) keeps its keys unrotated.
+    if (arch == "smollm3") cfg.no_rope_layer_step = 4;
+
+    // Per-pair rotary frequency divisors. Layer 0 carries them; later layers may
+    // repeat them, so a file with the vector on layer 0 only is complete.
+    if (doc.tensor_by_name.count(layer_name(0, "rope_freqs.weight")) != 0)
+        cfg.rope_freqs = true;
     if (cfg.ffn_no_gate) {
         // A gate-free FFN cannot be told from its tensors which activation it
         // means, so the architecture has to say. The table is read from
@@ -1226,6 +1250,8 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
         if (cfg.post_norms)
             for (const char *suffix : {"attn_post_norm.weight", "ffn_post_norm.weight"})
                 expect(layer_name(l, suffix));
+        if (cfg.attn_sinks) expect(layer_name(l, "attn_sinks.weight"));
+        if (cfg.rope_freqs) expect(layer_name(l, "rope_freqs.weight"));
         // The leading `dense_lead` blocks carry a plain FFN even in an MoE
         // model, so the branch is chosen per layer rather than per model.
         const bool moe_layer = cfg.expert_count != 0 && l >= cfg.dense_lead;
@@ -1375,6 +1401,15 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
             expect_dims(*m.tensor(layer_name(l, "attn_q_norm.weight")), {cfg.head_dim});
             expect_dims(*m.tensor(layer_name(l, "attn_k_norm.weight")), {cfg.head_dim});
         }
+        // One sink logit per query head -- not per kv head: the sink is applied
+        // after the query head's own softmax.
+        if (cfg.attn_sinks)
+            expect_dims(*m.tensor(layer_name(l, "attn_sinks.weight")), {cfg.heads});
+        // One divisor per rotating pair.
+        if (cfg.rope_freqs &&
+            m.doc.tensor_by_name.count(layer_name(l, "rope_freqs.weight")) != 0)
+            expect_dims(*m.tensor(layer_name(l, "rope_freqs.weight")),
+                        {static_cast<uint64_t>(std::max<uint32_t>(cfg.rope_dim, cfg.head_dim)) / 2});
         if (cfg.attn_qkv_bias) {
             if (cfg.fused_qkv) {
                 expect_dims(*m.tensor(layer_name(l, "attn_qkv.bias")),

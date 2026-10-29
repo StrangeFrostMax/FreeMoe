@@ -58,7 +58,8 @@ public:
 
     // Encodes text into token ids.
     //
-    //   * SentencePiece: greedy longest-match over the piece table.
+    //   * SentencePiece: the piece set's own scores, applied by the reference's
+    //     bigram merge (see `encode_sentencepiece`), not greedy longest-match.
     //   * BPE: the family pre-tokeniser cuts words, then merges are applied in
     //     rank order, exactly as the reference tokenizer does. Byte fallback
     //     covers any byte the vocabulary cannot express as a piece.
@@ -98,9 +99,6 @@ private:
     uint32_t vocab_ = 0;
     std::vector<std::string> pieces_;
     std::vector<float> scores_;
-    // First byte of each piece -> candidate token ids, so the greedy match does
-    // not scan the whole vocabulary for every position.
-    std::unordered_map<unsigned char, std::vector<int32_t>> by_first_byte_;
     std::unordered_map<std::string, int32_t> piece_to_id_;
     std::vector<std::pair<std::string, std::string>> merges_;
     // "left\x1fright" -> rank. A std::string key rather than a pair key so the
@@ -108,6 +106,20 @@ private:
     std::unordered_map<std::string, int32_t> merge_rank_;
     // BPE encoding: pre-tokenise, byte-encode, merge, look up.
     std::vector<int32_t> encode_bpe(const std::string &text, uint32_t bos_id, bool add_bos) const;
+    // SentencePiece encoding: escape whitespace, then repeatedly merge the
+    // adjacent pair whose concatenation has the highest piece score. That is the
+    // reference's segmentation for a unigram/`llama` vocabulary; greedy
+    // longest-match disagrees on ordinary text because a long low-score piece
+    // beats the two high-score pieces the model was trained on.
+    std::vector<int32_t> encode_sentencepiece(const std::string &text, uint32_t bos_id,
+                                              bool add_bos) const;
+    // The vocabulary holds SentencePiece pieces with the space marker, so
+    // lookups happen in the escaped domain. `mark_spaces`/`unmark_spaces` are the
+    // two directions; encoding works with raw spaces because every piece is
+    // normalised on load.
+    std::string normalize_spm(const std::string &text) const;
+    // `tokenizer.ggml.add_space_prefix`, true for SentencePiece vocabularies.
+    bool spm_add_space_prefix_ = true;
     // Merges one pre-tokenised word into pieces, given its byte-encoded form.
     std::vector<std::string> merge_word(const std::string &word) const;
 

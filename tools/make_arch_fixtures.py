@@ -62,11 +62,16 @@ def values_for(name: str, count: int, scale: float, *, norm: bool = False) -> li
     return raw
 
 
-def tensor(name: str, dims: list[int], scale: float, *, norm: bool = False) -> TensorSpec:
+def tensor(name: str, dims: list[int], scale: float, *, norm: bool = False,
+           values: list[float] | None = None) -> TensorSpec:
     count = 1
     for d in dims:
         count *= d
-    return TensorSpec(name, list(dims), f32_bytes(values_for(name, count, scale, norm=norm)), 0)
+    if values is None:
+        values = values_for(name, count, scale, norm=norm)
+    if len(values) != count:
+        raise ValueError(f"{name}: {len(values)} values for {count} elements")
+    return TensorSpec(name, list(dims), f32_bytes(values), 0)
 
 
 def tokenizer_tokens() -> list[str]:
@@ -120,6 +125,18 @@ def arch_tensors(spec: dict[str, Any]) -> list[TensorSpec]:
                 tensor(p + "attn_k.weight", [h, kv_dim], 0.16),
                 tensor(p + "attn_v.weight", [h, kv_dim], 0.16),
             ]
+        if spec.get("rope_freqs"):
+            # One divisor per rotating pair. Values above 1 stretch those pairs'
+            # positions; the pattern is uneven so a runtime that applies a single
+            # scalar (or none) cannot match the golden.
+            pairs = spec["rope_dim"] // 2
+            out += [tensor(p + "rope_freqs.weight", [pairs], 0.0,
+                           values=[1.0 + 0.5 * (i % 3) for i in range(pairs)])]
+        if spec.get("attn_sinks"):
+            # One logit per query head. Deliberately non-zero and asymmetric, so a
+            # runtime that ignores the sink or reads the wrong head's value cannot
+            # match the golden.
+            out += [tensor(p + "attn_sinks.weight", [heads], 0.75)]
         if spec.get("qk_norm"):
             # One head's worth of scale, shared by every head.
             out += [
@@ -520,6 +537,39 @@ SPECS: list[dict[str, Any]] = [
         "kv_heads": 2,
         "rope_dim": SHAPE["head_dim"],
         "qkv_bias": True,
+    },
+    {
+        # SmolLM3: the standard llama block with every fourth layer's rotary step
+        # removed (NoPE). Four layers are used so the skip actually happens at
+        # layer 3 -- a two-layer fixture would never exercise it.
+        "slug": "smollm3-nope",
+        "arch": "smollm3",
+        "name": "FreeMoe synthetic SmolLM3 with NoPE layers",
+        "kv_heads": 2,
+        "rope_dim": SHAPE["head_dim"],
+        "layers": 4,
+    },
+    {
+        # Per-pair rotary frequency divisors (`rope_freqs.weight`): the pairs that
+        # carry them advance slower, which is how granite/llama4-style checkpoints
+        # stretch context without YaRN.
+        "slug": "llama-ropfreqs",
+        "arch": "llama",
+        "name": "FreeMoe synthetic llama with per-pair rotary frequency factors",
+        "kv_heads": 2,
+        "rope_dim": SHAPE["head_dim"],
+        "rope_freqs": True,
+    },
+    {
+        # Attention sinks (ggml `soft_max_ext(..., sinks)`): every head's softmax
+        # denominator carries one extra learnable logit. Families that need it
+        # include deepseek4/4.1, mimo2 and minimax-m2.
+        "slug": "llama-sinks",
+        "arch": "llama",
+        "name": "FreeMoe synthetic llama with attention sinks",
+        "kv_heads": 2,
+        "rope_dim": SHAPE["head_dim"],
+        "attn_sinks": True,
     },
     {
         # YaRN context extension: the checkpoint was trained on 64 positions and

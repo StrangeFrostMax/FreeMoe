@@ -150,6 +150,15 @@ def load_model(path: Path) -> dict[str, Any]:
                                   for l in range(n_layer)),
         # Multi-head latent attention: the file carries the projection into the
         # latent and the per-head expansions, and no keys or values.
+        # Attention sinks: a per-head logit that the softmax denominator includes
+        # and the value sum never reads. Detected from the tensor, like every
+        # other structural fact.
+        "attn_sinks": "blk.0.attn_sinks.weight" in tensors,
+        # SmolLM3 keeps every fourth layer unrotated.
+        "no_rope_step": 4 if arch == "smollm3" else 0,
+        # Per-pair rotary frequency divisors; layer 0 is authoritative.
+        "rope_freqs": ("blk.0.rope_freqs.weight" in tensors
+                       and tensors["blk.0.rope_freqs.weight"][1]),
         "mla": "blk.0.attn_kv_a_mqa.weight" in tensors,
         "q_lora_rank": int(key("attention.q_lora_rank", 0)),
         "kv_lora_rank": int(key("attention.kv_lora_rank", 0)),
@@ -291,9 +300,11 @@ def yarn_corr_dims(n_dims: int, n_ctx_orig: float, freq_base: float,
 
 
 def rope_angles(scale: dict[str, Any], n_dims: int, pair: int, pos: int,
-                theta: float) -> tuple[float, float]:
+                theta: float, freq_factors: list[float] | None = None) -> tuple[float, float]:
     """cos/sin for one rotary pair, with linear/YaRN scaling applied."""
     extrap = theta ** (-2.0 * pair / n_dims)
+    if freq_factors:
+        extrap /= freq_factors[pair]
     angle_freq = scale["freq_scale"] * extrap
     if scale["ext_factor"] != 0.0:
         lo, hi = yarn_corr_dims(n_dims, scale["n_ctx_orig"], theta,
@@ -306,7 +317,8 @@ def rope_angles(scale: dict[str, Any], n_dims: int, pair: int, pos: int,
 
 def rope_half(vec: list[float], head_dim: int, heads: int, pos: int,
               rope_dim: int, theta: float,
-              scale: dict[str, Any] | None = None) -> None:
+              scale: dict[str, Any] | None = None,
+              cfg_freqs: list[float] | None = None) -> None:
     """Rotates each head's vector in place over `rope_dim` dimensions.
 
     This is ggml's default (`GGML_ROPE_TYPE_NORM`) layout, the one llama.cpp
@@ -323,7 +335,7 @@ def rope_half(vec: list[float], head_dim: int, heads: int, pos: int,
     for head in range(heads):
         base = head * head_dim
         for j in range(rope_dim // 2):
-            c, s = rope_angles(scale, rope_dim, j, pos, theta)
+            c, s = rope_angles(scale, rope_dim, j, pos, theta, cfg_freqs)
             a = vec[base + 2 * j]
             b = vec[base + 2 * j + 1]
             vec[base + 2 * j] = a * c - b * s
@@ -331,7 +343,8 @@ def rope_half(vec: list[float], head_dim: int, heads: int, pos: int,
 
 
 def rope_mla(vec: list[float], heads: int, stride: int, offset: int, width: int,
-             pos: int, theta: float, scale: dict[str, Any] | None = None) -> list[float]:
+             pos: int, theta: float, scale: dict[str, Any] | None = None,
+             cfg_freqs: list[float] | None = None) -> list[float]:
     """Rotary position applied to one slice per head.
 
     MLA rotates only the rope part of each query head, and the shared k_pe
@@ -343,7 +356,7 @@ def rope_mla(vec: list[float], heads: int, stride: int, offset: int, width: int,
     for head in range(heads):
         base = head * stride + offset
         for i in range(width // 2):
-            cs, sn = rope_angles(scale, width, i, pos, theta)
+            cs, sn = rope_angles(scale, width, i, pos, theta, cfg_freqs)
             a0 = out[base + 2 * i]
             a1 = out[base + 2 * i + 1]
             out[base + 2 * i] = a0 * cs - a1 * sn
@@ -456,9 +469,9 @@ class Session:
                 # Rotary on the trailing rope slice of each query head, and on
                 # the shared k_pe.
                 q = rope_mla(q, heads, hd, hd - cfg["rope_dim"], cfg["rope_dim"], self.pos,
-                             cfg["theta"], cfg["rope_scale"])
+                             cfg["theta"], cfg["rope_scale"], cfg["rope_freqs"])
                 kpe = rope_mla(kpe, 1, cfg["rope_dim"], 0, cfg["rope_dim"], self.pos,
-                               cfg["theta"], cfg["rope_scale"])
+                               cfg["theta"], cfg["rope_scale"], cfg["rope_freqs"])
                 kb = self.tensor(p + "attn_k_b.weight")
                 vb = self.tensor(p + "attn_v_b.weight")
                 k_vec: list[float] = []
@@ -501,10 +514,12 @@ class Session:
                 if cfg["qk_norm"]:
                     q = head_rmsnorm(q, heads, self.tensor(p + "attn_q_norm.weight"), cfg["eps"])
                     k = head_rmsnorm(k, kv_heads, self.tensor(p + "attn_k_norm.weight"), cfg["eps"])
-                rope_half(q, hd, heads, self.pos, cfg["rope_dim"], cfg["theta"],
-                          cfg["rope_scale"])
-                rope_half(k, hd, kv_heads, self.pos, cfg["rope_dim"], cfg["theta"],
-                          cfg["rope_scale"])
+                step = cfg["no_rope_step"]
+                if step == 0 or (layer + 1) % step != 0:
+                    rope_half(q, hd, heads, self.pos, cfg["rope_dim"], cfg["theta"],
+                              cfg["rope_scale"], cfg["rope_freqs"])
+                    rope_half(k, hd, kv_heads, self.pos, cfg["rope_dim"], cfg["theta"],
+                              cfg["rope_scale"], cfg["rope_freqs"])
             if TRACE is not None:
                 TRACE["pos"] = self.pos
                 TRACE[f"q.L{layer}"] = list(q)
@@ -529,6 +544,9 @@ class Session:
                     if cfg["attn_softcap"] > 0.0:
                         dot = cfg["attn_softcap"] * math.tanh(dot / cfg["attn_softcap"])
                     scores.append(dot)
+                if cfg["attn_sinks"]:
+                    # Append the sink logit, then ignore its probability.
+                    scores = scores + [self.tensor(p + "attn_sinks.weight")[head]]
                 probs = softmax(scores)
                 acc = [0.0] * head_v
                 for offset, t_index in enumerate(range(first, len(cache))):
