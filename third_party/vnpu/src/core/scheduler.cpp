@@ -158,6 +158,42 @@ vnpu_status_t build_gemm_tiles(vnpu_device_t *device,
                                args.mask_tile_n, tiles);
 }
 
+namespace {
+
+/* Exclusive ownership of a device's CELL-unit scratch buffers for the duration
+ * of one kernel dispatch. See the comment on `scratch_free` in internal.h. */
+class ScratchLease {
+public:
+    explicit ScratchLease(vnpu_device_t *device) : device_(device)
+    {
+        std::lock_guard<std::mutex> lock(device_->scratch_mutex);
+        if (!device_->scratch_free.empty()) {
+            set_ = std::move(device_->scratch_free.back());
+            device_->scratch_free.pop_back();
+        } else {
+            set_ = std::make_unique<std::vector<std::vector<uint8_t>>>();
+            set_->resize(std::max<uint32_t>(1, device_->scratch_workers));
+            for (auto &store : *set_)
+                store.resize(VNPU_LOCAL_STORE_BYTES + VNPU_CACHELINE_BYTES);
+        }
+    }
+    ~ScratchLease()
+    {
+        if (!set_) return;
+        std::lock_guard<std::mutex> lock(device_->scratch_mutex);
+        device_->scratch_free.push_back(std::move(set_));
+    }
+    ScratchLease(const ScratchLease &) = delete;
+    ScratchLease &operator=(const ScratchLease &) = delete;
+    std::vector<std::vector<uint8_t>> *get() { return set_.get(); }
+
+private:
+    vnpu_device_t *device_;
+    std::unique_ptr<std::vector<std::vector<uint8_t>>> set_;
+};
+
+} /* namespace */
+
 static vnpu_status_t prepare_matmul_f32(const vnpu_matmul_f32_args_t &in,
                                         uint32_t flags,
                                         const vnpu_device_t *device,
@@ -197,8 +233,9 @@ static vnpu_status_t prepare_matmul_f32(const vnpu_matmul_f32_args_t &in,
     p.tile_mask = in.tile_mask;
     p.mask_tile_m = in.mask_tile_m;
     p.mask_tile_n = in.mask_tile_n;
-    p.local_stores = const_cast<std::vector<std::vector<uint8_t>> *>(
-        &device->local_stores);
+    /* The scratch lease is taken by the caller: `prepare_*` must stay
+     * side-effect free so it can be called without dispatching. */
+    p.local_stores = nullptr;
     p.local_store_bytes = VNPU_LOCAL_STORE_BYTES;
     return VNPU_OK;
 }
@@ -215,6 +252,11 @@ static void execute_matmul_f32(ExecCtx &ctx)
                              in.tile_mask, in.mask_tile_m,
                              in.mask_tile_n, tiles);
     if (rc != VNPU_OK) throw std::runtime_error(vnpu_status_string(rc));
+    std::unique_ptr<ScratchLease> scratch;
+    if (unit == VNPU_UNIT_CELL) {
+        scratch = std::make_unique<ScratchLease>(ctx.device);
+        p.local_stores = scratch->get();
+    }
     p.tiles = &tiles;
     uint64_t active_tiles = 0;
     for (const auto &t : tiles) if (!t.cull) active_tiles++;
@@ -288,8 +330,13 @@ static void execute_matmul_i8(ExecCtx &ctx)
     p.tile_n = ctx.device->tile_n.load();
     p.B = make_packed_view(w);
     p.tiles = &tiles;
-    p.local_stores = &ctx.device->local_stores;
+    p.local_stores = nullptr;
     p.local_store_bytes = VNPU_LOCAL_STORE_BYTES;
+    std::unique_ptr<ScratchLease> scratch;
+    if (p.unit == VNPU_UNIT_CELL) {
+        scratch = std::make_unique<ScratchLease>(ctx.device);
+        p.local_stores = scratch->get();
+    }
     uint64_t active = 0;
     for (const auto &t : tiles) if (!t.cull) active++;
     ctx.tiles_dispatched += active;

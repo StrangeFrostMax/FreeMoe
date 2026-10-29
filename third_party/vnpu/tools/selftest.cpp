@@ -10,10 +10,12 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <atomic>
 #include <functional>
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -586,6 +588,85 @@ int vnpu_run_selftest(const char *filter)
         ref_matmul(A, B, {}, ref, M, K, N, false, VNPU_EPILOGUE_NONE);
         return compare_vectors(C, ref, 3e-3f, 3e-3f, "cluster") &&
                stats.total_jobs > 0;
+    });
+
+    /* Two streams on one device must not share CELL staging buffers. The
+     * selftest used to miss this: `local_cluster` only compared a single
+     * dispatch's output, and the corruption needs two dispatches to overlap,
+     * which on a 2-core host (the development box) they rarely do. It showed
+     * up as an intermittent CI failure on a 4-core runner. This test forces the
+     * overlap with a barrier and checks both results, so it fails on the
+     * shared-buffer bug regardless of how the scheduling happens to fall. */
+    run_test("stream_concurrency", []() {
+        Runtime r;
+        const uint32_t M = 8, K = 256, N = 2048;
+        std::vector<float> B(static_cast<size_t>(K) * N);
+        for (auto &x : B) x = rnd();
+        std::vector<float> ref;
+        std::vector<float> A[2] = {
+            std::vector<float>(static_cast<size_t>(M) * K),
+            std::vector<float>(static_cast<size_t>(M) * K)};
+        for (auto &x : A[0]) x = rnd();
+        for (auto &x : A[1]) x = rnd();
+        ref_matmul(A[0], B, {}, ref, M, K, N, false, VNPU_EPILOGUE_NONE);
+
+        vnpu_stream_t *streams[2] = {nullptr, nullptr};
+        for (int i = 0; i < 2; ++i)
+            if (vnpu_stream_create(r.device, 0, &streams[i]) != VNPU_OK)
+                return false;
+
+        bool ok = true;
+        size_t pool_after_first = 0;
+        for (int iter = 0; iter < 8 && ok; ++iter) {
+            std::vector<float> C[2] = {
+                std::vector<float>(static_cast<size_t>(M) * N, 0.0f),
+                std::vector<float>(static_cast<size_t>(M) * N, 0.0f)};
+            std::atomic<int> arrived{0};
+            vnpu_status_t status[2] = {VNPU_OK, VNPU_OK};
+            auto worker = [&, iter](int index) {
+                vnpu_matmul_f32_args_t args{};
+                args.A = A[index].data();
+                args.B = B.data();
+                args.C = C[index].data();
+                args.M = M;
+                args.K = K;
+                args.N = N;
+                args.alpha = 1.0f;
+                args.beta = 0.0f;
+                args.unit = VNPU_UNIT_AUTO;
+                arrived.fetch_add(1);
+                while (arrived.load() < 2) std::this_thread::yield();
+                status[index] = vnpu_matmul_f32(streams[index], &args);
+            };
+            std::thread t0(worker, 0);
+            std::thread t1(worker, 1);
+            t0.join();
+            t1.join();
+            for (int index = 0; index < 2; ++index)
+                if (status[index] != VNPU_OK) ok = false;
+            if (!ok) break;
+            const bool same = compare_vectors(C[0], ref, 3e-3f, 3e-3f, "stream0");
+            std::vector<float> ref1;
+            ref_matmul(A[1], B, {}, ref1, M, K, N, false, VNPU_EPILOGUE_NONE);
+            const bool same1 = compare_vectors(C[1], ref1, 3e-3f, 3e-3f, "stream1");
+            ok = same && same1;
+            if (iter == 0) {
+                std::lock_guard<std::mutex> lock(r.device->scratch_mutex);
+                pool_after_first = r.device->scratch_free.size();
+            }
+        }
+
+        size_t pool_end = 0;
+        {
+            std::lock_guard<std::mutex> lock(r.device->scratch_mutex);
+            pool_end = r.device->scratch_free.size();
+        }
+        for (int i = 0; i < 2; ++i) vnpu_stream_destroy(streams[i]);
+        /* One lease per concurrently running command, reused afterwards: the
+         * pool must neither leak a set per iteration nor serialise the streams
+         * down to one. */
+        return ok && pool_after_first >= 1 && pool_end == pool_after_first &&
+               pool_end <= 2;
     });
 
     run_test("speculative_step", []() {

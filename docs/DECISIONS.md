@@ -41,7 +41,9 @@ software device. It was vendored at commit
   and FreeMoe's `zen3-auto`/`auto`/`avx512` profiles all start on dual AVX2 on
   Zen 3;
 - explicit `device-info`/trace diagnostics, simulated-Zen-3 tests,
-  scalar-oracle regression tests and GCC 12 warning fix.
+  scalar-oracle regression tests and GCC 12 warning fix;
+- per-dispatch leasing of the CELL GEMM staging buffers, closing a cross-stream
+  data race in the upstream runtime (see `docs/BACKEND_SUPPORT.md`).
 
 See `third_party/vnpu/PATCHES_FREEMOE.md` and `docs/BACKEND_SUPPORT.md`.
 No AVX-512 result from the upstream README/REPORT is used as a target result.
