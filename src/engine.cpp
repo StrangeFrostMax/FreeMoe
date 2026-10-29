@@ -639,11 +639,7 @@ std::vector<float> Engine::forward_token(int32_t token, uint64_t position,
     // SwiGLU, gpt-neox's GELU, gemma's GeGLU. Both the gated and the gate-free
     // form live in include/fm/activation.hpp, so there is one implementation of
     // each and the clamp variants are testable in isolation.
-    static const std::set<std::string> known_activations = {
-        "silu", "gelu", "gelu_erf", "relu", "relu_sq", "softplus",
-        "swiglu-oai", "silu-clamp",
-    };
-    if (known_activations.count(c.activation) == 0)
+    if (!is_known_activation(c.activation))
         fail(ErrorCode::NOT_IMPLEMENTED, "unsupported activation '" + c.activation + "'");
     auto activate = [&](float x) -> float { return pointwise_activation(c, x); };
     // The gated activation lives in include/fm/activation.hpp so the two clamp

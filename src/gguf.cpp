@@ -745,6 +745,19 @@ std::string layer_name(uint32_t layer, const std::string &suffix) {
 
 } // namespace
 
+// The activations this build implements, in the vocabulary `ModelConfig::
+// activation` uses. One list, used by the manifest builder (which refuses a
+// name it does not know) and by the engine (which would otherwise fall back to
+// silu through `pointwise_activation`'s default). A new activation has to be
+// added here and in include/fm/activation.hpp, which is the point.
+bool is_known_activation(const std::string &kind) {
+    static const std::set<std::string> known = {
+        "silu", "gelu", "gelu_erf", "relu", "relu_sq", "softplus",
+        "swiglu-oai", "silu-clamp",
+    };
+    return known.count(kind) != 0;
+}
+
 // Which architectures this build can map. Everything here shares the same
 // pre-norm block structure and llama.cpp tensor naming; the differences are
 // handled by per-architecture flags rather than by separate code paths. This
@@ -756,6 +769,11 @@ bool is_llama_family(const std::string &arch) {
         "gemma", "gemma2", "gemma3", "phi3", "minicpm", "qwen3moe", "glm4",
         "qwen2moe", "phi2", "deepseek2", "internlm2", "orion", "exaone", "gptneox",
         "stablelm", "smollm3", "bitnet",
+        // Gate-free FFN families whose only difference from the llama block is
+        // the activation: relu^2 instead of silu (llama.cpp models/arcee.cpp,
+        // models/nemotron.cpp, models/jais2.cpp, all LLM_FFN_RELU_SQR with
+        // LLM_FFN_SEQ, i.e. a single up projection).
+        "arcee", "nemotron", "jais2",
     };
     return family.count(arch) != 0;
 }
@@ -987,8 +1005,6 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
             // so treating it as "no window" is exact rather than approximate.
             cfg.sliding_window = 0;
     }
-    if (cfg.activation != "silu" && cfg.activation != "gelu")
-        fail(ErrorCode::METADATA_MISMATCH, "unsupported activation " + cfg.activation);
 
     if (opt_double(doc, keys("attention.layer_norm_rms_epsilon"), &number)) cfg.rms_eps = number;
     else cfg.rms_eps = 1e-5;
@@ -1170,16 +1186,26 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
         // llama.cpp's own model files (`LLM_FFN_SEQ` with the listed
         // activation); anything else is still refused rather than guessed.
         static const std::map<std::string, const char *> seq_activation = {
-            {"phi2", "gelu"},     // src/models/phi2.cpp: LLM_FFN_GELU, LLM_FFN_SEQ
-            {"gptneox", "gelu"},  // src/models/gptneox.cpp: LLM_FFN_GELU, LLM_FFN_SEQ
+            {"phi2", "gelu"},       // src/models/phi2.cpp: LLM_FFN_GELU, LLM_FFN_SEQ
+            {"gptneox", "gelu"},    // src/models/gptneox.cpp: LLM_FFN_GELU, LLM_FFN_SEQ
+            {"arcee", "relu_sq"},   // src/models/arcee.cpp: LLM_FFN_RELU_SQR, SEQ
+            {"nemotron", "relu_sq"},// src/models/nemotron.cpp: LLM_FFN_RELU_SQR, SEQ
+            {"jais2", "relu_sq"},   // src/models/jais2.cpp: LLM_FFN_RELU_SQR, SEQ
         };
         auto it = seq_activation.find(arch);
         if (it == seq_activation.end())
             fail(ErrorCode::NOT_IMPLEMENTED,
-                 "a gate-free feed-forward is only defined for " + std::string("phi2 and gptneox") +
-                     " here; refusing rather than guessing its activation");
+                 "a gate-free feed-forward needs its activation named by the architecture, and " +
+                     arch + " is not in the table; refusing rather than guessing");
         cfg.activation = it->second;
     }
+
+    // The activation drives the arithmetic, so an unknown name is refused rather
+    // than silently becoming silu. This runs after every branch that can set it
+    // (the family defaults, the clamped variants, the gate-free table).
+    if (!is_known_activation(cfg.activation))
+        fail(ErrorCode::METADATA_MISMATCH,
+             "unsupported activation " + cfg.activation + " for architecture " + arch);
     if (opt_double(doc, keys("hyper_connection.count"), &number))
         cfg.hyper_connection_count = number;
     if (opt_double(doc, keys("rope.freq_base"), &number)) cfg.rope_theta = number;

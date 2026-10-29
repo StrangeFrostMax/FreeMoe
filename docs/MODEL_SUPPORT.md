@@ -61,6 +61,7 @@ each family, the tool records what a specific file contains.
 | Chat templates: a restricted Jinja interpreter over the checkpoint's own `tokenizer.chat_template` | WORKS (see below) |
 | Built-in templates for 11 marker families + evidence-based selection from the token table | WORKS |
 | `internlm2`, `exaone`, `orion`, `gptneox`, `stablelm` adapters | WORKS |
+| Gate-free `relu²` feed-forward families: `arcee`, `nemotron`, `jais2` | WORKS (fixture + oracle golden each) |
 | `glm4-moe`, `minicpm3`, and the remaining architectures in llama.cpp's `src/models/` | **MISSING** — see `docs/MODEL_COVERAGE_STATUS.md` for the per-model reason |
 | PrismML rotated weight basis (`prism.hadamard.*`) and Hadamard activation transform | **MISSING**, hard blocker |
 | Hybrid linear attention (`ssm_*`, `conv1d` state) | **MISSING**, hard blocker |
@@ -395,8 +396,13 @@ fused q/k/v projection, and the activation.
 The activation is the one fact GGUF cannot express for a *gate-free* FFN (up →
 activation → down has no gate to disambiguate it), so it is read from the
 architecture. That table is deliberately small and cites llama.cpp's own model
-files: `phi2` and `gptneox` are `LLM_FFN_GELU` with `LLM_FFN_SEQ`. Any other
-architecture with a gate-free FFN is still refused rather than guessed.
+files: `phi2` and `gptneox` are `LLM_FFN_GELU` with `LLM_FFN_SEQ`, and
+`arcee`, `nemotron` and `jais2` are `LLM_FFN_RELU_SQR` with `LLM_FFN_SEQ`.
+Any other architecture with a gate-free FFN is still refused rather than
+guessed — a llama checkpoint with its gates removed fails with `NOT_IMPLEMENTED`
+instead of being run with silu. The same three families are what makes the
+`relu_sq` primitive reachable: `gate_free_families` asserts each one's
+activation, norm biases and FFN biases, and their fixtures pin the logits.
 
 ## Ordered work that remains
 

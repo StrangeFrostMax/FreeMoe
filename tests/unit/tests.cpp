@@ -2863,7 +2863,8 @@ void test_architecture_parity() {
                                            "gptneox", "stablelm", "llama-yarn", "qwen2-linear",
                                            "llama-yarn-mscale", "llama-sinks", "llama-ropfreqs", "smollm3-nope",
                                            "qwen3moe-fused-up", "qwen3moe-clamp",
-                                           "glm4-mrope", "bitnet"};
+                                           "glm4-mrope", "bitnet", "arcee", "nemotron",
+                                           "jais2"};
     for (const std::string &slug : slugs) {
         const std::string model = "tests/fixtures/" + slug + "-shape.gguf";
         ArchGolden golden = read_arch_golden("tests/golden/" + slug + "_reference.txt");
@@ -2912,6 +2913,57 @@ void test_architecture_parity() {
     }
 }
 
+
+// Families whose feed-forward has one projection instead of a gate. GGUF
+// metadata cannot state an activation, so the architecture name is the only
+// evidence: each of these must arrive with the activation llama.cpp uses for it
+// (LLM_FFN_RELU_SQR), and a file of a family that is not in the table must be
+// refused rather than run with silu.
+void test_gate_free_families() {
+    struct Expect {
+        const char *slug;
+        const char *arch;
+        const char *activation;
+        bool norm_bias;
+        bool ffn_bias;
+        bool attn_output_bias;
+    };
+    const Expect cases[] = {
+        {"arcee", "arcee", "relu_sq", false, false, false},
+        {"nemotron", "nemotron", "relu_sq", true, true, false},
+        {"jais2", "jais2", "relu_sq", true, true, true},
+    };
+    for (const Expect &c : cases) {
+        const std::string path = std::string("tests/fixtures/") + c.slug + "-shape.gguf";
+        const ModelManifest manifest = build_manifest(parse_gguf_file(path), path);
+        const std::string tag = std::string(c.slug) + ": ";
+        CHECK(manifest.config.architecture == c.arch, tag + "architecture comes from the file");
+        CHECK(manifest.config.ffn_no_gate,
+              tag + "one projection with no gate is detected from the tensors");
+        CHECK(manifest.config.activation == c.activation,
+              tag + "activation comes from the architecture table, not a default");
+        CHECK(manifest.config.norm_bias == c.norm_bias, tag + "norm biases match the file");
+        CHECK(manifest.config.ffn_bias == c.ffn_bias, tag + "ffn projection biases match");
+        CHECK(manifest.config.attn_output_bias == c.attn_output_bias,
+              tag + "attention output bias matches");
+        CHECK(manifest.tensor("blk.0.ffn_gate.weight") == nullptr,
+              tag + "a gate-free checkpoint has no gate tensor");
+        CHECK(manifest.tensor("blk.0.ffn_up.weight") != nullptr,
+              tag + "the single up projection is mapped");
+    }
+
+    // llama is gated. Strip the gates and it becomes a gate-free FFN whose
+    // activation nothing states -- the one case where guessing would produce a
+    // plausible but wrong model, so it has to fail.
+    {
+        GGUFDocument doc = parse_gguf_file("tests/fixtures/llama-gqa-shape.gguf");
+        doc.tensor_by_name.erase("blk.0.ffn_gate.weight");
+        doc.tensor_by_name.erase("blk.1.ffn_gate.weight");
+        CHECK(throws_code(ErrorCode::NOT_IMPLEMENTED,
+                          [&]() { (void)build_manifest(doc, "gateless-llama.gguf"); }),
+              "a gate-free file of a family with no activation row is refused");
+    }
+}
 
 // PrismML's Bonsai 2 stores ternary weights in a Hadamard-rotated basis and
 // mixes linear attention into the block. Neither is implemented, and the danger
@@ -3641,6 +3693,7 @@ int main(int argc, char **argv) {
     maybe_run("activation_clamp_forms", test_activation_clamp_forms);
     maybe_run("pointwise_activations", test_pointwise_activations);
     maybe_run("ffn_variants", test_ffn_variants);
+    maybe_run("gate_free_families", test_gate_free_families);
     maybe_run("adapter_tags", test_adapter_tags);
     maybe_run("attention_sinks", test_attention_sinks);
     maybe_run("architecture_parity", test_architecture_parity);

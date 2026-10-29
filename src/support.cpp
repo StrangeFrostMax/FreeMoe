@@ -84,6 +84,12 @@ const std::map<std::string, ArchFacts> &known_architectures() {
         // bitnet: the llama block plus SUBLN sub-norms and optional one-element
         // projection scales.
         {"bitnet", {true, false}},
+        // Gate-free relu^2 feed-forward families: the same llama block, one
+        // projection, and an activation GGUF metadata cannot state, so the
+        // architecture name is the evidence (see build_manifest_llama).
+        {"arcee", {true, false}},
+        {"nemotron", {true, false}},
+        {"jais2", {true, false}},
         {"glm4moe", {false, true}},
         {"multimodal", {false, true}},
     };

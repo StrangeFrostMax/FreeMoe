@@ -23,11 +23,11 @@ what the work is: the 50 model names reduce to about eight capabilities.
 | Linear + YaRN context extension, `rope_freqs` divisors | `rope_scaling` checks, 4 fixtures |
 | Attention sinks, NoPE layers | `attention_sinks`, `rope_scaling`, fixtures |
 | MLA (DeepSeek-V2/V3 style), sigmoid/softmax/sqrt-softplus gating, group-limited routing, selection bias, shared expert | `deepseek2-mla` fixture + oracle |
-| GQA/MQA, per-head qk-norm, partial rotary, fused qkv, fused gate-up, post-norms, sliding window, tanh softcap, LayerNorm variants, silu/gelu | 27 architecture fixtures (`architecture_parity`, 189 checks) |
+| GQA/MQA, per-head qk-norm, partial rotary, fused qkv, fused gate-up, post-norms, sliding window, tanh softcap, LayerNorm variants, silu/gelu/relu², gate-free FFN | 31 architecture fixtures (`architecture_parity`, 210 checks) |
 | 36 quantisation types incl. ternary `TQ1_0`/`TQ2_0`/`Q1_0`/`Q2_0`/`PQ2_0`, the whole IQ family (IQ1_S/M, IQ2_XXS/XS/S, IQ3_XXS/S, IQ4_XS/NL) and FP4 (MXFP4, NVFP4) | `quant_reference_decode`, `quant_model_parity` (Q8_0/Q4_0/Q4_K/Q6_K end to end); **matches llama.cpp's own dequantizers to ≤1e-6 relative** of block magnitude via `tools/quant_upstream_check.py` (26 types, 0 failures; worst absolute 5.0e-06 on IQ4_NL, MXFP4/NVFP4 exact). Not claimed bit-exact — see `docs/GAP_ANALYSIS.md` |
 | Fused `ffn_gate_up_exps`, clamped SwiGLU (`swiglu-oai`, per-layer `swiglu_clamp`), router renormalisation floor | `ffn_variants`, `activation_clamp_forms` (13 checks), `qwen3moe-fused-up` and `qwen3moe-clamp` fixtures |
 | Mixed-precision expert stacks: per-projection types inside one expert record (Q4_K gate/up + Q6_K down), fused and separate | `quant_expert_mixed_types` (32 checks), `quant-expert-{fused,separate}.gguf` + F32 twins |
-| Pointwise activation primitives (`relu`, `relu_sq`, `gelu_erf`, `softplus`) as upstream's `llm_ffn_op_type` defines them | `pointwise_activations` (12 checks) — implemented and pinned, but no adapter row selects them yet |
+| Pointwise activation primitives (`relu`, `relu_sq`, `gelu_erf`, `softplus`) as upstream's `llm_ffn_op_type` defines them | `pointwise_activations` (12 checks) pins the arithmetic. `relu_sq` is now **reachable and verified end to end**: `arcee`, `nemotron` and `jais2` are gate-free `LLM_FFN_RELU_SQR` families, and `gate_free_families` (25 checks) plus their parity fixtures prove the activation is applied (with silu substituted, `arcee` fails the golden by 0.98 absolute). `relu`, `gelu_erf` and `softplus` remain primitive-only |
 | Refusal paths: unmapped architecture, undecodable tensor type, missing output head | `refusal_paths` (17 checks) — error code, message and probe blocker JSON |
 | mRoPE section split (`rope.dimension_sections`), plain and interleaved | `rope_mrope`; `glm4-mrope` fixture |
 | Adapter rows tagged in llama.cpp's vocabulary (`inspect --tags`, `freemoe adapters`) | `adapter_tags`, 85 checks |
@@ -36,10 +36,11 @@ Supported architecture strings today (each has a fixture unless noted):
 `llama`, `qwen2`, `qwen3`, `qwen2moe`, `qwen3moe`, `gemma`, `gemma2`, `gemma3`,
 `phi2`, `phi3`, `glm4`, `minicpm`, `deepseek2`, `internlm2`, `exaone`, `orion`,
 `gptneox`, `stablelm`, `smollm`, `smollm2`, `smollm3`, `tinyllama`, `bitnet`,
+`arcee`, `nemotron`, `jais2`,
 plus the native `freemoe-tiny`. `smollm`/`smollm2`/`tinyllama` are the same llama
 block. The three lists that decide this — the adapter table, the loader's family
 list and the probe's known-architecture table — are bound to each other by the
-`adapter_binding` test (215 checks), which is what caught `smollm3` and `bitnet`
+`adapter_binding` test (242 checks), which is what caught `smollm3` and `bitnet`
 missing from the probe's table while their adapters existed.
 
 ## The requested list
@@ -57,6 +58,7 @@ missing from the probe's table while their adapters existed.
 | SmolLM3 | `smollm3` | **WORKS** (NoPE layers implemented in this change) |
 | DeepSeek-R1 distills on Qwen/Llama | `qwen2`, `llama` | **WORKS** |
 | BitNet-b1.58 block, any decoded tensor type | `bitnet` | **WORKS** for the block (`bitnet` fixture); the published `I2_S` files stay refused by type (see the row below) |
+| Arcee AFM, Nemotron (dense), JAIS-2 (text) | `arcee`, `nemotron`, `jais2` | **WORKS** for the block: gate-free `relu²` FFN (the activation GGUF cannot state comes from the architecture table), LayerNorm-with-bias variants, tied head |
 
 ### One primitive away
 

@@ -33,6 +33,9 @@ const AdapterRow kRows[] = {
     {"gptneox", "LLM_ARCH_GPTNEOX", "llm_build_gptneox", "LayerNorm, gate-free GELU, parallel attention/FFN"},
     {"stablelm", "LLM_ARCH_STABLELM", "llm_build_stablelm", "llama block with its own rotary width"},
     {"bitnet", "LLM_ARCH_BITNET", "llm_build_bitnet", "llama block plus SUBLN sub-norms and optional projection scales"},
+    {"arcee", "LLM_ARCH_ARCEE", "llm_build_arcee", "RMSNorm llama block, gate-free FFN with relu^2"},
+    {"nemotron", "LLM_ARCH_NEMOTRON", "llm_build_nemotron", "LayerNorm llama block with biases, gate-free relu^2 FFN"},
+    {"jais2", "LLM_ARCH_JAIS2", "llm_build_jais2", "LayerNorm llama block, biased projections, gate-free relu^2 FFN"},
 };
 
 }  // namespace

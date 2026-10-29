@@ -339,6 +339,46 @@ def arch_metadata(spec: dict[str, Any]) -> dict[str, tuple[Any, ...]]:
 
 SPECS: list[dict[str, Any]] = [
     {
+        # arcee (llama.cpp models/arcee.cpp): the llama block with a gate-free
+        # FFN and relu^2 in place of SwiGLU. GGUF metadata cannot state an
+        # activation, so the architecture name is the evidence and this fixture
+        # is the check that the engine applies the same one.
+        "slug": "arcee",
+        "arch": "arcee",
+        "name": "FreeMoe synthetic arcee with a gate-free relu^2 FFN",
+        "kv_heads": 2,
+        "rope_dim": SHAPE["head_dim"],
+        "ffn_no_gate": True,
+    },
+    {
+        # nemotron: LayerNorm (biased) on all three norms and a gate-free relu^2
+        # FFN with biases on both projections. Distinct from arcee because the
+        # norm type and the FFN biases are separate facts.
+        "slug": "nemotron",
+        "arch": "nemotron",
+        "name": "FreeMoe synthetic nemotron with LayerNorm biases and relu^2 FFN",
+        "kv_heads": SHAPE["heads"],
+        "rope_dim": SHAPE["head_dim"],
+        "layernorm": True,
+        "ffn_no_gate": True,
+        "ffn_bias": True,
+    },
+    {
+        # jais2: LayerNorm, a biased attention output projection, the same
+        # gate-free relu^2 FFN, and the output head tied to the token table
+        # (llama.cpp marks it TENSOR_NOT_REQUIRED and falls back).
+        "slug": "jais2",
+        "arch": "jais2",
+        "name": "FreeMoe synthetic jais2 with biased projections and relu^2 FFN",
+        "kv_heads": 2,
+        "rope_dim": SHAPE["head_dim"],
+        "layernorm": True,
+        "ffn_no_gate": True,
+        "ffn_bias": True,
+        "attn_output_bias": True,
+        "tied_output": True,
+    },
+    {
         # bitnet (llama.cpp's models/bitnet.cpp): the plain pre-norm block plus
         # two SUBLNs -- an RMSNorm on the attention output before `attn_output`
         # and one on the gated FFN output before `ffn_down` -- and the optional
