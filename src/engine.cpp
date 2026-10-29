@@ -624,8 +624,13 @@ std::vector<float> Engine::forward_token(int32_t token, uint64_t position,
         // by `hidden` scales those by sqrt(hidden/width).
         double scale = 1.0 / std::sqrt(ss / static_cast<double>(x.size()) + c.rms_eps);
         std::vector<float> y(x.size());
-        for (uint32_t i = 0; i < x.size(); ++i)
-            y[i] = static_cast<float>(x[i] * scale * (norm_bias + w[i]));
+        for (uint32_t i = 0; i < x.size(); ++i) {
+            // A null weight is upstream's `build_norm` with no weight tensor:
+            // the vector is normalised and not scaled, i.e. unit gain. That is
+            // how `ssm.dt_b_c_rms` behaves when it is set without the weights.
+            const float gain = w == nullptr ? 1.0f : static_cast<float>(norm_bias + w[i]);
+            y[i] = static_cast<float>(x[i] * scale * gain);
+        }
         backend_->record_control(name, x.size() * sizeof(float) * 2, y.size() * sizeof(float));
         return y;
     };
@@ -800,9 +805,8 @@ std::vector<float> Engine::forward_token(int32_t token, uint64_t position,
         std::vector<float> y(inner, 0.0f);
         if (mamba2) {
             // dt is already projected; B and C ride along in the convolution.
-            if (c.ssm_vector_norms)
-                dt = rmsnorm(dt, norm_weights(prefix + "ssm_dt_norm.weight"),
-                             "ssm_dt_norm.L" + lp);
+            // No dt norm here: upstream's `build_mamba2_layer` has none, and the
+            // only norm in that block is the grouped `ssm_norm` after the scan.
             const float *dt_bias = bias_weights(prefix + "ssm_dt.bias");
             for (uint32_t i = 0; i < c.ssm_dt_rank; ++i) dt[i] += dt_bias[i];
             const uint32_t head_dim = inner / c.ssm_dt_rank;
@@ -850,17 +854,27 @@ std::vector<float> Engine::forward_token(int32_t token, uint64_t position,
                 matvec_view(tensor_view(prefix + "ssm_x.weight"), convolved,
                             dt_rank + 2 * state_size, inner, "ssm_x.L" + lp);
             std::vector<float> dt_in(dbc.begin(), dbc.begin() + dt_rank);
-            // falcon-mamba and jamba normalise dt, B and C before the scan. The
-            // tensors decide, so a file that carries them gets them applied and
-            // one that does not is untouched.
+            // falcon-mamba and jamba normalise dt, B and C before the scan, when
+            // the flag or the tensor set says so (`gguf.cpp` applies upstream's
+            // `flag || all three` gate). A weight the file does not carry means
+            // unit gain, which is what `build_norm` with a null weight does.
             if (c.ssm_vector_norms) {
-                dt_in = rmsnorm(dt_in, norm_weights(prefix + "ssm_dt_norm.weight"),
+                dt_in = rmsnorm(dt_in,
+                                c.ssm_dt_norm_present
+                                    ? norm_weights(prefix + "ssm_dt_norm.weight")
+                                    : nullptr,
                                 "ssm_dt_norm.L" + lp);
                 std::vector<float> b_vec(dbc.begin() + dt_rank, dbc.begin() + dt_rank + state_size);
                 std::vector<float> c_vec(dbc.begin() + dt_rank + state_size, dbc.end());
-                b_vec = rmsnorm(b_vec, norm_weights(prefix + "ssm_b_norm.weight"),
+                b_vec = rmsnorm(b_vec,
+                                c.ssm_b_norm_present
+                                    ? norm_weights(prefix + "ssm_b_norm.weight")
+                                    : nullptr,
                                 "ssm_b_norm.L" + lp);
-                c_vec = rmsnorm(c_vec, norm_weights(prefix + "ssm_c_norm.weight"),
+                c_vec = rmsnorm(c_vec,
+                                c.ssm_c_norm_present
+                                    ? norm_weights(prefix + "ssm_c_norm.weight")
+                                    : nullptr,
                                 "ssm_c_norm.L" + lp);
                 std::copy(b_vec.begin(), b_vec.end(), dbc.begin() + dt_rank);
                 std::copy(c_vec.begin(), c_vec.end(), dbc.begin() + dt_rank + state_size);

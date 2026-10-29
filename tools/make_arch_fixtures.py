@@ -424,7 +424,7 @@ def arch_metadata(spec: dict[str, Any]) -> dict[str, tuple[Any, ...]]:
         md[f"{arch}.rope.dimension_sections"] = ("array_i32", list(spec["rope_sections"]))
     if spec.get("ssm"):
         md[f"{arch}.ssm.conv_kernel"] = ("u32", spec["ssm_conv"])
-        if spec.get("ssm_vector_norms"):
+        if spec.get("ssm_vector_norms") or spec.get("ssm_flag_only"):
             md[f"{arch}.ssm.dt_b_c_rms"] = ("bool", True)
         md[f"{arch}.ssm.inner_size"] = ("u32", spec["ssm_inner"])
         md[f"{arch}.ssm.state_size"] = ("u32", spec["ssm_state"])
@@ -533,6 +533,24 @@ SPECS: list[dict[str, Any]] = [
         "layers": 2,
     },
     {
+        # The same mamba block with `ssm.dt_b_c_rms` set and none of the three
+        # weights. Upstream creates those tensors only for jamba, so a mamba
+        # file that sets the flag has null weights and `build_norm` degenerates
+        # to unit gain -- the norm still runs, it just does not scale. A runtime
+        # that treats the missing weights as "no norm" diverges from the
+        # reference on this file, and only this file can show it.
+        "slug": "mamba-flagonly",
+        "arch": "mamba",
+        "name": "FreeMoe synthetic mamba with dt/B/C norms and no weights",
+        "ssm": "mamba",
+        "ssm_inner": 64,
+        "ssm_state": 4,
+        "ssm_conv": 4,
+        "ssm_dt_rank": 3,
+        "ssm_flag_only": True,
+        "layers": 2,
+    },
+    {
         # mamba2 (llama.cpp models/mamba2.cpp): a scalar decay per head and
         # grouped B/C, so the same convolution covers the state and the groups.
         "slug": "mamba2",
@@ -544,6 +562,27 @@ SPECS: list[dict[str, Any]] = [
         "ssm_conv": 4,
         "ssm_dt_rank": 4,
         "ssm_groups": 2,
+        "layers": 2,
+    },
+    {
+        # The same mamba2 block carrying the dt/B/C norm weights a falcon-mamba
+        # style file has, plus `ssm.dt_b_c_rms`. Upstream's mamba2 layer applies
+        # none of them -- `build_mamba2_layer` has no dt/B/C norm, and
+        # `ssm.dt_b_c_rms` is a key only models/mamba.cpp reads -- so a runtime
+        # that applies them computes different numbers. Because every tensor is
+        # generated from its own name, the shared weights are the same sequence
+        # as `mamba2`, which makes the pair a differential test: the norms must
+        # change nothing.
+        "slug": "mamba2-dtnorm",
+        "arch": "mamba2",
+        "name": "FreeMoe synthetic mamba2 carrying unused dt/B/C norm weights",
+        "ssm": "mamba2",
+        "ssm_inner": 64,
+        "ssm_state": 4,
+        "ssm_conv": 4,
+        "ssm_dt_rank": 4,
+        "ssm_groups": 2,
+        "ssm_vector_norms": True,
         "layers": 2,
     },
     {

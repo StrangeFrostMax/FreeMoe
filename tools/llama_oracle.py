@@ -126,6 +126,21 @@ def load_model(path: Path) -> dict[str, Any]:
         if len(values) != 1:
             raise ReferenceError("per-layer attention.head_count_kv values differ")
         kv_head_key = values.pop()
+    # The dt/B/C norms are mamba-1 only. Upstream's gate is
+    # `ssm.dt_b_c_rms || (the three weight tensors)` (models/mamba-base.cpp:99)
+    # and `build_norm` multiplies only when the weight is present, so a norm
+    # without its weight degenerates to unit gain rather than disappearing.
+    ssm_a_rec = blk_rec("ssm_a")
+    ssm_kind = ("mamba2" if (ssm_a_rec in tensors and tensors[ssm_a_rec][0][0] == 1)
+                else "mamba" if has_ssm else "")
+    ssm_norms_present = tuple(blk_rec(s) in tensors
+                              for s in ("ssm_dt_norm.weight", "ssm_b_norm.weight",
+                                        "ssm_c_norm.weight"))
+    if ssm_kind == "mamba":
+        ssm_vector_norms = bool(key("ssm.dt_b_c_rms", False)) or all(ssm_norms_present)
+    else:
+        ssm_vector_norms = False
+
     cfg = {
         "arch": arch,
         "H": hidden,
@@ -230,15 +245,15 @@ def load_model(path: Path) -> dict[str, Any]:
         # A file with `ssm_in` has no attention; a pure mamba file has no FFN
         # either. Both facts are read from the tensors, as they are in the
         # adapter.
-        "ssm_kind": ("mamba2" if (blk_rec("ssm_a") in tensors and
-                                  tensors[blk_rec("ssm_a")][0][0] == 1)
-                     else "mamba" if has_ssm else ""),
+        #
+        "ssm_kind": ssm_kind,
         "ssm_conv": int(key("ssm.conv_kernel", 0)),
         "ssm_inner": int(key("ssm.inner_size", 0)),
         "ssm_state": int(key("ssm.state_size", 0)),
         "ssm_dt_rank": int(key("ssm.time_step_rank", 0)),
         "ssm_groups": max(1, int(key("ssm.group_count", 1))),
-        "ssm_vector_norms": blk_rec("ssm_dt_norm.weight") in tensors,
+        "ssm_vector_norms": ssm_vector_norms,
+        "ssm_norms_present": ssm_norms_present,
         "recurrent": recurrent,
         "moe_layers": [moe_layer(l) for l in range(n_layer)],
         "ffn_layers": [ffn_layer(l) for l in range(n_layer)],
@@ -345,9 +360,14 @@ def matvec(w: list[float], x: list[float], out_dim: int, in_dim: int) -> list[fl
     return out
 
 
-def rmsnorm(x: list[float], w: list[float], eps: float, add_one: bool = False) -> list[float]:
+def rmsnorm(x: list[float], w: list[float] | None, eps: float,
+            add_one: bool = False) -> list[float]:
+    """RMS norm. A `None` weight is unit gain, matching `build_norm`, which
+    multiplies only when the weight tensor is present."""
     mean_sq = sum(v * v for v in x) / len(x)
     scale = 1.0 / math.sqrt(mean_sq + eps)
+    if w is None:
+        return [v * scale for v in x]
     bias = 1.0 if add_one else 0.0
     return [x[i] * scale * (bias + w[i]) for i in range(len(x))]
 
@@ -697,8 +717,8 @@ class Session:
         y = [0.0] * inner
         if mamba2:
             dt_bias = self.tensor(p + "ssm_dt.bias")
-            if cfg["ssm_vector_norms"]:
-                dt = rmsnorm(dt, self.tensor(p + "ssm_dt_norm.weight"), cfg["eps"])
+            # No dt norm: upstream's build_mamba2_layer has none. The grouped
+            # `ssm_norm` after the scan is the only norm in that block.
             dt = [dt[i] + dt_bias[i] for i in range(cfg["ssm_dt_rank"])]
             head_dim = inner // cfg["ssm_dt_rank"]
             per_group = cfg["ssm_dt_rank"] // groups
@@ -734,12 +754,19 @@ class Session:
             dbc = matvec(self.tensor(p + "ssm_x.weight"), convolved, dt_rank + 2 * d_state, inner)
             if cfg["ssm_vector_norms"]:
                 # falcon-mamba and jamba: RMS norm on dt, B and C before the scan.
-                dbc[:dt_rank] = rmsnorm(dbc[:dt_rank], self.tensor(p + "ssm_dt_norm.weight"),
+                # A weight the file does not carry is unit gain (build_norm with
+                # a null weight), not a skipped norm.
+                gain = cfg["ssm_norms_present"]
+
+                def norm_weight(idx: int, name: str):
+                    return self.tensor(p + name) if gain[idx] else None
+
+                dbc[:dt_rank] = rmsnorm(dbc[:dt_rank], norm_weight(0, "ssm_dt_norm.weight"),
                                         cfg["eps"])
                 dbc[dt_rank:dt_rank + d_state] = rmsnorm(
-                    dbc[dt_rank:dt_rank + d_state], self.tensor(p + "ssm_b_norm.weight"), cfg["eps"])
+                    dbc[dt_rank:dt_rank + d_state], norm_weight(1, "ssm_b_norm.weight"), cfg["eps"])
                 dbc[dt_rank + d_state:] = rmsnorm(
-                    dbc[dt_rank + d_state:], self.tensor(p + "ssm_c_norm.weight"), cfg["eps"])
+                    dbc[dt_rank + d_state:], norm_weight(2, "ssm_c_norm.weight"), cfg["eps"])
             B = dbc[dt_rank:dt_rank + d_state]
             C = dbc[dt_rank + d_state:dt_rank + 2 * d_state]
             dt = matvec(self.tensor(p + "ssm_dt.weight"), dbc[:dt_rank], inner, dt_rank)

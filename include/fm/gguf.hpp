@@ -339,9 +339,16 @@ struct ModelConfig {
     uint32_t ssm_dt_rank = 0;  // dt_rank (mamba), n_head (mamba2)
     uint32_t ssm_groups = 1;   // n_group, the B/C groups
     bool ssm_dt_b_c_rms = false;
-    // falcon-mamba and jamba normalise dt, B and C before the state update. The
-    // tensors are the evidence, so this is read rather than assumed.
+    // mamba-1 normalises dt, B and C before the state update. Upstream gates the
+    // three norms on `ssm.dt_b_c_rms || (all three tensors present)`
+    // (models/mamba-base.cpp:99); a norm whose weight tensor is absent is still
+    // applied, as `build_norm` multiplies only when the weight is present, i.e.
+    // it degenerates to unit gain. The three flags below say which weights the
+    // file actually carries. mamba2 never applies these norms at all.
     bool ssm_vector_norms = false;
+    bool ssm_dt_norm_present = false;
+    bool ssm_b_norm_present = false;
+    bool ssm_c_norm_present = false;
     // Per-layer recurrence. An empty list means every layer is recurrent, which
     // is what a pure mamba file says by simply having no attention tensors. A
     // hybrid stack (jamba, nemotron-h) states the split explicitly: in llama.cpp

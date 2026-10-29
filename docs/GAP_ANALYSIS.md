@@ -7,7 +7,7 @@
 > attention sinks are implemented, and `auto` no longer dispatches AVX-512 on a
 > Zen 3 target. The measurements below are the state at `f704e4b` and are kept
 > as the baseline this work is measured against; current numbers live in
-> `docs/MODEL_COVERAGE_STATUS.md` (2924 checks, 36 architecture fixtures).
+> `docs/MODEL_COVERAGE_STATUS.md` (2981 checks, 42 architecture fixtures).
 >
 > What changed since the baseline, in the terms this document uses:
 >
