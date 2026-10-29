@@ -603,11 +603,25 @@ void test_zen3_fallback() {
                   std::string::npos,
               "simulated Zen 3 selects labelled fallback for " + profile);
 
+        // On hardware that really is Zen 3 the simulation flag is not used: the
+        // detection is genuine, so the device reports it as such and must not
+        // claim a simulation. The first version of this test asserted
+        // `zen3_detection_simulated: true` unconditionally, which failed three
+        // checks on Zen 3 CI runners and passed on the non-Zen-3 box the test
+        // was written on.
+        CHECK(sim_info.notes.find(zen3 ? "Zen 3 detected; "
+                                       : "Zen 3 detected (simulated for test); ") !=
+                  std::string::npos,
+              "simulated Zen 3 marks detection as " + std::string(zen3 ? "real" : "synthetic") +
+                  " for " + profile);
+
         const std::string sim_trace_text = read_text_file(sim_trace_path);
         CHECK(sim_trace_text.find("\"zen3_detected\":true") != std::string::npos,
               "simulated Zen 3 trace records detection for " + profile);
-        CHECK(sim_trace_text.find("\"zen3_detection_simulated\":true") != std::string::npos,
-              "simulated Zen 3 trace marks simulation for " + profile);
+        CHECK(sim_trace_text.find(std::string("\"zen3_detection_simulated\":") +
+                                  (zen3 ? "false" : "true")) != std::string::npos,
+              "simulated Zen 3 trace marks simulation as " +
+                  std::string(zen3 ? "not used on real Zen 3" : "synthetic") + " for " + profile);
         CHECK(sim_trace_text.find("\"zen3_fallback_selected\":true") != std::string::npos,
               "simulated Zen 3 trace marks detection fallback for " + profile);
         CHECK(sim_trace_text.find("\"selected_attempt\":\"Zen 3 AVX2 dual-pipe fallback\"") !=
