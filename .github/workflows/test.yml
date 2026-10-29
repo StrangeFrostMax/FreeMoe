@@ -47,6 +47,13 @@ jobs:
           grep -nE "error:|Error [0-9]+|No rule to make target" build.log | head -20 |
             while IFS= read -r line; do echo "::error title=build::$line"; done
           exit 1
+      # The test suite's ISA-dependent assertions need to know what they ran on,
+      # and the raw log is not reachable from everywhere, so record it here.
+      - name: Host info
+        run: |
+          nproc
+          grep -m1 "model name" /proc/cpuinfo || true
+          grep -oE "avx512f|avx2|fma" /proc/cpuinfo | sort -u | tr '\n' ' '; echo
       - name: Unit and architecture tests
         run: |
           set -o pipefail
@@ -57,9 +64,8 @@ jobs:
       - name: Report test failures
         if: failure()
         run: |
-          grep -nE "\[FAIL\]|FAILED|Traceback|Error|error:|failures" test.log | head -25 |
+          grep -nE "^FAIL:|^\[FAIL\]|FAILED|Traceback|Error [0-9]+|error:|checks," test.log | head -30 |
             while IFS= read -r line; do echo "::error title=tests::$line"; done
-          tail -25 test.log | while IFS= read -r line; do echo "::error title=tests tail::$line"; done
           exit 1
       - name: Fixture and table regeneration checks
         run: |
