@@ -52,6 +52,14 @@ KNOWN = {
     "mpt": "reference vectors mix raw-space and escaped-space forms",
 }
 
+# Vocabularies this build deliberately does not pre-tokenise. A skip for any
+# name NOT in this table is a failure under --fail-on-skip: the point of the
+# gate is that adding a vocabulary family, or losing one, cannot happen quietly.
+EXPECTED_UNIMPLEMENTED = {
+    "bert-bge": "WordPiece tokenizer; the LLM BPE path does not apply",
+    "gemma-4": "SPM-style BPE (space->U+2581, raw UTF-8, no byte encoding)",
+}
+
 
 def read_cases(inp: Path, out: Path) -> list[tuple[str, list[int]]]:
     """The same split llama.cpp's test uses, so the case boundaries agree."""
@@ -103,6 +111,9 @@ def main() -> int:
     parser.add_argument("--json", action="store_true")
     parser.add_argument("--strict", action="store_true",
                         help="count known, explained divergences as failures")
+    parser.add_argument("--fail-on-skip", action="store_true",
+                        help="fail for any vocabulary whose pre-tokenizer this build refuses "
+                             "unless it is listed in EXPECTED_UNIMPLEMENTED")
     args = parser.parse_args()
 
     if not BINARY.exists():
@@ -145,6 +156,12 @@ def main() -> int:
             if all(m["actual"] == [] for m in mismatches):
                 status = "skipped"
                 reason = "this build refuses the pre-tokenizer"
+                if args.fail_on_skip and name not in EXPECTED_UNIMPLEMENTED:
+                    status = "fail"
+                    reason = ("this build refuses the pre-tokenizer and the vocabulary is not "
+                              "in EXPECTED_UNIMPLEMENTED")
+                elif name in EXPECTED_UNIMPLEMENTED:
+                    reason = "expected: " + EXPECTED_UNIMPLEMENTED[name]
             elif name in KNOWN and not args.strict:
                 status = "known"
                 reason = KNOWN[name]

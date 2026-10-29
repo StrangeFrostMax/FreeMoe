@@ -2,12 +2,12 @@
 
 > **Status of this document.** Section C's findings C1, C4, C7, C9 (activation
 > half) and C10 are fixed:
-> BPE and SentencePiece are real encoders now (8 vocabularies at 46/46,
+> BPE and SentencePiece are real encoders now (12 vocabularies at 46/46,
 > `tools/tokenizer_parity.py`), linear/YaRN/`rope_freqs` context extension and
 > attention sinks are implemented, and `auto` no longer dispatches AVX-512 on a
 > Zen 3 target. The measurements below are the state at `f704e4b` and are kept
 > as the baseline this work is measured against; current numbers live in
-> `docs/MODEL_COVERAGE_STATUS.md` (2981 checks, 42 architecture fixtures).
+> `docs/MODEL_COVERAGE_STATUS.md` (3006 checks, 42 architecture fixtures).
 >
 > What changed since the baseline, in the terms this document uses:
 >
@@ -234,7 +234,12 @@ is 18/169.
 
 These do not fail loudly. Ordered by damage.
 
-### C1. BPE encoding is max-match, not BPE — **highest severity**
+### C1. ~~BPE encoding is max-match, not BPE~~ — **FIXED at `f704e4b`; verified at `main`**
+
+> **FIXED.** `merge_rank_` is consulted (`src/tokenizer.cpp`), the encoders are
+> real BPE/SentencePiece, and llama.cpp's own vectors agree on 12 vocabularies
+> (`tools/tokenizer_parity.py`, 46/46 each). The body below is the state at the
+> baseline and is kept as the record.
 
 `src/tokenizer.cpp` parses `tokenizer.ggml.merges` into `merges_` and
 `merge_rank_` (lines 119–130) and then **never consults them**. `encode()` does
@@ -267,14 +272,21 @@ ignores `sliding_window`. The mask is applied correctly per head
 (`first_visible`, `src/engine.cpp:834`), so results are right, but a gemma-2/3 or
 cohere2 checkpoint pays for full-context KV it can never read. No ring buffer.
 
-### C4. No RoPE scaling of any kind
+### C4. ~~No RoPE scaling of any kind~~ — **FIXED; verified at `main`**
+
+> **FIXED.** `src/rope.cpp` implements linear and YaRN scaling and refuses
+> `longrope` by name. The body below is the baseline record.
 
 No `rope_scaling`, `rope_freqs`, YaRN or linear scaling anywhere in `src/`
 (26 upstream files use per-layer `rope_freqs` or frequency factors). Those
 models will produce wrong positions outside the native window — and for
 long-context checkpoints, inside it too.
 
-### C5. Router renormalisation differs from upstream in two ways
+### C5. Router renormalisation — **FIXED; verified at `main`**
+
+> **FIXED.** The denominator is config-driven: upstream's clamp for every family
+> and `+1e-20` for `deepseek41` (`src/engine.cpp`, wired from the checkpoint).
+> The body below is the baseline record.
 
 Upstream (`llama-graph.cpp:2338–2358`) sums the selected weights after any
 `SOFTMAX_WEIGHT` step and clamps the denominator to `6.103515625e-5`
@@ -293,7 +305,11 @@ and guards with `total > 0.0f`, with no clamp and no per-architecture rule.
 seed. No min-p, no repetition/presence/frequency penalty, no DRY, no grammar or
 logit-bias constraints, no `n_probs`. Fine for parity tests, wrong for chat.
 
-### C7. Quantisation coverage has holes that matter for real checkpoints
+### C7. ~~Quantisation coverage has holes~~ — **FIXED at `f704e4b`; verified at `main`**
+
+> **FIXED.** The IQ family and both FP4 formats decode and execute, matched to
+> llama.cpp's own dequantizers (`tools/quant_upstream_check.py`). The body below
+> is the baseline record.
 
 Decodable: F32/F16/BF16, Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/Q8_1, Q2_K–Q6_K, Q8_K,
 IQ4_NL, TQ1_0/TQ2_0, Q1_0/Q2_0/PQ2_0, I8/I16/I32/I64/F64.
@@ -309,7 +325,11 @@ Upstream still writes `blk.N.ffn_gate.E.weight` for some converted files; this
 engine requires the stacked layout and fails otherwise. Recorded in
 `docs/MODEL_SUPPORT.md:330`.
 
-### C9. Activation and attention variants missing
+### C9. Activation and attention variants — **FIXED (all but SITU); verified at `main`**
+
+> **FIXED** for `attn_sinks`, `SWIGLU_OAI_MOE` and `GEGLU_ERF`. `SITU` is an
+> `GGML_ABORT` upstream, so refusing it matches the reference. The body below is
+> the baseline record.
 
 No `attn_sinks`, no `SWIGLU_OAI_MOE` (clamped SwiGLU), no `SITU`, no
 `GEGLU_ERF`. Small self-contained kernels — but they are what `gpt-oss`,

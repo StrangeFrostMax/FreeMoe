@@ -37,6 +37,7 @@
 #include <algorithm>
 #include <array>
 #include <climits>
+#include <functional>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -81,11 +82,21 @@ Tokenizer::PreTokenizer lookup_pre_tokenizer(const std::string &name) {
         {"command-r", Pre::Gpt2Digits}, {"smollm", Pre::Gpt2Digits},
         {"codeshell", Pre::Gpt2Digits}, {"exaone", Pre::Gpt2Digits},
         {"minerva", Pre::Gpt2Digits},   {"mellum2", Pre::Gpt2Digits},
+        // deepseek-llm / -coder / -v3: their own splitting rules, each
+        // transcribed from the reference table and checked against its
+        // published test vectors.
+        {"deepseek-llm", Pre::DeepseekLlm},   {"deepseek-coder", Pre::DeepseekCoder},
+        {"deepseek-v3", Pre::DeepseekV3},     {"hunyuan-dense", Pre::DeepseekV3},
+        {"joyai-llm", Pre::DeepseekV3},       {"hy_v4", Pre::DeepseekV3},
+        // falcon: punctuation runs first, then the GPT-2 rule.
+        {"falcon", Pre::Falcon},
+        // tekken: Mistral 3 / Ministral, case-aware letter runs.
+        {"tekken", Pre::Tekken},
+        // qwen35: llama-3's rule with marks counted as letters, one digit each.
+        {"qwen35", Pre::Qwen35},
         // Recognised vocabularies whose splitting rule is not implemented here.
-        {"deepseek-llm", Pre::Unsupported},   {"deepseek-coder", Pre::Unsupported},
-        {"deepseek-v3", Pre::Unsupported},    {"falcon", Pre::Unsupported},
         {"minicpm5", Pre::Unsupported},       {"gemma4", Pre::Unsupported},
-        {"mmbert", Pre::Unsupported},         {"tekken", Pre::Unsupported},
+        {"mmbert", Pre::Unsupported},
         {"youtu", Pre::Unsupported},          {"spark2_5", Pre::Unsupported},
         {"kimi-k2", Pre::Unsupported},        {"gorilla", Pre::Unsupported},
         {"whitespace", Pre::Unsupported},     {"sarvam-moe", Pre::Unsupported},
@@ -220,6 +231,360 @@ std::vector<WordSpan> split_gpt2(const std::vector<uint32_t> &cpts, bool split_d
         }
         if (spaces > 0) {
             pos += spaces;
+            emit(pos);
+            continue;
+        }
+        emit(++pos);
+    }
+    return words;
+}
+
+// The reference splitter applies `regex_exprs` **one after another**, each pass
+// subdividing the words the previous pass produced (`unicode_regex_split` in
+// llama.cpp/src/unicode.cpp). A word that a pattern does not match is left
+// whole, which is why a run of spaces survives as one piece: no pattern in the
+// deepseek tables matches a bare space.
+//
+// A "matcher" returns the length of the longest match at a position, or 0 for no
+// match. Applying one matcher to a word means: emit every match, and emit the
+// gaps between matches as their own pieces.
+using Matcher = std::function<size_t(const std::vector<uint32_t> &, size_t)>;
+
+std::vector<WordSpan> apply_matcher(const std::vector<WordSpan> &words,
+                                    const std::vector<uint32_t> &cpts, const Matcher &match) {
+    std::vector<WordSpan> out;
+    for (const WordSpan &w : words) {
+        size_t pos = w.begin;
+        size_t run_start = w.begin;
+        auto flush = [&](size_t end) {
+            if (end > run_start) out.push_back({run_start, end});
+        };
+        while (pos < w.end) {
+            const size_t len = match(cpts, pos);
+            if (len == 0 || pos + len > w.end) {
+                ++pos;
+                continue;
+            }
+            flush(pos);
+            out.push_back({pos, pos + len});
+            pos += len;
+            run_start = pos;
+        }
+        flush(w.end);
+    }
+    return out;
+}
+
+std::vector<WordSpan> split_by_patterns(const std::vector<uint32_t> &cpts,
+                                        const std::vector<Matcher> &patterns) {
+    std::vector<WordSpan> words;
+    if (!cpts.empty()) words.push_back({0, cpts.size()});
+    for (const Matcher &m : patterns) words = apply_matcher(words, cpts, m);
+    return words;
+}
+
+// The matchers the deepseek tables are built from. Each one is a single
+// alternative of the reference's table, applied as its own pass.
+namespace match {
+
+inline bool at_letter(const std::vector<uint32_t> &c, size_t p) {
+    return p < c.size() && unicode::is_letter(c[p]);
+}
+inline bool at_number(const std::vector<uint32_t> &c, size_t p) {
+    return p < c.size() && unicode::is_number(c[p]);
+}
+inline bool at_space(const std::vector<uint32_t> &c, size_t p) {
+    return p < c.size() && unicode::is_space(c[p]);
+}
+inline bool at_class(const std::vector<uint32_t> &c, size_t p, uint32_t bit) {
+    return p < c.size() && (unicode::classes(c[p]) & bit) != 0;
+}
+inline bool at_newline(const std::vector<uint32_t> &c, size_t p) {
+    return p < c.size() && (c[p] == '\r' || c[p] == '\n');
+}
+
+// "[\r\n]"
+inline size_t newline(const std::vector<uint32_t> &c, size_t p) { return at_newline(c, p) ? 1 : 0; }
+
+// "\s?[X]+" with X = letters, punctuation or "letters or marks".
+inline size_t lead_run(const std::vector<uint32_t> &c, size_t p, uint32_t bits) {
+    size_t start = p;
+    if (at_space(c, p)) ++start;
+    if (start >= c.size() || (unicode::classes(c[start]) & bits) == 0) return 0;
+    while (start < c.size() && (unicode::classes(c[start]) & bits) != 0) ++start;
+    return start - p;
+}
+
+// "\s+$": trailing whitespace that reaches the end of the text.
+inline size_t trailing_space(const std::vector<uint32_t> &c, size_t p) {
+    if (!at_space(c, p)) return 0;
+    size_t end = p;
+    while (end < c.size() && at_space(c, end)) ++end;
+    // The reference anchors on the end of the *word*, which here is the whole
+    // remaining text, so a run that stops at a non-space is not this pattern.
+    return end == c.size() ? end - p : 0;
+}
+
+// "\p{N}+" and "\p{N}" and "\p{N}{1,n}".
+inline size_t digit_run(const std::vector<uint32_t> &c, size_t p, size_t max_digits) {
+    if (!at_number(c, p)) return 0;
+    size_t n = 0;
+    while (p + n < c.size() && at_number(c, p + n) && n < max_digits) ++n;
+    return n;
+}
+
+}  // namespace match
+
+// deepseek-llm (`LLAMA_VOCAB_PRE_TYPE_DEEPSEEK_LLM`):
+//
+//   [\r\n] | \s?[letters]+ | \s?[punct]+ | \s+$ | [CJK]+ | \p{N}+
+//
+// The CJK alternative is redundant after the letter pass, which runs first and
+// claims every CJK code point (they are `\p{L}`) with the same boundaries.
+std::vector<WordSpan> split_deepseek_llm(const std::vector<uint32_t> &cpts) {
+    using namespace match;
+    return split_by_patterns(cpts, {
+        newline,
+        [](const std::vector<uint32_t> &c, size_t p) { return lead_run(c, p, unicode::kLetter); },
+        [](const std::vector<uint32_t> &c, size_t p) { return lead_run(c, p, unicode::kPunctuation); },
+        trailing_space,
+        [](const std::vector<uint32_t> &c, size_t p) { return digit_run(c, p, SIZE_MAX); },
+    });
+}
+
+// deepseek-coder (`LLAMA_VOCAB_PRE_TYPE_DEEPSEEK_CODER`): the same table with
+// one digit per token instead of digit runs.
+std::vector<WordSpan> split_deepseek_coder(const std::vector<uint32_t> &cpts) {
+    using namespace match;
+    return split_by_patterns(cpts, {
+        newline,
+        [](const std::vector<uint32_t> &c, size_t p) { return lead_run(c, p, unicode::kLetter); },
+        [](const std::vector<uint32_t> &c, size_t p) { return lead_run(c, p, unicode::kPunctuation); },
+        [](const std::vector<uint32_t> &c, size_t p) { return digit_run(c, p, 1); },
+    });
+}
+
+// deepseek-v3 (`LLAMA_VOCAB_PRE_TYPE_DEEPSEEK3_LLM`, shared with hunyuan-dense,
+// joyai and hy_v4):
+//
+//   \p{N}{1,3} | [CJK kana]+ | [!-~][A-Za-z]+ | [^\r\n\p{L}\p{P}\p{S}]?[\p{L}\p{M}]+ |
+//   ?[\p{P}\p{S}]+[\r\n]* | \s*[\r\n]+ | \s+(?!\S) | \s+
+std::vector<WordSpan> split_deepseek_v3(const std::vector<uint32_t> &cpts) {
+    using namespace match;
+    constexpr uint32_t kLetterMark = unicode::kLetter | unicode::kMark;
+    constexpr uint32_t kPunctSymbol = unicode::kPunctuation | unicode::kSymbol;
+    return split_by_patterns(cpts, {
+        [](const std::vector<uint32_t> &c, size_t p) { return digit_run(c, p, 3); },
+        // "[!-~][A-Za-z]+": one ASCII punctuation or symbol, then letters.
+        [](const std::vector<uint32_t> &c, size_t p) {
+            if (p + 1 >= c.size()) return size_t{0};
+            const uint32_t ch = c[p];
+            if (ch < 0x21 || ch > 0x7e) return size_t{0};
+            if (unicode::is_letter(ch) || unicode::is_number(ch)) return size_t{0};
+            if (!at_letter(c, p + 1)) return size_t{0};
+            size_t end = p + 1;
+            while (end < c.size() && unicode::is_letter(c[end])) ++end;
+            return end - p;
+        },
+        // "[^\r\n\p{L}\p{P}\p{S}]?[\p{L}\p{M}]+"
+        [](const std::vector<uint32_t> &c, size_t p) {
+            size_t start = p;
+            if (start < c.size() && !at_newline(c, start) &&
+                (unicode::classes(c[start]) & (kLetterMark | kPunctSymbol)) == 0)
+                ++start;
+            if (start >= c.size() || (unicode::classes(c[start]) & kLetterMark) == 0) return size_t{0};
+            while (start < c.size() && (unicode::classes(c[start]) & kLetterMark) != 0) ++start;
+            return start - p;
+        },
+        // " ?[\p{P}\p{S}]+[\r\n]*"
+        [](const std::vector<uint32_t> &c, size_t p) {
+            size_t start = p;
+            if (start < c.size() && c[start] == ' ') ++start;
+            if (start >= c.size() || (unicode::classes(c[start]) & kPunctSymbol) == 0) return size_t{0};
+            while (start < c.size() && (unicode::classes(c[start]) & kPunctSymbol) != 0) ++start;
+            while (start < c.size() && at_newline(c, start)) ++start;
+            return start - p;
+        },
+        // "\s*[\r\n]+"
+        [](const std::vector<uint32_t> &c, size_t p) {
+            size_t start = p;
+            while (start < c.size() && at_space(c, start) && !at_newline(c, start)) ++start;
+            if (start >= c.size() || !at_newline(c, start)) return size_t{0};
+            while (start < c.size() && at_newline(c, start)) ++start;
+            return start - p;
+        },
+        // "\s+(?!\S)": a whitespace run not followed by a non-space.
+        [](const std::vector<uint32_t> &c, size_t p) {
+            if (!at_space(c, p)) return size_t{0};
+            size_t end = p;
+            while (end < c.size() && at_space(c, end)) ++end;
+            return end == c.size() ? end - p : size_t{0};
+        },
+        // "\s+"
+        [](const std::vector<uint32_t> &c, size_t p) {
+            if (!at_space(c, p)) return size_t{0};
+            size_t end = p;
+            while (end < c.size() && at_space(c, end)) ++end;
+            return end - p;
+        },
+    });
+}
+
+// falcon (`LLAMA_VOCAB_PRE_TYPE_FALCON`):
+//
+//   [\p{P}$+<=>^~|`]+ | 's|'t|...| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S) |
+//   [0-9][0-9][0-9]
+//
+// Applied as sequential passes, like the deepseek tables. The punctuation-run
+// pass comes first and has no leading space, so it splits a run of punctuation
+// before the GPT-2-shaped pass can glue a space to it.
+std::vector<WordSpan> split_falcon(const std::vector<uint32_t> &cpts) {
+    using namespace match;
+    auto punct_plus = [](const std::vector<uint32_t> &c, size_t p) {
+        const uint32_t ch = p < c.size() ? c[p] : ~0u;
+        if ((unicode::classes(ch) & unicode::kPunctuation) != 0) return true;
+        return ch == '$' || ch == '+' || ch == '<' || ch == '=' || ch == '>' || ch == '^' ||
+               ch == '~' || ch == '|' || ch == '`';
+    };
+    return split_by_patterns(cpts, {
+        // "[\p{P}$+<=>^~|`]+"
+        [punct_plus](const std::vector<uint32_t> &c, size_t p) {
+            if (!punct_plus(c, p)) return size_t{0};
+            size_t end = p;
+            while (end < c.size() && punct_plus(c, end)) ++end;
+            return end - p;
+        },
+        // The contractions, case-insensitive as in the reference table.
+        [](const std::vector<uint32_t> &c, size_t p) {
+            if (p >= c.size() || c[p] != '\'') return size_t{0};
+            auto lower = [&](size_t i) {
+                return i < c.size() ? static_cast<uint32_t>(unicode::ascii_lower(c[i])) : ~0u;
+            };
+            const uint32_t a = lower(p + 1), b = lower(p + 2);
+            if (a == 's' || a == 't' || a == 'm' || a == 'd') return size_t{2};
+            if ((a == 'r' && b == 'e') || (a == 'v' && b == 'e') || (a == 'l' && b == 'l'))
+                return size_t{3};
+            return size_t{0};
+        },
+        // " ?\p{L}+", " ?\p{N}+", " ?[^\s\p{L}\p{N}]+"
+        [](const std::vector<uint32_t> &c, size_t p) { return lead_run(c, p, unicode::kLetter); },
+        [](const std::vector<uint32_t> &c, size_t p) { return lead_run(c, p, unicode::kNumber); },
+        [](const std::vector<uint32_t> &c, size_t p) {
+            constexpr uint32_t kOther = ~(unicode::kSpace | unicode::kLetter | unicode::kNumber);
+            if (p >= c.size()) return size_t{0};
+            size_t start = p;
+            if (c[start] == ' ') ++start;
+            if (start >= c.size() || (unicode::classes(c[start]) & kOther) == 0) return size_t{0};
+            while (start < c.size() && (unicode::classes(c[start]) & kOther) != 0) ++start;
+            return start - p;
+        },
+        // "\s+(?!\S)"
+        [](const std::vector<uint32_t> &c, size_t p) {
+            if (!at_space(c, p)) return size_t{0};
+            size_t end = p;
+            while (end < c.size() && at_space(c, end)) ++end;
+            if (end < c.size()) return size_t{0};  // followed by a non-space: no match
+            return end - p;
+        },
+        // "[0-9][0-9][0-9]"
+        [](const std::vector<uint32_t> &c, size_t p) {
+            for (size_t k = 0; k < 3; ++k)
+                if (p + k >= c.size() || c[p + k] < '0' || c[p + k] > '9') return size_t{0};
+            return size_t{3};
+        },
+    });
+}
+
+// tekken (Mistral 3 / Ministral):
+//
+//   [^\r\n\p{L}\p{N}]?((?=[\p{L}\p{M}])([^a-z]))*((?=[\p{L}\p{M}])([^A-Z]))+ |
+//   [^\r\n\p{L}\p{N}]?((?=[\p{L}\p{M}])([^a-z]))+((?=[\p{L}\p{M}])([^A-Z]))* |
+//   \p{N} | ?[^\s\p{L}\p{N}]+[\r\n/]* | \s*[\r\n]+ | \s+(?!\S) | \s+
+//
+// The two lookahead forms together mean: an optional leading non-letter, then a
+// run of letters/marks that starts with an uppercase (first form) or continues
+// as the case run that the leading character began (second form). In practice
+// this cuts a letter run at an upper/lower case boundary, keeping the run of one
+// case together.
+std::vector<WordSpan> split_tekken(const std::vector<uint32_t> &cpts) {
+    const size_t size = cpts.size();
+    auto at = [&](size_t pos) -> uint32_t { return pos < size ? cpts[pos] : kOutOfRange; };
+    auto letter_mark = [&](size_t pos) {
+        const uint32_t cpt = at(pos);
+        if (cpt == kOutOfRange) return false;
+        return (unicode::classes(cpt) & (unicode::kLetter | unicode::kMark)) != 0;
+    };
+    auto number = [&](size_t pos) { return unicode::is_number(at(pos)); };
+    auto space = [&](size_t pos) { return unicode::is_space(at(pos)); };
+    auto lead_ok = [&](size_t pos) {
+        const uint32_t c = at(pos);
+        if (c == kOutOfRange || c == '\r' || c == '\n') return false;
+        return !unicode::is_letter(c) && !unicode::is_number(c);
+    };
+
+    std::vector<WordSpan> words;
+    size_t start = 0, pos = 0;
+    auto emit = [&](size_t end) {
+        if (end > start) words.push_back({start, end});
+        start = end;
+    };
+
+    while (pos < size) {
+        // \p{N} one at a time.
+        if (number(pos)) {
+            ++pos;
+            emit(pos);
+            continue;
+        }
+        // The two letter-run forms: an optional lead, then a maximal run of
+        // letters/marks.
+        {
+            const bool lead = lead_ok(pos) && letter_mark(pos + 1);
+            const size_t body = lead ? pos + 1 : pos;
+            if (letter_mark(body)) {
+                pos = body;
+                while (letter_mark(pos)) ++pos;
+                emit(pos);
+                continue;
+            }
+        }
+        // " ?[^\s\p{L}\p{N}]+[\r\n/]*"
+        auto other = [&](size_t p) {
+            const uint32_t c = at(p);
+            if (c == kOutOfRange) return false;
+            return !unicode::is_space(c) && !unicode::is_letter(c) && !unicode::is_number(c);
+        };
+        {
+            const bool lead = at(pos) == ' ';
+            if (other(lead ? pos + 1 : pos)) {
+                pos += lead ? 1 : 0;
+                while (other(pos)) ++pos;
+                while (at(pos) == '\r' || at(pos) == '\n' || at(pos) == '/') ++pos;
+                emit(pos);
+                continue;
+            }
+        }
+        // "\s*[\r\n]+"
+        {
+            size_t run = pos;
+            while (space(run) && at(run) != '\r' && at(run) != '\n') ++run;
+            if (at(run) == '\r' || at(run) == '\n') {
+                while (at(run) == '\r' || at(run) == '\n') ++run;
+                pos = run;
+                emit(pos);
+                continue;
+            }
+        }
+        // "\s+(?!\S)" and "\s+"
+        size_t run = 0;
+        while (space(pos + run)) ++run;
+        if (run > 1 && at(pos + run) != kOutOfRange) {
+            pos += run - 1;
+            emit(pos);
+            continue;
+        }
+        if (run > 0) {
+            pos += run;
             emit(pos);
             continue;
         }
@@ -512,6 +877,12 @@ const char *Tokenizer::pre_tokenizer_family_name(PreTokenizer family) {
         case PreTokenizer::Gpt2Digits: return "gpt2-digits";
         case PreTokenizer::Llama3: return "llama3";
         case PreTokenizer::Qwen2: return "qwen2";
+        case PreTokenizer::Qwen35: return "qwen35";
+        case PreTokenizer::DeepseekLlm: return "deepseek-llm";
+        case PreTokenizer::DeepseekCoder: return "deepseek-coder";
+        case PreTokenizer::DeepseekV3: return "deepseek-v3";
+        case PreTokenizer::Falcon: return "falcon";
+        case PreTokenizer::Tekken: return "tekken";
         case PreTokenizer::Unspecified: return "unspecified";
         case PreTokenizer::Unsupported: return "unsupported";
     }
@@ -576,6 +947,12 @@ std::vector<int32_t> Tokenizer::encode_bpe(const std::string &text, uint32_t bos
         case PreTokenizer::Gpt2Digits: words = split_gpt2(cpts, true); break;
         case PreTokenizer::Llama3: words = split_llama3(cpts, 3); break;
         case PreTokenizer::Qwen2: words = split_llama3(cpts, 1); break;
+        case PreTokenizer::Qwen35: words = split_llama3(cpts, 1); break;
+        case PreTokenizer::DeepseekLlm: words = split_deepseek_llm(cpts); break;
+        case PreTokenizer::DeepseekCoder: words = split_deepseek_coder(cpts); break;
+        case PreTokenizer::DeepseekV3: words = split_deepseek_v3(cpts); break;
+        case PreTokenizer::Falcon: words = split_falcon(cpts); break;
+        case PreTokenizer::Tekken: words = split_tekken(cpts); break;
         default: break;
     }
 

@@ -372,7 +372,12 @@ int command_inspect(const Args &args) {
                   << "expert_records=" << manifest.experts.size()
                   << ", slot_bytes=" << manifest.slot_bytes << "\n"
                   << "source_fingerprint=" << fm::hex64(doc.source_fingerprint) << "\n"
-                  << "validation: OK\n";
+                  // "validation" here means the metadata and tensor map were
+                  // checked, not that the model can run: a file whose tokenizer
+                  // this build refuses still prints this line. `probe` is the
+                  // command that answers "can this run", so say what this one
+                  // actually establishes.
+                  << "manifest: validated (run `freemoe probe` for runnability)\n";
     }
     return 0;
 }
