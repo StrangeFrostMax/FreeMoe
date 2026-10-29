@@ -1,12 +1,34 @@
 # Gap analysis: design vs code vs model codes
 
-> **Status of this document.** Section C's findings C1, C4 and C10 are fixed:
+> **Status of this document.** Section C's findings C1, C4, C7, C9 (activation
+> half) and C10 are fixed:
 > BPE and SentencePiece are real encoders now (8 vocabularies at 46/46,
 > `tools/tokenizer_parity.py`), linear/YaRN/`rope_freqs` context extension and
 > attention sinks are implemented, and `auto` no longer dispatches AVX-512 on a
 > Zen 3 target. The measurements below are the state at `f704e4b` and are kept
 > as the baseline this work is measured against; current numbers live in
-> `docs/MODEL_COVERAGE_STATUS.md` (1993 checks, 23 architecture fixtures).
+> `docs/MODEL_COVERAGE_STATUS.md` (2235 checks, 26 architecture fixtures).
+>
+> What changed since the baseline, in the terms this document uses:
+>
+> * **C7 closed.** The IQ family (IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S,
+>   IQ3_XXS, IQ3_S, IQ4_XS) and both FP4 formats (MXFP4, NVFP4) decode and
+>   execute. Every decoder is bit-exact against llama.cpp's own
+>   `dequantize_row_*` (`tools/quant_upstream_check.py`, 26 types, 0 failures),
+>   and the grids come from a generated table file so the transcription is
+>   mechanical. Only `PTQ1_0` stays geometry-only: no verifiable layout exists,
+>   so it is refused by name rather than guessed.
+> * **C9 half closed.** `swiglu-oai` (gpt-oss, minimax-m3) and per-layer
+>   `swiglu_clamp` (`deepseek4/4.1`, glm5-next) are implemented, along with the
+>   fused `ffn_gate_up_exps` layout and the router's renormalisation floor.
+>   `SITU` and `GEGLU_ERF` remain open.
+> * **mRoPE primitive landed.** Sections are parsed, validated against the head
+>   width, and drive a per-axis position selection in `RopePlan`; the text path
+>   is unchanged by construction because all four axes carry the same position.
+>   Wiring the six mRoPE architectures is now adapter work, not engine work.
+> * **Adapter rows carry llama.cpp's tag vocabulary** (`inspect --tags`,
+>   `freemoe adapters`), so a failure can be compared with an upstream
+>   `llama_model_loader` message tensor by tensor.
 
 Measured on `f704e4b` (merged PR #10), 2026-10-28, against `ggml-org/llama.cpp`
 `master` fetched the same day (169 files under `src/models/`).
@@ -297,8 +319,8 @@ fabricating a capability.
 | 4 | **CPU ISA override + AVX2-only re-benchmark** (C10) | Today's only performance evidence is from an ISA the target lacks | S |
 | 5 | **Eviction-exercising benchmark config** (§A Phase 5/6) | Without it the cache-policy and prefetch gates cannot be evaluated at all | S |
 | 6 | **Batched prefill** (C2) | Largest throughput win at prompt length > 32; makes §10.2 metrics honest | L |
-| 7 | **IQ1–IQ4 / MXFP4 decoders** (C7) | Unlocks quantised checkpoints of MoE families that are already supported | M |
-| 8 | **mRoPE, fused `gate_up_exps`, sinks, clamped SwiGLU, SITU, GEGLU_ERF** (C9) | +18 models in five small kernels | M |
+| 7 | ~~**IQ1–IQ4 / MXFP4 decoders** (C7)~~ **done** | Unlocks quantised checkpoints of MoE families that are already supported | M |
+| 8 | **SITU, GEGLU_ERF** (C9 remainder) | The clamped SwiGLU half, `gate_up_exps`, sinks and the mRoPE primitive are done; these two activations are what is left of the +18 | S |
 | 9 | **One recurrent family** (delta-net or mamba) | +17 models, but introduces state, scan kernels and a new cache shape | XL |
 | 10 | **Sampling** (C6), **SWA cache** (C3), **per-expert tensors** (C8), **deepseek41/clamp rule** (C5) | Completeness of things already claimed | S–M |
 | 11 | **GPU backend** (§A Phase 2) | Required for every VRAM gate; unstarted | XL |

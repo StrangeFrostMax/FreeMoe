@@ -16,6 +16,7 @@
 // exactly the difference between a working loader and a wrong one.
 
 #include "fm/support.hpp"
+#include "fm/adapter.hpp"
 #include "fm/quant.hpp"
 #include "fm/tokenizer.hpp"
 
@@ -521,6 +522,36 @@ Json probe_model(const GGUFDocument &doc, const std::string &source_path) {
     if (tied_flag && tied_flag->b && doc.tensor_by_name.count("output.weight") != 0) {
         block("AMBIGUOUS_TIED_OUTPUT",
               "the file declares tied embeddings but also ships a separate output tensor");
+    }
+
+    // Adapter row + tags. The probe is what a user runs before `run`, so it has
+    // to name the row and the branch decisions in the same vocabulary the
+    // engine's own errors use.
+    {
+        Json adapter = Json::object();
+        adapter.set("id", "llama-family-v1");
+        if (const AdapterRow *row = adapter_row(arch)) {
+            adapter.set("arch", row->arch);
+            adapter.set("upstream_enum", row->upstream_enum ? row->upstream_enum : "");
+            adapter.set("graph", row->graph ? row->graph : "");
+            adapter.set("block", row->block ? row->block : "");
+        } else {
+            adapter.set("arch", arch);
+            adapter.set("upstream_enum", "");
+        }
+        // Branch tags need a ModelConfig, which does not exist for an unmapped
+        // architecture. Report the facts the probe already established instead
+        // of pretending to have resolved a block.
+        Json tags = Json::array();
+        tags.push(Json::string("arch=" + arch));
+        tags.push(Json::string(has_adapter ? "block=llama-family" : "block=unmapped"));
+        if (doc.tensor_by_name.count("blk.0.attn_sinks.weight") != 0) tags.push(Json::string("sinks=yes"));
+        if (doc.tensor_by_name.count("blk.0.rope_freqs.weight") != 0) tags.push(Json::string("rope_freqs=yes"));
+        if (doc.tensor_by_name.count("blk.0.attn_q_norm.weight") != 0)
+            tags.push(Json::string("qk_norm=per-head"));
+        if (doc.tensor_by_name.count("blk.0.ffn_gate_exps.weight") != 0) tags.push(Json::string("moe=stacked"));
+        adapter.set("tags", std::move(tags));
+        out.set("adapter", std::move(adapter));
     }
 
     const int64_t blocker_count = static_cast<int64_t>(blockers_count);

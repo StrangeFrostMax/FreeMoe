@@ -76,6 +76,9 @@ enum class TensorRole : uint32_t {
     FFN_DOWN,
     FFN_ROUTER,
     FFN_GATE_EXPS,
+    // Gate and up fused into one expert tensor ([hidden, 2*width] per expert,
+    // gate block first). cohere2moe, dots3note, gemma4 and deepseek3.2 use it.
+    FFN_GATE_UP_EXPS,
     FFN_UP_EXPS,
     FFN_DOWN_EXPS,
     // Optional per-projection biases. qwen2 and several descendants carry them.
@@ -138,6 +141,12 @@ struct TensorInfo {
     // files that already use canonical names; adapters may map a vendor name
     // onto it while `name` keeps the original.
     std::string canonical;
+    // Adapter tag for this tensor, in llama.cpp's vocabulary (`ATTN_Q`,
+    // `FFN_GATE_EXPS`, …). Populated when the adapter maps the tensor, so a
+    // failure names the same thing an upstream log would name.
+    std::string tag;
+    // The ggml operation this tensor feeds (`matmul`, `norm`, …), for reports.
+    std::string op;
     uint32_t block_size = 1;
     uint32_t block_bytes = 4;
     // False when the container declares a type this build has no geometry for.
@@ -227,8 +236,20 @@ struct ModelConfig {
     double logit_scale = 0.0;
     // gemma stores RMSNorm scales zero-centred: the effective scale is 1 + w.
     bool norm_add_one = false;
-    // "silu" (SwiGLU) or "gelu" (GeGLU). The two are not interchangeable.
+    // "silu" (SwiGLU), "gelu" (GeGLU), "swiglu-oai" (gpt-oss / minimax-m3: a
+    // clamped gate times a clamped-up-plus-one) or "silu-clamp" (deepseek4/4.1,
+    // glm5-next: silu(gate) clamped from above times a clamped up).
     std::string activation = "silu";
+    // Clamp bounds for the two clamped variants. 0 means "not clamped", which
+    // keeps every other family on the plain path.
+    double activation_limit = 0.0;
+    // `swiglu-oai` scales the sigmoid argument; 1.702 is the constant
+    // llama.cpp uses for gpt-oss and minimax-m3.
+    double activation_alpha = 0.0;
+    // Per-layer clamp for `silu-clamp`; empty means "use activation_limit".
+    std::vector<double> swiglu_clamp;
+    // Routed experts store gate and up in one tensor, gate block first.
+    bool fused_gate_up_exps = false;
     // gemma2/3 clamp attention scores and/or final logits through tanh.
     double attn_logit_softcap = 0.0;
     double final_logit_softcap = 0.0;
@@ -263,6 +284,17 @@ struct ModelConfig {
     // reads the keys, so the defaults are what a real checkpoint runs with.
     double rope_yarn_beta_fast = 32.0;
     double rope_yarn_beta_slow = 1.0;
+    // mRoPE: `{arch}.rope.dimension_sections`, four counts of rotary *pairs*
+    // assigned to the time, height, width and extra axes. llama.cpp enables
+    // mRoPE only when the first two are non-zero, so a file that carries the key
+    // with zeros still rotates normally.
+    std::array<uint32_t, 4> rope_sections = {0, 0, 0, 0};
+    // Two section layouts exist. The plain one assigns runs of pairs in order
+    // (MROPE); the interleaved one cycles t/t/y/x in triplets (IMROPE, qwen3-vl
+    // and qwen3.5). They differ only in which axis each pair reads its position
+    // from, so both are one switch here.
+    bool mrope = false;
+    bool mrope_interleaved = false;
     // Derived by `resolve_rope_scaling()` in src/rope.cpp; never read from the
     // file. `rope_freq_scale` keeps llama.cpp's direction (1/factor) so the two
     // implementations can be compared line by line.
@@ -313,6 +345,14 @@ struct ModelConfig {
     // experts are picked without changing their weights.
     std::string expert_gating = "softmax";
     bool expert_selection_bias = false;
+    // Floor added to the renormalisation denominator. llama.cpp clamps it to the
+    // smallest F16 normal (6.103515625e-5) except for deepseek4.1, which adds
+    // 1e-20 instead; the difference only shows when every selected weight is
+    // tiny, which is exactly the case a comparison would otherwise miss.
+    double expert_weights_epsilon = 6.103515625e-5;
+    // Rearm the epsilon above the sum rather than comparing with `> 0`: a
+    // denominator of zero is a router bug, not a reason to emit NaN.
+    bool expert_weights_epsilon_additive = false;
     uint32_t expert_groups = 0;
     uint32_t expert_groups_used = 0;
 

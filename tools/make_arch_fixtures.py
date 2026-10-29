@@ -186,8 +186,12 @@ def arch_tensors(spec: dict[str, Any]) -> list[TensorSpec]:
             ew = spec.get("expert_width", i)
             out += [
                 tensor(p + "ffn_gate_inp.weight", [h, experts], 0.12),
-                tensor(p + "ffn_gate_exps.weight", [h, ew, experts], 0.16),
-                tensor(p + "ffn_up_exps.weight", [h, ew, experts], 0.16),
+                # Fused layout: gate and up in one tensor, gate block first, which
+                # is the order ggml_swiglu splits in.
+                *([tensor(p + "ffn_gate_up_exps.weight", [h, 2 * ew, experts], 0.16)]
+                  if spec.get("fused_exps") else
+                  [tensor(p + "ffn_gate_exps.weight", [h, ew, experts], 0.16),
+                   tensor(p + "ffn_up_exps.weight", [h, ew, experts], 0.16)]),
                 tensor(p + "ffn_down_exps.weight", [ew, h, experts], 0.16),
             ]
             if spec.get("expert_bias"):
@@ -300,6 +304,14 @@ def arch_metadata(spec: dict[str, Any]) -> dict[str, tuple[Any, ...]]:
         if scaling.get("yarn_log_multiplier") is not None:
             md[f"{arch}.rope.scaling.yarn_log_multiplier"] = (
                 "f32", scaling["yarn_log_multiplier"])
+    if spec.get("rope_sections"):
+        # mRoPE section split, four counts of rotary pairs. llama.cpp only turns
+        # mRoPE on when the first two are non-zero.
+        md[f"{arch}.rope.dimension_sections"] = ("array_i32", list(spec["rope_sections"]))
+    if spec.get("swiglu_clamp"):
+        # Per-layer clamp bounds, the shape llama.cpp reads for deepseek4/4.1.
+        rows = spec["swiglu_clamp"]
+        md[f"{arch}.swiglu_clamp_exp"] = ("array_f32", [float(v) for v in rows])
     if spec.get("attn_softcap"):
         md[f"{arch}.attn_logit_softcapping"] = ("f32", spec["attn_softcap"])
     if spec.get("final_softcap"):
@@ -537,6 +549,48 @@ SPECS: list[dict[str, Any]] = [
         "kv_heads": 2,
         "rope_dim": SHAPE["head_dim"],
         "qkv_bias": True,
+    },
+    {
+        # Fused gate+up expert tensors: one tensor per layer instead of two, gate
+        # block first. The layout cohere2moe, dots3note, gemma4 and deepseek3.2
+        # use; the block is the existing stacked-expert MoE, so this fixture pins
+        # the residency/extent split rather than a family.
+        "slug": "qwen3moe-fused-up",
+        "arch": "qwen3moe",
+        "name": "FreeMoe synthetic qwen3moe with fused gate-up expert tensors",
+        "kv_heads": 2,
+        "rope_dim": SHAPE["head_dim"],
+        "qk_norm": True,
+        "experts": 4,
+        "expert_used": 2,
+        "fused_exps": True,
+    },
+    {
+        # Clamped SwiGLU with a per-layer bound (`swiglu_clamp_exp`): deepseek4/4.1
+        # and glm5-next square their activation this way. The fixture's bounds
+        # differ per layer and are small enough that the clamp actually binds.
+        "slug": "qwen3moe-clamp",
+        "arch": "qwen3moe",
+        "name": "FreeMoe synthetic qwen3moe with per-layer clamped SwiGLU",
+        "kv_heads": 2,
+        "rope_dim": SHAPE["head_dim"],
+        "qk_norm": True,
+        "experts": 4,
+        "expert_used": 2,
+        "layers": 3,
+        "swiglu_clamp": [0.7, 0.0, 1.3],
+    },
+    {
+        # mRoPE: the same glm4 block plus a section split. On a text prompt all
+        # four positions coincide, so the token stream must be unchanged; the
+        # fixture pins that the metadata is read, and the unit test pins the
+        # section assignment itself.
+        "slug": "glm4-mrope",
+        "arch": "glm4",
+        "name": "FreeMoe synthetic glm4 with mRoPE sections",
+        "kv_heads": 2,
+        "rope_dim": SHAPE["head_dim"],
+        "rope_sections": [2, 1, 1, 0],
     },
     {
         # SmolLM3: the standard llama block with every fourth layer's rotary step

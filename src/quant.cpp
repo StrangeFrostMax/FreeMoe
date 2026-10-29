@@ -9,6 +9,7 @@
 // type whose semantics are not implemented here.
 
 #include "fm/quant.hpp"
+#include "fm/quant_tables.hpp"
 
 #include <string>
 
@@ -69,6 +70,51 @@ void get_scale_min_k4(int j, const uint8_t *q, uint8_t *d, uint8_t *m) {
     }
 }
 
+uint32_t read_u32(const uint8_t *p) {
+    uint32_t v;
+    std::memcpy(&v, p, sizeof(v));
+    return v;
+}
+
+// E8M0 exponent -> float, halved. The halving is part of the format: MXFP4's
+// 4-value codes are stored doubled, so the scale absorbs the factor of two.
+float e8m0_to_fp32_half(uint8_t x) {
+    uint32_t bits;
+    if (x < 2) {
+        // 2^(-128) and 2^(-127) as denormals.
+        bits = 0x00200000u << x;
+    } else {
+        bits = static_cast<uint32_t>(x - 1) << 23;
+    }
+    float out;
+    std::memcpy(&out, &bits, sizeof(out));
+    return out;
+}
+
+// UE4M3 (unsigned, 4 exponent bits with bias 7, 3 mantissa bits), halved for the
+// same reason as MXFP4. 0x00 and 0x7F decode to zero.
+float ue4m3_to_fp32(uint8_t x) {
+    if (x == 0 || x == 0x7F) return 0.0f;
+    const int exponent = (x >> 3) & 0xF;
+    const int mantissa = x & 0x7;
+    const float raw = exponent == 0
+                          ? std::ldexp(static_cast<float>(mantissa), -9)
+                          : std::ldexp(1.0f + static_cast<float>(mantissa) / 8.0f, exponent - 7);
+    return raw * 0.5f;
+}
+
+// The 16 four-bit codes of the FP4 formats, in sign-magnitude order: the low
+// three bits are the magnitude index and bit 3 is the sign.
+const int8_t kvalues_fp4[16] = {0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12};
+
+// Grid lookup for the IQ formats. The grid entry is a packed little-endian word
+// whose bytes are the elements in order, so the entry is copied out and read as
+// bytes. It is copied into the caller's buffer rather than a shared one because
+// several decoders read two grid entries at once.
+void load_grid(uint64_t entry, uint8_t out[8]) { std::memcpy(out, &entry, 8); }
+
+void load_grid32(uint32_t entry, uint8_t out[4]) { std::memcpy(out, &entry, 4); }
+
 } // namespace
 
 float fp16_to_f32(uint16_t value) { return fp16_to_fp32(value); }
@@ -90,9 +136,23 @@ std::string quant_geometry_or_name(uint32_t type_id) {
 const QuantGeometry &quant_geometry(uint32_t type_id) {
     const auto &table = quantisation_table();
     auto it = table.find(type_id);
-    if (it == table.end())
+    if (it == table.end()) {
+        // Types that exist in a fork but not in the GGUF type table cannot be
+        // bounded without inventing a block layout, so they are refused by name
+        // rather than by number. A bare "unknown tensor type 36" sends the
+        // reader looking in the wrong place.
+        static const std::map<uint32_t, std::string> external = {
+            {36, "I2_S is bitnet.cpp's private ternary type and is not part of the GGUF "
+                 "type table; re-quantise the checkpoint to TQ1_0 or TQ2_0, which this "
+                 "build decodes"},
+        };
+        auto external_it = external.find(type_id);
+        if (external_it != external.end())
+            fail(ErrorCode::UNSUPPORTED_QUANTISATION,
+                 "tensor type " + std::to_string(type_id) + ": " + external_it->second);
         fail(ErrorCode::UNSUPPORTED_QUANTISATION,
              "unknown tensor type " + std::to_string(type_id));
+    }
     return it->second;
 }
 
@@ -309,17 +369,254 @@ void dequantize_block(uint32_t type_id, const uint8_t *src, float *dst) {
         }
         return;
     }
+
+    case 39: { // MXFP4: one E8M0 exponent byte, then 16 bytes of 4-bit codes
+        const float d = e8m0_to_fp32_half(src[0]);
+        const uint8_t *qs = src + 1;
+        for (int j = 0; j < 16; ++j) {
+            dst[j] = static_cast<float>(kvalues_fp4[qs[j] & 0x0F]) * d;
+            dst[j + 16] = static_cast<float>(kvalues_fp4[qs[j] >> 4]) * d;
+        }
+        return;
+    }
+    case 40: { // NVFP4: four UE4M3 sub-block scales, then 32 bytes of 4-bit codes
+        const uint8_t *qs = src + 4;
+        // 64 elements in four sub-blocks of 16, each with its own scale. The
+        // codes of a sub-block are split: the low nibbles come first, then the
+        // high ones, which is why both halves of the sub-block are written in
+        // one pass.
+        for (int s = 0; s < 4; ++s) {
+            const float d = ue4m3_to_fp32(src[s]);
+            float *out = dst + s * 16;
+            const uint8_t *sub = qs + s * 8;
+            for (int j = 0; j < 8; ++j) {
+                out[j] = static_cast<float>(kvalues_fp4[sub[j] & 0x0F]) * d;
+                out[j + 8] = static_cast<float>(kvalues_fp4[sub[j] >> 4]) * d;
+            }
+        }
+        return;
+    }
+    case 16: { // IQ2_XXS: 8 grid indices per 32-element block, sign bits in aux32[1]
+        const float d = fp16_to_fp32(read_u16(src));
+        const uint8_t *qs = src + 2;
+        int out = 0;
+        for (int ib32 = 0; ib32 < 8; ++ib32) {
+            // qs is an array of 16-bit words in the reference, so one 32-weight
+            // step advances it by four words -- eight bytes, not four.
+            const uint32_t aux0 = read_u32(qs + 8 * ib32);
+            const uint32_t aux1 = read_u32(qs + 8 * ib32 + 4);
+            uint8_t idx[4];
+            std::memcpy(idx, &aux0, sizeof(idx));
+            // The scale is a 4-bit value in the top nibble of the second word,
+            // offset by 0.5 so it cannot collapse to zero.
+            const float db = d * (0.5f + static_cast<float>(aux1 >> 28)) * 0.25f;
+            for (int l = 0; l < 4; ++l) {
+                uint8_t grid[8];
+                load_grid(iq2xxs_grid[idx[l]], grid);
+                const uint8_t signs = ksigns_iq2xs[(aux1 >> (7 * l)) & 127];
+                for (int j = 0; j < 8; ++j) {
+                    const float v = db * static_cast<float>(grid[j]);
+                    dst[out++] = (signs & kmask_iq2xs[j]) ? -v : v;
+                }
+            }
+        }
+        return;
+    }
+    case 17: { // IQ2_XS: 9-bit grid index and 7-bit sign index per 8 weights
+        const float d = fp16_to_fp32(read_u16(src));
+        const uint8_t *qs = src + 2;
+        const uint8_t *scales = qs + 64;
+        int out = 0;
+        for (int ib32 = 0; ib32 < 8; ++ib32) {
+            const float db[2] = {d * (0.5f + static_cast<float>(scales[ib32] & 0x0F)) * 0.25f,
+                                 d * (0.5f + static_cast<float>(scales[ib32] >> 4)) * 0.25f};
+            for (int l = 0; l < 4; ++l) {
+                const uint16_t code = read_u16(qs + 2 * (4 * ib32 + l));
+                uint8_t grid[8];
+                load_grid(iq2xs_grid[code & 511], grid);
+                const uint8_t signs = ksigns_iq2xs[code >> 9];
+                for (int j = 0; j < 8; ++j) {
+                    const float v = db[l / 2] * static_cast<float>(grid[j]);
+                    dst[out++] = (signs & kmask_iq2xs[j]) ? -v : v;
+                }
+            }
+        }
+        return;
+    }
+    case 22: { // IQ2_S: 10-bit grid index split between qs and qh, explicit signs
+        const float d = fp16_to_fp32(read_u16(src));
+        const uint8_t *qs = src + 2;             // 64 bytes, first half is indices
+        const uint8_t *qh = qs + 64;             // 2 extra index bits per sub-block
+        const uint8_t *scales = qh + 8;
+        const uint8_t *signs = qs + 32;          // sign bytes live in the upper qs half
+        int out = 0;
+        for (int ib32 = 0; ib32 < 8; ++ib32) {
+            const float db[2] = {d * (0.5f + static_cast<float>(scales[ib32] & 0x0F)) * 0.25f,
+                                 d * (0.5f + static_cast<float>(scales[ib32] >> 4)) * 0.25f};
+            for (int l = 0; l < 4; ++l) {
+                const uint32_t index = static_cast<uint32_t>(qs[4 * ib32 + l]) |
+                                       ((static_cast<uint32_t>(qh[ib32]) << (8 - 2 * l)) & 0x300u);
+                uint8_t grid[8];
+                load_grid(iq2s_grid[index], grid);
+                const uint8_t sign = signs[4 * ib32 + l];
+                for (int j = 0; j < 8; ++j) {
+                    const float v = db[l / 2] * static_cast<float>(grid[j]);
+                    dst[out++] = (sign & kmask_iq2xs[j]) ? -v : v;
+                }
+            }
+        }
+        return;
+    }
+    case 18: { // IQ3_XXS: two 8-bit grid indices per 8 weights, 4-byte scale+sign words
+        const float d = fp16_to_fp32(read_u16(src));
+        const uint8_t *qs = src + 2;             // 64 index bytes then 32 words
+        const uint8_t *scales_and_signs = qs + 64;
+        int out = 0;
+        for (int ib32 = 0; ib32 < 8; ++ib32) {
+            const uint32_t aux = read_u32(scales_and_signs + 4 * ib32);
+            const float db = d * (0.5f + static_cast<float>(aux >> 28)) * 0.5f;
+            for (int l = 0; l < 4; ++l) {
+                const uint8_t signs = ksigns_iq2xs[(aux >> (7 * l)) & 127];
+                uint8_t grid1[4];
+                uint8_t grid2[4];
+                load_grid32(iq3xxs_grid[qs[8 * ib32 + 2 * l]], grid1);
+                load_grid32(iq3xxs_grid[qs[8 * ib32 + 2 * l + 1]], grid2);
+                for (int j = 0; j < 4; ++j) {
+                    const float v0 = db * static_cast<float>(grid1[j]);
+                    const float v1 = db * static_cast<float>(grid2[j]);
+                    dst[out + j] = (signs & kmask_iq2xs[j]) ? -v0 : v0;
+                    dst[out + j + 4] = (signs & kmask_iq2xs[j + 4]) ? -v1 : v1;
+                }
+                out += 8;
+            }
+        }
+        return;
+    }
+    case 21: { // IQ3_S: 9-bit grid indices (qh supplies the 9th bit), 4-bit scales
+        const float d = fp16_to_fp32(read_u16(src));
+        const uint8_t *qs = src + 2;             // 64 index bytes
+        const uint8_t *qh = qs + 64;             // 8 high-bit bytes
+        const uint8_t *signs = qh + 8;           // 32 sign bytes
+        const uint8_t *scales = signs + 32;      // 4 packed scale bytes
+        int out = 0;
+        for (int ib32 = 0; ib32 < 8; ib32 += 2) {
+            const float db[2] = {d * (1.0f + 2.0f * static_cast<float>(scales[ib32 / 2] & 0x0F)),
+                                 d * (1.0f + 2.0f * static_cast<float>(scales[ib32 / 2] >> 4))};
+            for (int half = 0; half < 2; ++half) {
+                const uint8_t high = qh[ib32 / 2 * 2 + half];
+                const uint8_t *sg = signs + (ib32 / 2 * 2 + half) * 4;
+                for (int l = 0; l < 4; ++l) {
+                    const uint32_t i1 = static_cast<uint32_t>(qs[2 * l]) |
+                                        ((static_cast<uint32_t>(high) << (8 - 2 * l)) & 256u);
+                    const uint32_t i2 = static_cast<uint32_t>(qs[2 * l + 1]) |
+                                        ((static_cast<uint32_t>(high) << (7 - 2 * l)) & 256u);
+                    uint8_t grid1[4];
+                    uint8_t grid2[4];
+                    load_grid32(iq3s_grid[i1], grid1);
+                    load_grid32(iq3s_grid[i2], grid2);
+                    for (int j = 0; j < 4; ++j) {
+                        const float v0 = db[half] * static_cast<float>(grid1[j]);
+                        const float v1 = db[half] * static_cast<float>(grid2[j]);
+                        dst[out + j] = (sg[l] & kmask_iq2xs[j]) ? -v0 : v0;
+                        dst[out + j + 4] = (sg[l] & kmask_iq2xs[j + 4]) ? -v1 : v1;
+                    }
+                    out += 8;
+                }
+                qs += 8;
+            }
+        }
+        return;
+    }
+    case 19: { // IQ1_S: 11-bit grid index, 3-bit scale, one delta bit per block
+        const float d = fp16_to_fp32(read_u16(src));
+        const uint8_t *qs = src + 2;             // 32 index bytes
+        const uint8_t *qh_bytes = qs + 32;       // 8 uint16: high index bits, scale, sign
+        int out = 0;
+        for (int ib = 0; ib < 8; ++ib) {
+            const uint16_t h = read_u16(qh_bytes + 2 * ib);
+            const float dl = d * (2.0f * static_cast<float>((h >> 12) & 7) + 1.0f);
+            // The delta is a fixed offset applied to every weight of the block,
+            // not a per-weight sign: that is what makes 1-bit grids usable.
+            const float delta = (h & 0x8000) ? -0.125f : 0.125f;
+            for (int l = 0; l < 4; ++l) {
+                const uint32_t index = static_cast<uint32_t>(qs[4 * ib + l]) |
+                                       ((static_cast<uint32_t>(h >> (3 * l)) & 7u) << 8);
+                int8_t grid[8];
+                load_grid(iq1s_grid[index], reinterpret_cast<uint8_t *>(grid));
+                for (int j = 0; j < 8; ++j) {
+                    dst[out++] = dl * (static_cast<float>(grid[j]) + delta);
+                }
+            }
+        }
+        return;
+    }
+    case 29: { // IQ1_M: the scale itself is packed across the four scale words
+        const uint8_t *qs = src;                  // 32 index bytes
+        const uint8_t *qh = qs + 32;              // 16 bytes: high index bits, deltas
+        const uint8_t *sc_bytes = qh + 16;        // 8 bytes read as four uint16
+        uint16_t sc[4];
+        for (int i = 0; i < 4; ++i) sc[i] = read_u16(sc_bytes + 2 * i);
+        // The fp16 scale is assembled bit by bit from the four words; it is not
+        // stored contiguously, which is easy to miss and produces garbage scales.
+        const uint16_t scale_bits = static_cast<uint16_t>((sc[0] >> 12) | ((sc[1] >> 8) & 0x00F0) |
+                                                          ((sc[2] >> 4) & 0x0F00) | (sc[3] & 0xF000));
+        const float d = fp16_to_fp32(scale_bits);
+        int out = 0;
+        for (int ib = 0; ib < 8; ++ib) {
+            const uint16_t s = sc[ib / 2];
+            const float dl1 = d * (2.0f * static_cast<float>((s >> (6 * (ib % 2))) & 7) + 1.0f);
+            const float dl2 = d * (2.0f * static_cast<float>((s >> (6 * (ib % 2) + 3)) & 7) + 1.0f);
+            const uint8_t *q = qs + 4 * ib;
+            const uint8_t *h = qh + 2 * ib;
+            const uint32_t idx[4] = {
+                static_cast<uint32_t>(q[0]) | ((static_cast<uint32_t>(h[0]) << 8) & 0x700u),
+                static_cast<uint32_t>(q[1]) | ((static_cast<uint32_t>(h[0]) << 4) & 0x700u),
+                static_cast<uint32_t>(q[2]) | ((static_cast<uint32_t>(h[1]) << 8) & 0x700u),
+                static_cast<uint32_t>(q[3]) | ((static_cast<uint32_t>(h[1]) << 4) & 0x700u),
+            };
+            const float delta[4] = {(h[0] & 0x08) ? -0.125f : 0.125f,
+                                    (h[0] & 0x80) ? -0.125f : 0.125f,
+                                    (h[1] & 0x08) ? -0.125f : 0.125f,
+                                    (h[1] & 0x80) ? -0.125f : 0.125f};
+            for (int l = 0; l < 4; ++l) {
+                int8_t grid[8];
+                load_grid(iq1s_grid[idx[l]], reinterpret_cast<uint8_t *>(grid));
+                const float dl = l < 2 ? dl1 : dl2;
+                for (int j = 0; j < 8; ++j) {
+                    dst[out++] = dl * (static_cast<float>(grid[j]) + delta[l]);
+                }
+            }
+        }
+        return;
+    }
+    case 23: { // IQ4_XS: 6-bit signed scales across two arrays, non-linear 4-bit codes
+        const float d = fp16_to_fp32(read_u16(src));
+        const uint16_t scales_h = read_u16(src + 2);
+        const uint8_t *scales_l = src + 4;
+        const uint8_t *qs = scales_l + 4;
+        int out = 0;
+        for (int ib = 0; ib < 8; ++ib) {
+            const int low = (scales_l[ib / 2] >> (4 * (ib % 2))) & 0x0F;
+            const int high = (scales_h >> (2 * ib)) & 3;
+            const float dl = d * static_cast<float>((low | (high << 4)) - 32);
+            for (int j = 0; j < 16; ++j) {
+                dst[out + j] = dl * static_cast<float>(kvalues_iq4nl[qs[j] & 0x0F]);
+                dst[out + j + 16] = dl * static_cast<float>(kvalues_iq4nl[qs[j] >> 4]);
+            }
+            out += 32;
+            qs += 16;
+        }
+        return;
+    }
     case 20: { // IQ4_NL: half d, 16 bytes of nibbles indexing a non-linear table
         // Table from the format definition. The four-bit codes are not a linear
         // scale: they are indices into these signed values, so a linear
         // (q - 8) * d approximation would be wrong, not just imprecise.
-        static const int8_t kvalues[16] = {-127, -104, -83, -65, -49, -35, -22, -10,
-                                           1,    13,   25,  38,  53,  69,  89,  113};
         const float d = fp16_to_fp32(read_u16(src));
         const uint8_t *qs = src + 2;
         for (int j = 0; j < 16; ++j) {
-            dst[j] = d * static_cast<float>(kvalues[qs[j] & 0x0F]);
-            dst[j + 16] = d * static_cast<float>(kvalues[qs[j] >> 4]);
+            dst[j] = d * static_cast<float>(kvalues_iq4nl[qs[j] & 0x0F]);
+            dst[j + 16] = d * static_cast<float>(kvalues_iq4nl[qs[j] >> 4]);
         }
         return;
     }

@@ -5,6 +5,7 @@
 #include "fm/residency.hpp"
 #include "fm/quant.hpp"
 #include "fm/rope.hpp"
+#include "fm/adapter.hpp"
 #include "fm/support.hpp"
 #include "fm/tokenizer.hpp"
 #include "fm/unicode.hpp"
@@ -998,9 +999,18 @@ void test_generic_inspect_and_roundtrip() {
     CHECK(tensor_capability(1).execute, "F16 executes through the quantised GEMV");
     CHECK(tensor_capability(8).dequantize, "Q8_0 can be decoded");
     CHECK(tensor_capability(8).execute, "Q8_0 executes through the quantised GEMV");
-    CHECK(!tensor_capability(19).dequantize, "IQ-family types remain decode-unsupported");
+    // The IQ family and the FP4 formats all decode and execute now; the one
+    // remaining geometry-only type is PTQ1_0, whose layout has no verifiable
+    // reference.
+    for (uint32_t type_id : {16u, 17u, 18u, 19u, 21u, 22u, 23u, 29u, 39u, 40u}) {
+        CHECK(tensor_capability(type_id).dequantize,
+              "IQ/FP4 type decodes: " + std::to_string(type_id));
+        CHECK(tensor_capability(type_id).execute,
+              "IQ/FP4 type executes: " + std::to_string(type_id));
+    }
     CHECK(tensor_capability(14).dequantize, "Q6_K decoding is implemented");
-    CHECK(!tensor_capability(19).parse, "unknown type cannot be parsed");
+    CHECK(!tensor_capability(143).dequantize, "PTQ1_0 stays geometry-only");
+    CHECK(tensor_capability(143).parse, "a geometry-only type can still be parsed");
     CHECK(!tensor_capability(999).parse, "unknown tensor type is refused");
 
     // F16 dequantisation against exactly representable half values.
@@ -1036,12 +1046,20 @@ void test_generic_inspect_and_roundtrip() {
     }
     CHECK(throws_code(ErrorCode::UNSUPPORTED_QUANTISATION,
                       []() {
-                          std::vector<uint8_t> block(256, 0);
-                          float out[256];
-                          // Type 19 (IQ-family) has no decoder here.
-                          dequantize_row(19, block.data(), out, 256);
+                          std::vector<uint8_t> block(128, 0);
+                          float out[128];
+                          // PTQ1_0 has a known geometry but no verified layout.
+                          dequantize_row(143, block.data(), out, 128);
                       }),
-          "unimplemented block decoder is a typed error");
+          "geometry-only block decoder is a typed error");
+    CHECK(throws_code(ErrorCode::UNSUPPORTED_QUANTISATION,
+                      []() {
+                          std::vector<uint8_t> block(64, 0);
+                          float out[64];
+                          // I2_S is bitnet.cpp's private type, refused by name.
+                          dequantize_row(36, block.data(), out, 64);
+                      }),
+          "a fork-only quantisation type is named in the error");
 
     // The quantised fixture must now report dequantise-and-execute capability
     // through the generic view, proving the matrix is wired to real files.
@@ -1068,7 +1086,9 @@ void test_quant_reference_decode() {
     CHECK(std::memcmp(bytes.data(), "FMQR1", 5) == 0, "quant reference magic");
     uint32_t records = 0;
     std::memcpy(&records, bytes.data() + 8, sizeof(records));
-    CHECK(records == 26, "quant reference covers every supported block type");
+    // One record per block type in the fixture, including the IQ family, the
+    // FP4 formats and the element types.
+    CHECK(records == 36, "quant reference covers every supported block type");
 
     size_t pos = 12;
     uint32_t decoded_types = 0;
@@ -1398,7 +1418,8 @@ void test_quant_gemv() {
                       [&]() { gemv_quant(cfg, 99, junk.data(), x32.data(), y9.data(), 9, 32); }),
           "unknown quantised type is a typed error");
     CHECK(!kernel_supports_type(99), "unknown type has no kernel");
-    CHECK(!kernel_supports_type(19), "unimplemented type reports no kernel");
+    CHECK(!kernel_supports_type(143), "geometry-only type reports no kernel");
+    CHECK(kernel_supports_type(39), "MXFP4 has a kernel");
 }
 
 void test_cpu_kernels() {
@@ -2143,6 +2164,96 @@ ArchGolden read_arch_golden(const std::string &path) {
 // still produces logits" is not evidence: a wrong ramp produces fluent text.
 // These checks pin the formulas against values computed from ggml's definitions
 // by hand, and then confirm the fixture's raw metadata reaches the config.
+// mRoPE: which axis each rotary pair reads its position from. A text-only
+// prompt has one position on all four axes, so nothing else in the suite can
+// catch a wrong split -- the sections have to be checked directly.
+void test_rope_mrope() {
+    ModelConfig cfg;
+    cfg.rope_theta = 10000.0;
+    cfg.rope_freq_scale = 1.0;
+    cfg.rope_mscale = 1.0;
+    cfg.rope_sections = {4, 2, 2, 0};
+    cfg.mrope = true;
+    cfg.mrope_interleaved = false;
+
+    RopePlan plan;
+    plan.init(cfg, 32);
+    CHECK(plan.axis_of(0) == 0, "the first section is the time axis");
+    CHECK(plan.axis_of(3) == 0, "the time section is four pairs wide");
+    CHECK(plan.axis_of(4) == 1, "the height section follows");
+    CHECK(plan.axis_of(5) == 1, "the height section is two pairs wide");
+    CHECK(plan.axis_of(6) == 2, "the width section follows");
+    CHECK(plan.axis_of(7) == 2, "the width section is two pairs wide");
+    // The pattern repeats every sum(sections) pairs, so pair 8 starts over.
+    CHECK(plan.axis_of(8) == 0, "the section pattern repeats");
+    CHECK(plan.axis_of(12) == 1, "the repeat lands on the same axes");
+    // A non-zero fourth section is the extra axis (text and vision embeddings
+    // that need a fourth coordinate).
+    ModelConfig extra_cfg = cfg;
+    extra_cfg.rope_sections = {4, 2, 2, 1};
+    RopePlan extra;
+    extra.init(extra_cfg, 32);
+    CHECK(extra.axis_of(8) == 3, "the extra axis takes the leftover pairs");
+
+    // Interleaved layout: the axes cycle t/y/x within each triplet, and a pair
+    // whose axis has run out of its 3*count budget falls through to the extra
+    // axis. With sections {4,2,2,0} the height and width budgets end at six
+    // pairs, so the seventh pair of the pattern is the extra axis.
+    cfg.mrope_interleaved = true;
+    cfg.rope_sections = {4, 2, 2, 0};
+    RopePlan inter;
+    inter.init(cfg, 32);
+    const std::vector<uint32_t> expected = {0, 1, 2, 0, 1, 2, 0, 3};
+    bool matches = true;
+    for (uint32_t pair = 0; pair < expected.size(); ++pair)
+        if (inter.axis_of(pair) != expected[pair]) matches = false;
+    CHECK(matches, "interleaved sections cycle t/y/x and spill into the extra axis");
+
+    // Four equal positions must reproduce the scalar rotation exactly: that is
+    // what keeps the text path identical to a non-mRoPE model.
+    RopePlan plain;
+    ModelConfig plain_cfg = cfg;
+    plain_cfg.rope_sections = {0, 0, 0, 0};
+    plain_cfg.mrope = false;
+    plain.init(plain_cfg, 32);
+    const std::array<double, 4> same = {7.0, 7.0, 7.0, 7.0};
+    bool identical = true;
+    for (uint32_t pair = 0; pair < rope_pairs(32); ++pair) {
+        double c0 = 0.0, s0 = 0.0, c1 = 0.0, s1 = 0.0;
+        plain.rotation(pair, 7.0, c0, s0);
+        plan.rotation(pair, same, c1, s1);
+        if (std::fabs(c0 - c1) > 1e-12 || std::fabs(s0 - s1) > 1e-12) identical = false;
+    }
+    CHECK(identical, "equal mRoPE positions reproduce plain rotary");
+
+    // Distinct positions must actually change the pair, or the axis selection
+    // above would be decoration.
+    const std::array<double, 4> distinct = {0.0, 10.0, 20.0, 30.0};
+    double c0 = 0.0, s0 = 0.0, c1 = 0.0, s1 = 0.0;
+    plan.rotation(0, distinct, c0, s0);   // axis 0 -> position 0
+    plan.rotation(4, distinct, c1, s1);   // axis 1 -> position 10
+    CHECK(std::fabs(c0 - 1.0) < 1e-12 && std::fabs(s0) < 1e-12,
+          "a zero time position leaves the first pair unrotated");
+    // Pair 4 keeps its own frequency, so the angle is position times that
+    // frequency -- the section changes the position, never the frequency.
+    const double theta4 = std::pow(10000.0, -(2.0 * 4.0) / 32.0);
+    CHECK(std::fabs(c1 - std::cos(10.0 * theta4)) < 1e-12,
+          "the height axis rotates by its own position at its own frequency");
+
+    // A section split wider than the head is refused rather than truncated.
+    const std::string path = "tests/fixtures/glm4-mrope-shape.gguf";
+    const ModelManifest manifest = build_manifest(parse_gguf_file(path), path);
+    CHECK(manifest.config.mrope, "the fixture's sections enable mRoPE");
+    CHECK(!manifest.config.mrope_interleaved, "glm4 uses the plain section layout");
+    const std::array<uint32_t, 4> expected_sections = {2, 1, 1, 0};
+    CHECK(manifest.config.rope_sections == expected_sections,
+          "the fixture's sections are read verbatim");
+    CHECK(manifest.config.rope_sections[0] + manifest.config.rope_sections[1] +
+                  manifest.config.rope_sections[2] + manifest.config.rope_sections[3] <=
+              manifest.config.head_dim / 2,
+          "the fixture's sections fit inside the head");
+}
+
 void test_rope_scaling() {
     // ggml's correction-dim solve for a 8-dim rotation over a 64-token context:
     // start clamps to 0 (the fast knee is negative) and end rounds to 2, so
@@ -2325,6 +2436,149 @@ void test_rope_scaling() {
 // the value sum never reads it. Parity alone would catch a missing sink, but not
 // a sink read from the wrong head or applied to the wrong head count, so the
 // dimensions and the all-layers rule are checked directly here.
+// Adapter rows and tags. The point of the tags is that a failure names the same
+// thing llama.cpp would name, so these checks pin the vocabulary rather than
+// just the plumbing.
+// The primitives that change what the feed-forward computes, and the expert
+// layout that changes where its weights live. Parity covers the arithmetic; these
+// checks pin the plumbing so a fixture cannot pass for the wrong reason.
+void test_ffn_variants() {
+    // Fused gate+up experts: both extents point inside one tensor, and the up
+    // extent starts exactly where the gate extent ends.
+    {
+        const std::string path = "tests/fixtures/qwen3moe-fused-up-shape.gguf";
+        const ModelManifest manifest = build_manifest(parse_gguf_file(path), path);
+        CHECK(manifest.config.fused_gate_up_exps, "the fused expert layout is detected");
+        CHECK(manifest.tensor("blk.0.ffn_gate_exps.weight") == nullptr,
+              "the separate gate tensor is absent in a fused checkpoint");
+        CHECK(manifest.tensor("blk.0.ffn_gate_up_exps.weight") != nullptr,
+              "the fused tensor is mapped");
+        const ExpertRecord *expert = manifest.expert(0, 0);
+        CHECK(expert != nullptr, "expert 0 of layer 0 has a record");
+        if (expert) {
+            const ExpertExtent &gate = expert->extents[0];
+            const ExpertExtent &up = expert->extents[1];
+            CHECK(up.offset == gate.offset + gate.bytes,
+                  "the up half begins where the gate half ends");
+            CHECK(gate.role == TensorRole::FFN_GATE_EXPS && up.role == TensorRole::FFN_UP_EXPS,
+                  "the two halves keep their own roles");
+            const TensorInfo *fused = manifest.tensor("blk.0.ffn_gate_up_exps.weight");
+            CHECK(fused && fused->byte_size / manifest.config.expert_count ==
+                               gate.bytes + up.bytes,
+                  "gate plus up covers exactly one expert's slice");
+        }
+        // A file carrying both layouts is ambiguous, not "prefer one".
+        GGUFDocument doc = parse_gguf_file(path);
+        GGUFDocument ambiguous = doc;
+        MetadataValue name;
+        name.type = GGUFValueType::STRING;
+        name.s = "blk.0.ffn_gate_exps.weight";
+        TensorInfo phantom = doc.tensors[0];
+        phantom.name = name.s;
+        ambiguous.tensors.push_back(phantom);
+        ambiguous.tensor_by_name[name.s] = ambiguous.tensors.size() - 1;
+        CHECK(throws_code(ErrorCode::METADATA_MISMATCH,
+                          [&]() { (void)build_manifest(ambiguous, path); }),
+              "both expert layouts present is a typed error");
+    }
+    // Clamped SwiGLU: the per-layer bounds reach the config unchanged, including
+    // the zero that means "this layer is not clamped".
+    {
+        const std::string path = "tests/fixtures/qwen3moe-clamp-shape.gguf";
+        const ModelManifest manifest = build_manifest(parse_gguf_file(path), path);
+        CHECK(manifest.config.activation == "silu-clamp",
+              "swiglu_clamp_exp selects the clamped variant");
+        CHECK(manifest.config.swiglu_clamp.size() == manifest.config.layers,
+              "one bound per layer is read");
+        if (manifest.config.swiglu_clamp.size() >= 3) {
+            CHECK(std::fabs(manifest.config.swiglu_clamp[0] - 0.7) < 1e-6,
+                  "the first layer's bound is read");
+            CHECK(manifest.config.swiglu_clamp[1] == 0.0,
+                  "a zero bound means that layer is not clamped, not 'use the max'");
+            CHECK(std::fabs(manifest.config.swiglu_clamp[2] - 1.3) < 1e-6,
+                  "the third layer's bound is read");
+        }
+        const std::vector<std::string> tags = adapter_config_tags(manifest.config);
+        CHECK(std::find(tags.begin(), tags.end(), "ffn=silu-clamp") != tags.end(),
+              "the clamped activation is tagged");
+        // Without the metadata the plain path must be selected.
+        const std::string plain = "tests/fixtures/qwen3moe-shape.gguf";
+        const ModelManifest plain_manifest = build_manifest(parse_gguf_file(plain), plain);
+        CHECK(plain_manifest.config.activation == "silu" &&
+                  plain_manifest.config.swiglu_clamp.empty(),
+              "a checkpoint without clamp metadata keeps plain silu");
+    }
+    // Router denominator: the F16-normal clamp by default, 1e-20 additive for
+    // deepseek4.1. Getting this wrong only shows when every selected weight is
+    // tiny, which is why it is asserted rather than assumed.
+    {
+        const std::string path = "tests/fixtures/qwen3moe-shape.gguf";
+        const ModelManifest manifest = build_manifest(parse_gguf_file(path), path);
+        CHECK(std::fabs(manifest.config.expert_weights_epsilon - 6.103515625e-5) < 1e-12,
+              "the default router denominator floor is the smallest F16 normal");
+        CHECK(!manifest.config.expert_weights_epsilon_additive,
+              "the default rule clamps rather than adds");
+    }
+}
+
+void test_adapter_tags() {
+    // Every architecture the adapter claims has a row with an upstream enum, so
+    // an error can be traced to one file in llama.cpp.
+    int rows = 0;
+    for (const AdapterRow &row : adapter_rows()) {
+        ++rows;
+        CHECK(row.arch != nullptr && *row.arch != '\0', "every adapter row names its architecture");
+        CHECK(row.upstream_enum != nullptr && *row.upstream_enum != '\0',
+              std::string("every adapter row names its upstream enum: ") + row.arch);
+        CHECK(adapter_row(row.arch) != nullptr, "the row is findable by its own name");
+    }
+    CHECK(rows >= 20, "the adapter catalogue is populated");
+    CHECK(adapter_row("not-a-real-arch") == nullptr,
+          "an unknown architecture has no row rather than a default");
+
+    // llama.cpp's vocabulary for the roles that differ from the internal name.
+    CHECK(std::string(adapter_tensor_tag(TensorRole::ATTN_OUTPUT)) == "ATTN_OUT",
+          "attn_output is tagged ATTN_OUT, as upstream names it");
+    CHECK(std::string(adapter_tensor_tag(TensorRole::FFN_ROUTER)) == "FFN_GATE_INP",
+          "the router is tagged FFN_GATE_INP, as upstream names it");
+    CHECK(std::string(adapter_tensor_tag(TensorRole::FFN_GATE_EXPS)) == "FFN_GATE_EXPS",
+          "expert tensors keep their upstream names");
+
+    // A mapped checkpoint carries a tag per tensor and a tag per branch decision.
+    const std::string path = "tests/fixtures/llama-sinks-shape.gguf";
+    const ModelManifest manifest = build_manifest(parse_gguf_file(path), path);
+    CHECK(!manifest.tensor("blk.0.attn_q.weight")->tag.empty(),
+          "a mapped tensor carries an adapter tag");
+    CHECK(manifest.tensor("blk.0.attn_sinks.weight")->tag == "ATTN_SINKS",
+          "the sink tensor is tagged ATTN_SINKS");
+    CHECK(manifest.tensor("blk.0.attn_output.weight")->tag == "ATTN_OUT",
+          "the output projection reports upstream's tag");
+    const std::vector<std::string> tags = adapter_config_tags(manifest.config);
+    auto has = [&tags](const std::string &needle) {
+        return std::find(tags.begin(), tags.end(), needle) != tags.end();
+    };
+    CHECK(has("arch=llama"), "the branch tags name the architecture");
+    CHECK(has("upstream=LLM_ARCH_LLAMA"), "the branch tags name the upstream enum");
+    CHECK(has("attn=gqa"), "grouped-query attention is tagged");
+    CHECK(has("sinks=yes"), "enabled sinks are tagged");
+    CHECK(has("rope=full") && has("norm=rmsnorm") && has("ffn=silu"),
+          "rotary, norm and activation are all tagged");
+    // A checkpoint without a feature must not claim it.
+    const std::string plain_path = "tests/fixtures/llama-gqa-shape.gguf";
+    const ModelManifest plain = build_manifest(parse_gguf_file(plain_path), plain_path);
+    const std::vector<std::string> plain_tags = adapter_config_tags(plain.config);
+    CHECK(std::find(plain_tags.begin(), plain_tags.end(), "sinks=yes") == plain_tags.end(),
+          "a checkpoint without sinks is not tagged as having them");
+    // The MoE tags appear only where the router exists.
+    const std::string moe_path = "tests/fixtures/qwen3moe-shape.gguf";
+    const ModelManifest moe = build_manifest(parse_gguf_file(moe_path), moe_path);
+    const std::vector<std::string> moe_tags = adapter_config_tags(moe.config);
+    CHECK(std::find(moe_tags.begin(), moe_tags.end(), "moe=stacked") != moe_tags.end(),
+          "stacked-expert MoE is tagged");
+    CHECK(std::find(moe_tags.begin(), moe_tags.end(), "qk_norm=per-head") != moe_tags.end(),
+          "per-head q/k norm is tagged");
+}
+
 void test_attention_sinks() {
     const std::string path = "tests/fixtures/llama-sinks-shape.gguf";
     const GGUFDocument doc = parse_gguf_file(path);
@@ -2354,7 +2608,9 @@ void test_architecture_parity() {
                                            "glm4", "qwen2moe", "phi2-layernorm",
                                            "deepseek2-mla", "internlm2", "exaone", "orion",
                                            "gptneox", "stablelm", "llama-yarn", "qwen2-linear",
-                                           "llama-yarn-mscale", "llama-sinks", "llama-ropfreqs", "smollm3-nope"};
+                                           "llama-yarn-mscale", "llama-sinks", "llama-ropfreqs", "smollm3-nope",
+                                           "qwen3moe-fused-up", "qwen3moe-clamp",
+                                           "glm4-mrope"};
     for (const std::string &slug : slugs) {
         const std::string model = "tests/fixtures/" + slug + "-shape.gguf";
         ArchGolden golden = read_arch_golden("tests/golden/" + slug + "_reference.txt");
@@ -2935,7 +3191,10 @@ int main(int argc, char **argv) {
     maybe_run("tokenizer_sentencepiece", test_tokenizer_sentencepiece);
     maybe_run("unicode_classes", test_unicode_classes);
     maybe_run("model_map_and_tied_output", test_model_map_and_tied_output);
+    maybe_run("rope_mrope", test_rope_mrope);
     maybe_run("rope_scaling", test_rope_scaling);
+    maybe_run("ffn_variants", test_ffn_variants);
+    maybe_run("adapter_tags", test_adapter_tags);
     maybe_run("attention_sinks", test_attention_sinks);
     maybe_run("architecture_parity", test_architecture_parity);
     maybe_run("rotated_and_ternary_blockers", test_rotated_and_ternary_blockers);
