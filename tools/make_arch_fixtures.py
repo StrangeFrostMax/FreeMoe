@@ -84,12 +84,58 @@ def tokenizer_tokens() -> list[str]:
 def arch_tensors(spec: dict[str, Any]) -> list[TensorSpec]:
     h, i, layers = spec["hidden"], spec["intermediate"], spec["layers"]
     heads, hd = spec["heads"], spec["head_dim"]
-    kv_heads = spec["kv_heads"]
+    kv_heads = spec.get("kv_heads", heads)
     kv_dim = kv_heads * hd
     out = [tensor("token_embd.weight", [h, V], 0.35)]
     for layer in range(layers):
         p = f"blk.{layer}."
         out += [tensor(p + "attn_norm.weight", [h], 0.0, norm=True)]
+        if spec.get("ssm"):
+            # llama.cpp's mamba block: no attention, and a pure file has no
+            # feed-forward either. The A and D tensors carry no ".weight" suffix
+            # upstream, so they are written bare here too.
+            inner = spec["ssm_inner"]
+            d_state = spec["ssm_state"]
+            d_conv = spec["ssm_conv"]
+            groups = spec.get("ssm_groups", 1)
+            mamba2 = spec["ssm"] == "mamba2"
+            channels = inner + 2 * groups * d_state if mamba2 else inner
+            dt_rank = spec["ssm_dt_rank"]
+            in_dim = inner + channels + dt_rank if mamba2 else 2 * inner
+            out += [
+                tensor(p + "ssm_in.weight", [h, in_dim], 0.16),
+                tensor(p + "ssm_conv1d.weight", [d_conv, channels], 0.30),
+                tensor(p + "ssm_conv1d.bias", [channels], 0.05),
+                # A is negative in a real checkpoint (it is a decay), which the
+                # scan multiplies by softplus(dt); a positive one would diverge.
+                tensor(p + "ssm_a", [1, dt_rank] if mamba2 else [d_state, inner], -0.20),
+                tensor(p + "ssm_d", [1, dt_rank] if mamba2 else [inner], 0.10),
+                tensor(p + "ssm_out.weight", [inner, h], 0.16),
+            ]
+            if mamba2:
+                out += [
+                    tensor(p + "ssm_dt.bias", [dt_rank], 0.05),
+                    tensor(p + "ssm_norm.weight", [inner // groups, groups], 0.0, norm=True),
+                ]
+            else:
+                out += [
+                    tensor(p + "ssm_x.weight", [inner, dt_rank + 2 * d_state], 0.16),
+                    tensor(p + "ssm_dt.weight", [dt_rank, inner], 0.16),
+                    tensor(p + "ssm_dt.bias", [inner], 0.05),
+                ]
+            if spec.get("ssm_vector_norms"):
+                # falcon-mamba / jamba: RMS norms on dt, B and C before the scan.
+                for suffix, width in (("ssm_dt_norm", dt_rank), ("ssm_b_norm", d_state),
+                                      ("ssm_c_norm", d_state)):
+                    out += [tensor(p + suffix + ".weight", [width], 0.0, norm=True)]
+            if spec.get("ssm_ffn"):
+                out += [
+                    tensor(p + "ffn_norm.weight", [h], 0.0, norm=True),
+                    tensor(p + "ffn_gate.weight", [h, i], 0.16),
+                    tensor(p + "ffn_up.weight", [h, i], 0.16),
+                    tensor(p + "ffn_down.weight", [i, h], 0.16),
+                ]
+            continue
         if spec.get("layernorm"):
             out += [tensor(p + "attn_norm.bias", [h], 0.05)]
         if spec.get("parallel_residual"):
@@ -290,17 +336,24 @@ def arch_metadata(spec: dict[str, Any]) -> dict[str, tuple[Any, ...]]:
         "general.quantization_version": ("u32", 1),
         f"{arch}.block_count": ("u32", spec["layers"]),
         f"{arch}.embedding_length": ("u32", h),
-        f"{arch}.feed_forward_length": ("u32", spec["intermediate"]),
-        f"{arch}.attention.head_count": ("u32", spec["heads"]),
-        f"{arch}.attention.head_count_kv": ("u32", spec["kv_heads"]),
-        f"{arch}.attention.key_length": ("u32", spec["head_dim"]),
-        f"{arch}.attention.value_length": ("u32", spec["head_dim"]),
+        # A pure state-space file states none of these: llama.cpp's mamba
+        # loader reads no head count, no feed-forward width and no rotary width,
+        # and writing them here would be a fixture that no real file resembles.
+        **({} if spec.get("ssm") else {
+            f"{arch}.feed_forward_length": ("u32", spec["intermediate"]),
+            f"{arch}.attention.head_count": ("u32", spec["heads"]),
+            f"{arch}.attention.head_count_kv": ("u32", spec["kv_heads"]),
+            f"{arch}.attention.key_length": ("u32", spec["head_dim"]),
+            f"{arch}.attention.value_length": ("u32", spec["head_dim"]),
+        }),
         # LayerNorm files declare a different epsilon key, and that key is what
         # the adapter uses as evidence for the norm type.
         (f"{arch}.attention.layer_norm_epsilon" if spec.get("layernorm")
          else f"{arch}.attention.layer_norm_rms_epsilon"): ("f32", 1e-5),
-        f"{arch}.rope.dimension_count": ("u32", spec["rope_dim"]),
-        f"{arch}.rope.freq_base": ("f32", 10000.0),
+        **({} if spec.get("ssm") else {
+            f"{arch}.rope.dimension_count": ("u32", spec["rope_dim"]),
+            f"{arch}.rope.freq_base": ("f32", 10000.0),
+        }),
         f"{arch}.context_length": ("u32", spec["context"]),
         f"{arch}.vocab_size": ("u32", V),
         "tokenizer.ggml.model": ("string", "freemoe.byte-v1"),
@@ -354,6 +407,15 @@ def arch_metadata(spec: dict[str, Any]) -> dict[str, tuple[Any, ...]]:
         # mRoPE section split, four counts of rotary pairs. llama.cpp only turns
         # mRoPE on when the first two are non-zero.
         md[f"{arch}.rope.dimension_sections"] = ("array_i32", list(spec["rope_sections"]))
+    if spec.get("ssm"):
+        md[f"{arch}.ssm.conv_kernel"] = ("u32", spec["ssm_conv"])
+        if spec.get("ssm_vector_norms"):
+            md[f"{arch}.ssm.dt_b_c_rms"] = ("bool", True)
+        md[f"{arch}.ssm.inner_size"] = ("u32", spec["ssm_inner"])
+        md[f"{arch}.ssm.state_size"] = ("u32", spec["ssm_state"])
+        md[f"{arch}.ssm.time_step_rank"] = ("u32", spec["ssm_dt_rank"])
+        if spec.get("ssm_groups", 1) > 1:
+            md[f"{arch}.ssm.group_count"] = ("u32", spec["ssm_groups"])
     if spec.get("realtime_delay") is not None:
         md[f"{arch}.realtime_delay_tokens"] = ("u32", spec["realtime_delay"])
     if spec.get("attn_temp_scale") is not None:
@@ -425,6 +487,49 @@ SPECS: list[dict[str, Any]] = [
         "expert_used": 2,
         "expert_width": 48,
         "fused_exps": True,
+    },
+    {
+        # mamba (llama.cpp models/mamba.cpp): no attention at all. Each layer is
+        # a 1D convolution and a state-space scan over a rolling state, and a
+        # pure mamba file has no feed-forward either.
+        "slug": "mamba",
+        "arch": "mamba",
+        "name": "FreeMoe synthetic mamba (recurrent block, no attention)",
+        "ssm": "mamba",
+        "ssm_inner": 64,      # 2 * hidden, the only expansion mamba supports
+        "ssm_state": 4,
+        "ssm_conv": 4,
+        "ssm_dt_rank": 3,
+        "layers": 2,
+    },
+    {
+        # falcon-mamba's variant of the mamba block: the same scan with an RMS
+        # norm on dt, B and C first (llama.cpp's `ssm.dt_b_c_rms`). The norms
+        # change the scan's inputs, so a runtime that ignores them diverges.
+        "slug": "mamba-dtrms",
+        "arch": "mamba",
+        "name": "FreeMoe synthetic mamba with dt/B/C RMS norms",
+        "ssm": "mamba",
+        "ssm_inner": 64,
+        "ssm_state": 4,
+        "ssm_conv": 3,
+        "ssm_dt_rank": 3,
+        "ssm_vector_norms": True,
+        "layers": 2,
+    },
+    {
+        # mamba2 (llama.cpp models/mamba2.cpp): a scalar decay per head and
+        # grouped B/C, so the same convolution covers the state and the groups.
+        "slug": "mamba2",
+        "arch": "mamba2",
+        "name": "FreeMoe synthetic mamba2 (grouped scan, scalar decay)",
+        "ssm": "mamba2",
+        "ssm_inner": 64,
+        "ssm_state": 4,
+        "ssm_conv": 4,
+        "ssm_dt_rank": 4,
+        "ssm_groups": 2,
+        "layers": 2,
     },
     {
         # mistral3 (llama.cpp models/mistral3.cpp): the llama block plus three
@@ -971,7 +1076,9 @@ def render_golden(spec: dict[str, Any], prefill: dict[str, Any],
 
 def build(spec: dict[str, Any]) -> dict[str, Any]:
     resolved = {**SHAPE, **{k: v for k, v in spec.items() if k in SHAPE}}
-    resolved.update({k: spec[k] for k in ("arch", "kv_heads", "rope_dim", "name")})
+    resolved.update({k: spec[k] for k in ("arch", "name")})
+    # A state-space file states no rotary width and no head count.
+    resolved.setdefault("rope_dim", resolved.get("head_dim"))
     resolved.setdefault("qkv_bias", False)
     resolved["kv_heads"] = spec.get("kv_heads", resolved["heads"])
 
@@ -994,6 +1101,7 @@ def main() -> int:
         stale = []
         for spec in SPECS:
             resolved = {**SHAPE, **spec}
+            resolved.setdefault("rope_dim", resolved.get("head_dim"))
             resolved.setdefault("qkv_bias", False)
             resolved["kv_heads"] = spec.get("kv_heads", resolved["heads"])
             expected_meta = arch_metadata(resolved)

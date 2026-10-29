@@ -830,6 +830,9 @@ bool is_llama_family(const std::string &arch) {
         // adaptive RMSNorm driven by a sinusoidal delay embedding (whose MLP is
         // a gelu_erf), and llama.cpp's per-position attention temperature.
         "mistral3",
+        // mamba/mamba2: no attention at all. Each layer is a 1D convolution and
+        // a state-space scan over a rolling state, and a pure file has no FFN.
+        "mamba", "mamba2",
     };
     return family.count(arch) != 0;
 }
@@ -869,24 +872,98 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
 
     cfg.layers = static_cast<uint32_t>(require_key("block_count", "layer count"));
     cfg.hidden = static_cast<uint32_t>(require_key("embedding_length", "embedding length"));
-    cfg.intermediate =
-        static_cast<uint32_t>(require_key("feed_forward_length", "feed-forward length"));
-    cfg.heads = static_cast<uint32_t>(require_key("attention.head_count", "attention head count"));
-    uint64_t kv_heads = 0;
-    if (!opt_u64(doc, keys("attention.head_count_kv"), &kv_heads)) kv_heads = cfg.heads;
-    cfg.kv_heads = static_cast<uint32_t>(kv_heads);
-    uint64_t head_dim = 0;
-    if (!opt_u64(doc, keys("attention.key_length"), &head_dim)) {
-        if (cfg.heads == 0 || cfg.hidden % cfg.heads != 0)
-            fail(ErrorCode::SHAPE_MISMATCH, "cannot derive head dimension from embedding length");
-        head_dim = cfg.hidden / cfg.heads;
+
+    // --- recurrent (state-space) layers -------------------------------------
+    // A file with `ssm_in` has no attention at all: llama.cpp's mamba block is a
+    // 1D convolution followed by a state-space scan, and a pure mamba model has
+    // no feed-forward either. The tensors are the evidence, so this is detected
+    // rather than assumed from the architecture name.
+    const bool has_ssm = doc.tensor_by_name.count(layer_name(0, "ssm_in.weight")) != 0;
+    if (has_ssm) {
+        cfg.ssm_conv = static_cast<uint32_t>(require_key("ssm.conv_kernel", "SSM convolution width"));
+        cfg.ssm_inner = static_cast<uint32_t>(require_key("ssm.inner_size", "SSM inner size"));
+        cfg.ssm_state = static_cast<uint32_t>(require_key("ssm.state_size", "SSM state size"));
+        cfg.ssm_dt_rank =
+            static_cast<uint32_t>(require_key("ssm.time_step_rank", "SSM time-step rank"));
+        uint64_t groups = 1;
+        if (opt_u64(doc, keys("ssm.group_count"), &groups) && groups > 1)
+            cfg.ssm_groups = static_cast<uint32_t>(groups);
+        opt_bool(doc, keys("ssm.dt_b_c_rms"), &cfg.ssm_dt_b_c_rms);
+        if (cfg.ssm_conv < 2 || cfg.ssm_inner == 0 || cfg.ssm_state == 0 || cfg.ssm_dt_rank == 0)
+            fail(ErrorCode::METADATA_MISMATCH,
+                 "an SSM layer needs a convolution width of at least 2 and non-zero sizes");
+        // mamba2 says so with a scalar decay: `ssm_a` is {1, n_head}, while
+        // mamba's is one row of `d_state` per channel.
+        const auto a_it = doc.tensor_by_name.find(layer_name(0, "ssm_a"));
+        const bool scalar_a =
+            a_it != doc.tensor_by_name.end() && !doc.tensors[a_it->second].dims.empty() &&
+            doc.tensors[a_it->second].dims[0] == 1;
+        cfg.ssm_kind = scalar_a ? "mamba2" : "mamba";
+        // mamba2 channels the grouped B and C through the same convolution as
+        // the state, and normalises B, C and dt per group.
+        if (cfg.ssm_kind == "mamba2") {
+            cfg.ssm_vector_norms =
+                doc.tensor_by_name.count(layer_name(0, "ssm_dt_norm.weight")) != 0;
+            if (doc.tensor_by_name.count(layer_name(0, "ssm_norm.weight")) == 0)
+                fail(ErrorCode::MISSING_REQUIRED_TENSOR,
+                     "mamba2 needs its grouped norm (blk.0.ssm_norm.weight)");
+            if (cfg.ssm_inner % cfg.ssm_groups != 0 || cfg.ssm_inner % cfg.ssm_dt_rank != 0)
+                fail(ErrorCode::SHAPE_MISMATCH,
+                     "the SSM inner size must divide into groups and heads");
+        } else {
+            cfg.ssm_vector_norms =
+                doc.tensor_by_name.count(layer_name(0, "ssm_dt_norm.weight")) != 0;
+            // mamba-1's scan is one head per channel.
+            if (cfg.ssm_inner != 2 * cfg.hidden)
+                fail(ErrorCode::SHAPE_MISMATCH,
+                     "mamba expands the hidden width by exactly 2 (inner_size must be 2*hidden)");
+        }
+        cfg.has_ffn = doc.tensor_by_name.count(layer_name(0, "ffn_norm.weight")) != 0;
+        // A per-layer recurrence mask. llama.cpp reads `attention.recurrent_layers`
+        // as an array; without it every layer is recurrent, which is what a pure
+        // mamba file says by having no attention tensors at all.
+        if (auto it = doc.metadata.find(arch + ".attention.recurrent_layers");
+            it != doc.metadata.end() && it->second.is_array()) {
+            const auto &entries = it->second.array;
+            if (!entries.empty() && entries.size() != cfg.layers)
+                fail(ErrorCode::METADATA_MISMATCH,
+                     arch + ".attention.recurrent_layers has " + std::to_string(entries.size()) +
+                         " entries for " + std::to_string(cfg.layers) + " layers");
+            for (const auto &entry : entries)
+                cfg.recurrent_layers.push_back(entry.as_bool() ? 1 : 0);
+            for (uint32_t l = 0; l < cfg.layers; ++l) {
+                // A hybrid file (jamba-style) is not mapped: an attention layer
+                // here would need a cache this adapter does not describe.
+                if (cfg.recurrent_layers[l] == 0)
+                    fail(ErrorCode::NOT_IMPLEMENTED,
+                         "a mixed recurrent/attention layer stack is not mapped by this adapter "
+                         "(layer " + std::to_string(l) + " is an attention layer)");
+            }
+        }
     }
-    cfg.head_dim = static_cast<uint32_t>(head_dim);
+
+    if (!has_ssm) {
+        cfg.intermediate =
+            static_cast<uint32_t>(require_key("feed_forward_length", "feed-forward length"));
+        cfg.heads =
+            static_cast<uint32_t>(require_key("attention.head_count", "attention head count"));
+        uint64_t kv_heads = 0;
+        if (!opt_u64(doc, keys("attention.head_count_kv"), &kv_heads)) kv_heads = cfg.heads;
+        cfg.kv_heads = static_cast<uint32_t>(kv_heads);
+        uint64_t head_dim = 0;
+        if (!opt_u64(doc, keys("attention.key_length"), &head_dim)) {
+            if (cfg.heads == 0 || cfg.hidden % cfg.heads != 0)
+                fail(ErrorCode::SHAPE_MISMATCH,
+                     "cannot derive head dimension from embedding length");
+            head_dim = cfg.hidden / cfg.heads;
+        }
+        cfg.head_dim = static_cast<uint32_t>(head_dim);
+    }
     // --- multi-head latent attention ---------------------------------------
     // Detected from the tensors: only MLA files carry `attn_kv_a_mqa`, which is
     // the projection into the latent. `head_dim` is then the *key* width
     // (nope + rope) and `attention.value_length_mla` the value width.
-    if (doc.tensor_by_name.count(layer_name(0, "attn_kv_a_mqa.weight")) != 0) {
+    if (!has_ssm && doc.tensor_by_name.count(layer_name(0, "attn_kv_a_mqa.weight")) != 0) {
         cfg.mla = true;
         uint64_t rank = 0;
         if (opt_u64(doc, keys("attention.q_lora_rank"), &rank)) cfg.q_lora_rank = static_cast<uint32_t>(rank);
@@ -914,7 +991,7 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
     }
 
     uint64_t rope_dim = 0;
-    if (opt_u64(doc, keys("rope.dimension_count"), &rope_dim))
+    if (!has_ssm && opt_u64(doc, keys("rope.dimension_count"), &rope_dim))
         cfg.rope_dim = static_cast<uint32_t>(rope_dim);
     uint64_t vocab = 0;
     if (!opt_u64(doc, keys("vocab_size"), &vocab)) {
@@ -1156,7 +1233,9 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
         // pre-norm block and the "parallel" reading would double-count.
         const bool attn_post_present =
             doc.tensor_by_name.count(layer_name(0, "attn_post_norm.weight")) != 0;
-        if (!ffn_present && !attn_post_present) {
+        // A recurrent layer has no FFN to normalise, so the absence of an
+        // ffn_norm there is not phi2's shared residual.
+        if (!ffn_present && !attn_post_present && !has_ssm) {
             if (doc.tensor_by_name.count(layer_name(0, "attn_norm.weight")) == 0)
                 fail(ErrorCode::MISSING_REQUIRED_TENSOR,
                      "no ffn_norm and no attn_norm: nothing normalises the FFN input");
@@ -1446,12 +1525,15 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
         cfg.chat_template = chat_template;
 
     // --- semantic checks that must fail closed rather than be approximated ---
-    if (cfg.heads == 0 || cfg.kv_heads == 0 || cfg.head_dim == 0 ||
-        cfg.heads % cfg.kv_heads != 0 || cfg.kv_heads > cfg.heads)
+    // A recurrent model has no attention, so it states no head counts at all.
+    if (cfg.ssm_kind.empty() &&
+        (cfg.heads == 0 || cfg.kv_heads == 0 || cfg.head_dim == 0 ||
+         cfg.heads % cfg.kv_heads != 0 || cfg.kv_heads > cfg.heads))
         fail(ErrorCode::SHAPE_MISMATCH, "grouped-query head counts are inconsistent");
     // MLA projects q through a bottleneck, so the per-head key width has no
     // reason to fill the embedding. Every other family keeps the identity.
-    if (!cfg.mla && static_cast<uint64_t>(cfg.heads) * cfg.head_dim != cfg.hidden)
+    if (cfg.ssm_kind.empty() && !cfg.mla &&
+        static_cast<uint64_t>(cfg.heads) * cfg.head_dim != cfg.hidden)
         fail(ErrorCode::SHAPE_MISMATCH,
              "attention head count times head dimension does not equal embedding length");
     if (cfg.rope_dim != 0 && (cfg.rope_dim % 2 != 0 || cfg.rope_dim > cfg.head_dim))
@@ -1487,8 +1569,9 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
 
     // phi3 stores one fused q/k/v projection instead of three. Detect it from
     // the tensors, because the metadata does not say either way.
-    if (!cfg.mla) {
-        // MLA builds q from a low-rank pair, so it has neither shape.
+    if (!cfg.mla && !has_ssm) {
+        // MLA builds q from a low-rank pair, so it has neither shape. A
+        // recurrent layer has no attention projection at all.
         const bool fused = doc.tensor_by_name.count(layer_name(0, "attn_qkv.weight")) != 0;
         const bool split = doc.tensor_by_name.count(layer_name(0, "attn_q.weight")) != 0;
         if (fused && split)
@@ -1541,7 +1624,7 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
     // glm4 keeps the FFN gate and up halves in a single tensor. Detected from
     // the shapes rather than the architecture name, because the same adapter
     // serves both layouts.
-    if (cfg.expert_count == 0 && !cfg.ffn_no_gate) {
+    if (cfg.expert_count == 0 && !cfg.ffn_no_gate && cfg.has_ffn) {
         const TensorInfo *up = m.tensor(layer_name(0, "ffn_up.weight"));
         const bool has_gate = doc.tensor_by_name.count(layer_name(0, "ffn_gate.weight")) != 0;
         if (!up)
@@ -1591,6 +1674,24 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
     if (cfg.norm_bias) expect("output_norm.bias");
     if (cfg.logit_bias) expect("output.bias");
     for (uint32_t l = 0; l < cfg.layers; ++l) {
+        if (cfg.layer_is_recurrent(l)) {
+            // The whole block, in llama.cpp's tensor names. There is no
+            // attention and (in a pure mamba file) no feed-forward.
+            for (const char *suffix : {"attn_norm.weight", "ssm_in.weight", "ssm_conv1d.weight",
+                                       "ssm_conv1d.bias", "ssm_dt.bias", "ssm_a", "ssm_d",
+                                       "ssm_out.weight"})
+                expect(layer_name(l, suffix));
+            // mamba-1 projects dt, B and C separately; mamba2 folds dt into
+            // `ssm_in`, so it has no `ssm_x` and no dt weight.
+            if (cfg.ssm_kind != "mamba2") expect(layer_name(l, "ssm_x.weight"));
+            if (cfg.ssm_kind != "mamba2") expect(layer_name(l, "ssm_dt.weight"));
+            if (cfg.ssm_kind == "mamba2") expect(layer_name(l, "ssm_norm.weight"));
+            if (cfg.ssm_vector_norms)
+                for (const char *suffix : {"ssm_dt_norm.weight", "ssm_b_norm.weight",
+                                           "ssm_c_norm.weight"})
+                    expect(layer_name(l, suffix));
+            if (!cfg.has_ffn) continue;
+        }
         for (const char *suffix : {"attn_norm.weight", "attn_output.weight"})
             expect(layer_name(l, suffix));
         if (!cfg.parallel_residual && cfg.ffn_norm_is_post)
@@ -1753,7 +1854,42 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
     if (cfg.logit_bias) expect_dims(*m.tensor("output.bias"), {cfg.vocab});
     for (uint32_t l = 0; l < cfg.layers; ++l) {
         expect_dims(*m.tensor(layer_name(l, "attn_norm.weight")), {cfg.hidden});
-        if (!cfg.parallel_residual)
+        if (cfg.layer_is_recurrent(l)) {
+            // The shapes the state layout and both scans are derived from. Each
+            // is checked against the metadata, so a file whose tensors and keys
+            // disagree is refused rather than run with one of the two.
+            const uint64_t conv_channels = cfg.ssm_conv_channels();
+            expect_dims(*m.tensor(layer_name(l, "ssm_in.weight")),
+                        {cfg.hidden, cfg.ssm_kind == "mamba2"
+                                         ? static_cast<uint64_t>(cfg.ssm_inner) + conv_channels +
+                                               cfg.ssm_dt_rank
+                                         : static_cast<uint64_t>(2) * cfg.ssm_inner});
+            expect_dims(*m.tensor(layer_name(l, "ssm_conv1d.weight")),
+                        {cfg.ssm_conv, conv_channels});
+            expect_dims(*m.tensor(layer_name(l, "ssm_conv1d.bias")), {conv_channels});
+            expect_dims(*m.tensor(layer_name(l, "ssm_dt.bias")),
+                        {cfg.ssm_kind == "mamba2" ? cfg.ssm_dt_rank : cfg.ssm_inner});
+            if (cfg.ssm_kind == "mamba2")
+                expect_dims(*m.tensor(layer_name(l, "ssm_a")), {1, cfg.ssm_dt_rank});
+            else
+                expect_dims(*m.tensor(layer_name(l, "ssm_a")), {cfg.ssm_state, cfg.ssm_inner});
+            expect_dims(*m.tensor(layer_name(l, "ssm_out.weight")),
+                        {cfg.ssm_inner, cfg.hidden});
+            if (cfg.ssm_kind == "mamba2") {
+                expect_dims(*m.tensor(layer_name(l, "ssm_d")), {1, cfg.ssm_dt_rank});
+                expect_dims(*m.tensor(layer_name(l, "ssm_norm.weight")),
+                            {cfg.ssm_inner / cfg.ssm_groups, cfg.ssm_groups});
+            } else {
+                expect_dims(*m.tensor(layer_name(l, "ssm_x.weight")),
+                            {cfg.ssm_inner,
+                             static_cast<uint64_t>(cfg.ssm_dt_rank) + 2 * cfg.ssm_state});
+                expect_dims(*m.tensor(layer_name(l, "ssm_dt.weight")),
+                            {cfg.ssm_dt_rank, cfg.ssm_inner});
+                expect_dims(*m.tensor(layer_name(l, "ssm_d")), {cfg.ssm_inner});
+            }
+            if (!cfg.has_ffn) continue;
+        }
+        if (!cfg.parallel_residual && (cfg.has_ffn || !cfg.layer_is_recurrent(l)))
             expect_dims(*m.tensor(layer_name(l, cfg.ffn_norm_is_post ? "attn_post_norm.weight"
                                                                    : "ffn_norm.weight")),
                         {cfg.hidden});

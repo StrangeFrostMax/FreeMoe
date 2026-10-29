@@ -187,6 +187,14 @@ void Engine::load_fixed_weights() {
     workspace_buffer_ = backend_->allocate(budget_.workspace_bytes, AllocationTag::Workspace);
     staging_buffer_ = backend_->allocate(budget_.staging_bytes, AllocationTag::Staging);
     kv_ = kv_buffer_->f32();
+    // A recurrent model's state must start at zero: the convolution history and
+    // the scan state are read before they are written. The KV cache does not
+    // care, but it costs the same single pass and removes a class of
+    // uninitialised-read bugs from the first token.
+    if (!manifest_.config.ssm_kind.empty())
+        std::memset(kv_, 0,
+                    static_cast<size_t>(manifest_.config.layers) *
+                        manifest_.config.ssm_state_floats() * sizeof(float));
 
     std::vector<uint8_t> host_weights(static_cast<size_t>(manifest_.fixed_weight_bytes));
     uint64_t offset = 0;
@@ -227,6 +235,8 @@ void Engine::load_fixed_weights() {
                              tensor.role == TensorRole::OUTPUT_BIAS ||
                              tensor.role == TensorRole::FFN_EXP_PROBS_B ||
                              tensor.role == TensorRole::FFN_ROUTER_BIAS ||
+                             tensor.role == TensorRole::SSM_CONV1D_BIAS ||
+                             tensor.role == TensorRole::SSM_DT_BIAS ||
                              proj_bias_2d;
         if (tensor.type_id == 0 && !is_bias) continue; // already plain floats
         size_t count = 1;
@@ -694,9 +704,196 @@ std::vector<float> Engine::forward_token(int32_t token, uint64_t position,
         }
     }
 
+    // `ggml_compute_softplus_f32`: a plain log(1+e^x) below 20, and the identity
+    // above it, where the exponential would overflow. The threshold is part of
+    // the reference's arithmetic, not an optimisation.
+    auto softplus = [](float v) -> float {
+        return v > 20.0f ? v : static_cast<float>(std::log1p(std::exp(static_cast<double>(v))));
+    };
+    // A recurrent layer replaces attention entirely: a 1D convolution over the
+    // projected input, then a state-space scan whose state rolls forward in the
+    // activation buffer. llama.cpp keeps that state in its recurrent memory and
+    // nothing in a kv cache, so the same region of this build's kv buffer holds
+    // `ssm_state_floats()` floats per recurrent layer, in the same layout.
+    auto ssm_block = [&](uint32_t layer, const std::string &prefix,
+                         const std::vector<float> &h) -> std::vector<float> {
+        const std::string lp = std::to_string(layer);
+        const uint32_t inner = c.ssm_inner;
+        const uint32_t state_size = c.ssm_state;
+        const uint32_t conv_width = c.ssm_conv;
+        const uint32_t channels = c.ssm_conv_channels();
+        float *slot = kv_ + static_cast<size_t>(layer) * c.ssm_state_floats();
+        // d_conv - 1 columns of history, then the state itself.
+        float *history = slot;
+        float *ssm_state = slot + static_cast<size_t>(conv_width - 1) * channels;
+        const uint32_t history_rows = conv_width - 1;
+
+        const bool mamba2 = c.ssm_kind == "mamba2";
+        const uint32_t in_dim =
+            mamba2 ? inner + channels + c.ssm_dt_rank : 2 * inner;
+        std::vector<float> projected = matvec_view(tensor_view(prefix + "ssm_in.weight"), h,
+                                                   in_dim, c.hidden, "ssm_in.L" + lp);
+        std::vector<float> z(projected.begin(), projected.begin() + inner);
+        std::vector<float> conv_in;
+        std::vector<float> dt;
+        if (mamba2) {
+            conv_in.assign(projected.begin() + inner, projected.begin() + inner + channels);
+            // mamba2 projects dt inside `ssm_in` and stores only its bias, so
+            // there is no dt weight to apply here (models/mamba2.cpp).
+            dt.assign(projected.begin() + inner + channels, projected.end());
+        } else {
+            conv_in.assign(projected.begin() + inner, projected.end());
+            // dt/B/C come from the convolved x, so they are produced below.
+        }
+
+        // 1D convolution: `ggml_ssm_conv` slides a window of d_conv columns over
+        // the concatenated (history | new input) and dots it with the kernel.
+        // The window is then rolled forward by one column.
+        std::vector<float> convolved(channels, 0.0f);
+        const float *kernel = weights(prefix + "ssm_conv1d.weight");
+        auto convolve = [&](const std::vector<float> &current) {
+            for (uint32_t i = 0; i < channels; ++i) {
+                double acc = 0.0;
+                for (uint32_t k = 0; k < conv_width; ++k) {
+                    // Rows 0..d_conv-2 are history (oldest first); the last is
+                    // this token.
+                    const float value = k + 1 < conv_width
+                                            ? history[static_cast<size_t>(k) * channels + i]
+                                            : current[i];
+                    acc += static_cast<double>(value) * kernel[k + conv_width * i];
+                }
+                convolved[i] = static_cast<float>(acc);
+            }
+            // Roll the history: drop the oldest column, append this token.
+            for (uint32_t k = 0; k + 1 < history_rows; ++k)
+                for (uint32_t i = 0; i < channels; ++i)
+                    history[static_cast<size_t>(k) * channels + i] =
+                        history[static_cast<size_t>(k + 1) * channels + i];
+            if (history_rows > 0)
+                for (uint32_t i = 0; i < channels; ++i)
+                    history[static_cast<size_t>(history_rows - 1) * channels + i] = current[i];
+        };
+        convolve(conv_in);
+        const float *conv_bias = bias_weights(prefix + "ssm_conv1d.bias");
+        for (uint32_t i = 0; i < channels; ++i)
+            convolved[i] = static_cast<float>(silu(static_cast<double>(convolved[i] + conv_bias[i])));
+        backend_->record_control("ssm_conv.L" + lp, channels * sizeof(float) * 3,
+                                 channels * sizeof(float));
+
+        const float *A = weights(prefix + "ssm_a");
+        const float *D = weights(prefix + "ssm_d");
+        std::vector<float> y(inner, 0.0f);
+        if (mamba2) {
+            // dt is already projected; B and C ride along in the convolution.
+            if (c.ssm_vector_norms)
+                dt = rmsnorm(dt, norm_weights(prefix + "ssm_dt_norm.weight"),
+                             "ssm_dt_norm.L" + lp);
+            const float *dt_bias = bias_weights(prefix + "ssm_dt.bias");
+            for (uint32_t i = 0; i < c.ssm_dt_rank; ++i) dt[i] += dt_bias[i];
+            const uint32_t head_dim = inner / c.ssm_dt_rank;
+            const uint32_t group = c.ssm_dt_rank / c.ssm_groups;
+            const float *B = convolved.data() + inner;
+            const float *C = convolved.data() + inner + c.ssm_groups * state_size;
+            for (uint32_t head = 0; head < c.ssm_dt_rank; ++head) {
+                const float dt_sp = softplus(dt[head]);
+                const float dA = static_cast<float>(std::exp(dt_sp * A[head]));
+                const uint32_t g = head / group;
+                for (uint32_t i = 0; i < head_dim; ++i) {
+                    const uint32_t ii = i + head * head_dim;
+                    const float x_dt = convolved[ii] * dt_sp;
+                    double acc = 0.0;
+                    float *st = ssm_state + static_cast<size_t>(ii) * state_size;
+                    for (uint32_t k = 0; k < state_size; ++k) {
+                        const float value = st[k] * dA + B[k + g * state_size] * x_dt;
+                        st[k] = value;
+                        acc += static_cast<double>(value) * C[k + g * state_size];
+                    }
+                    y[ii] = static_cast<float>(acc) + convolved[ii] * D[head];
+                }
+            }
+            for (uint32_t i = 0; i < inner; ++i) y[i] = static_cast<float>(silu(z[i])) * y[i];
+            // The grouped RMS norm, one group of `inner / groups` channels each.
+            const float *norm_w = norm_weights(prefix + "ssm_norm.weight");
+            const uint32_t width = inner / c.ssm_groups;
+            for (uint32_t g = 0; g < c.ssm_groups; ++g) {
+                double acc = 0.0;
+                for (uint32_t i = 0; i < width; ++i) {
+                    const double v = y[g * width + i];
+                    acc += v * v;
+                }
+                const double scale = 1.0 / std::sqrt(acc / width + c.rms_eps);
+                for (uint32_t i = 0; i < width; ++i)
+                    y[g * width + i] = static_cast<float>(y[g * width + i] * scale *
+                                                          norm_w[i + width * g]);
+            }
+            backend_->record_control("ssm_norm.L" + lp, y.size() * sizeof(float) * 2,
+                                     y.size() * sizeof(float));
+        } else {
+            // mamba-1: dt, B and C are projected from the convolved x.
+            const uint32_t dt_rank = c.ssm_dt_rank;
+            std::vector<float> dbc =
+                matvec_view(tensor_view(prefix + "ssm_x.weight"), convolved,
+                            dt_rank + 2 * state_size, inner, "ssm_x.L" + lp);
+            std::vector<float> dt_in(dbc.begin(), dbc.begin() + dt_rank);
+            // falcon-mamba and jamba normalise dt, B and C before the scan. The
+            // tensors decide, so a file that carries them gets them applied and
+            // one that does not is untouched.
+            if (c.ssm_vector_norms) {
+                dt_in = rmsnorm(dt_in, norm_weights(prefix + "ssm_dt_norm.weight"),
+                                "ssm_dt_norm.L" + lp);
+                std::vector<float> b_vec(dbc.begin() + dt_rank, dbc.begin() + dt_rank + state_size);
+                std::vector<float> c_vec(dbc.begin() + dt_rank + state_size, dbc.end());
+                b_vec = rmsnorm(b_vec, norm_weights(prefix + "ssm_b_norm.weight"),
+                                "ssm_b_norm.L" + lp);
+                c_vec = rmsnorm(c_vec, norm_weights(prefix + "ssm_c_norm.weight"),
+                                "ssm_c_norm.L" + lp);
+                std::copy(b_vec.begin(), b_vec.end(), dbc.begin() + dt_rank);
+                std::copy(c_vec.begin(), c_vec.end(), dbc.begin() + dt_rank + state_size);
+            }
+            const float *B = dbc.data() + dt_rank;
+            const float *C = dbc.data() + dt_rank + state_size;
+            dt = matvec_view(tensor_view(prefix + "ssm_dt.weight"), dt_in, inner, dt_rank,
+                             "ssm_dt.L" + lp);
+            const float *dt_bias = bias_weights(prefix + "ssm_dt.bias");
+            for (uint32_t i = 0; i < inner; ++i) dt[i] += dt_bias[i];
+            // One channel is one head, and the state wears the decay per state
+            // index: dA = exp(softplus(dt) * A[channel, k]).
+            for (uint32_t h_index = 0; h_index < inner; ++h_index) {
+                const float dt_sp = softplus(dt[h_index]);
+                const float x_dt = convolved[h_index] * dt_sp;
+                double acc = 0.0;
+                float *st = ssm_state + static_cast<size_t>(h_index) * state_size;
+                const float *a_row = A + static_cast<size_t>(h_index) * state_size;
+                for (uint32_t k = 0; k < state_size; ++k) {
+                    const float decay = static_cast<float>(std::exp(dt_sp * a_row[k]));
+                    const float value = st[k] * decay + B[k] * x_dt;
+                    st[k] = value;
+                    acc += static_cast<double>(value) * C[k];
+                }
+                y[h_index] = static_cast<float>(acc) + convolved[h_index] * D[h_index];
+            }
+            // `ggml_swiglu_split(z, y)`: silu of the first argument times the
+            // second, so the gate is the z half here.
+            for (uint32_t i = 0; i < inner; ++i) y[i] = static_cast<float>(silu(z[i])) * y[i];
+        }
+        // One scan step: the state it read and the state it wrote, plus the
+        // convolution output the scan consumed.
+        backend_->record_control("ssm_scan.L" + lp,
+                                 static_cast<uint64_t>(state_size) * inner * sizeof(float) * 2 +
+                                     channels * sizeof(float),
+                                 static_cast<uint64_t>(state_size) * inner * sizeof(float));
+        return matvec_view(tensor_view(prefix + "ssm_out.weight"), y, c.hidden, inner,
+                           "ssm_out.L" + lp);
+    };
+
     for (uint32_t layer = 0; layer < c.layers; ++layer) {
         const std::string prefix = "blk." + std::to_string(layer) + ".";
         std::vector<float> h = norm(x, prefix + "attn_norm", "attn_norm.L" + std::to_string(layer));
+        if (c.layer_is_recurrent(layer)) {
+            residual_add(x, ssm_block(layer, prefix, h),
+                         "residual.ssm.L" + std::to_string(layer));
+            if (!c.has_ffn) continue;
+        } else {
         // phi2 runs the FFN on the *attention's* normalised input and adds both
         // branches to the same residual, so `h` is reused rather than replaced.
         const std::vector<float> attn_normed = c.parallel_residual ? h : std::vector<float>();
@@ -1032,6 +1229,13 @@ std::vector<float> Engine::forward_token(int32_t token, uint64_t position,
                 h[j] = static_cast<float>(h[j] * (1.0f + scale[j]));
             backend_->record_control("ffn_norm_ada.L" + std::to_string(layer),
                                      h.size() * sizeof(float), h.size() * sizeof(float));
+        }
+        }  // end of the attention branch
+        if (c.layer_is_recurrent(layer) && c.has_ffn) {
+            // A hybrid block: the recurrent layer has already taken its residual
+            // and the feed-forward reads the post-residual norm, exactly as in
+            // the attention branch.
+            h = norm(x, prefix + "ffn_norm", "ffn_norm.L" + std::to_string(layer));
         }
         std::vector<float> ffn(c.hidden, 0.0f);
         // The leading blocks of an MoE model can still carry a plain FFN.

@@ -2865,7 +2865,8 @@ void test_architecture_parity() {
                                            "qwen3moe-fused-up", "qwen3moe-clamp",
                                            "glm4-mrope", "bitnet", "arcee", "nemotron",
                                            "jais2", "gpt-oss", "plm", "mistral3",
-                                           "qwen3vl", "qwen3vlmoe"};
+                                           "qwen3vl", "qwen3vlmoe", "mamba", "mamba2",
+                                           "mamba-dtrms"};
     for (const std::string &slug : slugs) {
         const std::string model = "tests/fixtures/" + slug + "-shape.gguf";
         ArchGolden golden = read_arch_golden("tests/golden/" + slug + "_reference.txt");
@@ -3677,6 +3678,133 @@ void test_mrope_families() {
     }
 }
 
+// The recurrent families (llama.cpp models/mamba.cpp, mamba2.cpp, and the
+// shared block in mamba-base.cpp). There is no attention and, in a pure file, no
+// feed-forward: the block is a 1D convolution over a rolling window and a
+// state-space scan whose state replaces the kv cache. Because the state is the
+// only channel through which an earlier token reaches a later one, the checks
+// below look at both the parsed facts and the shape of that state.
+void test_recurrent_families() {
+    struct Expect {
+        const char *slug;
+        const char *kind;
+        uint32_t groups;
+        bool vector_norms;
+    };
+    const Expect cases[] = {
+        {"mamba", "mamba", 1, false},
+        {"mamba-dtrms", "mamba", 1, true},
+        {"mamba2", "mamba2", 2, false},
+    };
+    for (const Expect &c : cases) {
+        const std::string path = std::string("tests/fixtures/") + c.slug + "-shape.gguf";
+        RunConfig config;
+        config.model_path = path;
+        config.budget.total_hot_bytes = 64ull * 1024 * 1024;
+        Engine engine(config);
+        engine.initialize();
+        const ModelConfig &cfg = engine.manifest().config;
+        const std::string tag = std::string(c.slug) + ": ";
+
+        CHECK(cfg.ssm_kind == c.kind, tag + "the state-space variant comes from the tensors");
+        CHECK(cfg.ssm_groups == c.groups, tag + "the group count is read");
+        CHECK(cfg.ssm_vector_norms == c.vector_norms, tag + "the dt/B/C norms are detected");
+        CHECK(!cfg.has_ffn, tag + "a pure mamba file has no feed-forward");
+        CHECK(cfg.layer_is_recurrent(0) && cfg.layer_is_recurrent(1),
+              tag + "every layer of a pure file is recurrent");
+        CHECK(cfg.heads == 0 && cfg.kv_heads == 0,
+              tag + "a recurrent file states no attention head counts");
+        // The state is a fixed size per layer, not a per-position cache: the
+        // convolution history plus one state vector per channel.
+        const uint64_t per_layer = cfg.ssm_state_floats();
+        const uint64_t expected =
+            static_cast<uint64_t>(cfg.ssm_conv - 1) * cfg.ssm_conv_channels() +
+            static_cast<uint64_t>(cfg.ssm_state) * cfg.ssm_inner;
+        CHECK(per_layer == expected, tag + "the state size is history plus one state vector");
+
+        ArchGolden golden = read_arch_golden("tests/golden/" + std::string(c.slug) + "_reference.txt");
+        PromptResult result = engine.run_prompt(golden.prompt, 8);
+        CHECK(result.input_ids == golden.input_ids, tag + "prompt tokenization matches");
+        CHECK(result.generated_ids == golden.greedy, tag + "greedy decoding matches the reference");
+
+        int convolutions = 0, scans = 0;
+        for (const OpRecord &op : engine.backend().operations()) {
+            if (op.name.rfind("ssm_conv.", 0) == 0) ++convolutions;
+            if (op.name.rfind("ssm_scan.", 0) == 0) ++scans;
+        }
+        CHECK(convolutions > 0 && convolutions % static_cast<int>(cfg.layers) == 0,
+              tag + "the convolution runs once per layer per token");
+        CHECK(scans == convolutions, tag + "the scan runs wherever the convolution does");
+        engine.release_runtime();
+    }
+
+    // The budget follows the state, not the context: a recurrent file must not
+    // reserve a per-position cache it will never read.
+    {
+        const ModelManifest manifest =
+            build_manifest(parse_gguf_file("tests/fixtures/mamba-shape.gguf"),
+                           "tests/fixtures/mamba-shape.gguf");
+        BudgetConfig budget;
+        budget.total_hot_bytes = 64ull * 1024 * 1024;
+        DeviceInfo device;
+        device.memory_type = "host";
+        const BudgetResult result = compute_budget(manifest, budget, device);
+        const uint64_t expected = static_cast<uint64_t>(manifest.config.layers) *
+                                  manifest.config.ssm_state_floats() * sizeof(float);
+        CHECK(result.kv_bytes == expected,
+              "a recurrent model reserves one rolling state per layer, not a kv cache");
+        CHECK(result.kv_bytes <
+                  static_cast<uint64_t>(manifest.config.layers) * manifest.config.context *
+                      manifest.config.hidden * sizeof(float),
+              "the state is smaller than a per-position cache would be");
+    }
+
+    // Every way the metadata can disagree with the tensors is refused, because
+    // each one would otherwise run with a state of the wrong width.
+    {
+        GGUFDocument doc = parse_gguf_file("tests/fixtures/mamba-shape.gguf");
+        GGUFDocument broken = doc;
+        broken.metadata.erase("mamba.ssm.state_size");
+        CHECK(throws_code(ErrorCode::METADATA_MISMATCH,
+                          [&]() { (void)build_manifest(broken, "mamba-shape.gguf"); }),
+              "a recurrent file without a state size is refused");
+    }
+    {
+        GGUFDocument broken = parse_gguf_file("tests/fixtures/mamba-shape.gguf");
+        // mamba expands the hidden width by exactly 2; the scan's layout depends
+        // on it, so a file that says otherwise is refused rather than reshaped.
+        broken.metadata["mamba.ssm.inner_size"].u = 48;
+        CHECK(throws_code(ErrorCode::SHAPE_MISMATCH,
+                          [&]() { (void)build_manifest(broken, "mamba-shape.gguf"); }),
+              "an expansion other than 2 is refused");
+    }
+    {
+        // A hybrid stack would need a cache per attention layer beside the
+        // recurrent state, which this adapter does not describe.
+        GGUFDocument broken = parse_gguf_file("tests/fixtures/mamba-shape.gguf");
+        MetadataValue layers;
+        layers.type = GGUFValueType::ARRAY;
+        for (int i = 0; i < 2; ++i) {
+            MetadataValue entry;
+            entry.type = GGUFValueType::BOOL;
+            entry.b = i == 0;
+            layers.array.push_back(entry);
+        }
+        broken.metadata["mamba.attention.recurrent_layers"] = layers;
+        CHECK(throws_code(ErrorCode::NOT_IMPLEMENTED,
+                          [&]() { (void)build_manifest(broken, "mamba-shape.gguf"); }),
+              "a mixed recurrent/attention stack is refused rather than half-run");
+    }
+    {
+        GGUFDocument broken = parse_gguf_file("tests/fixtures/mamba2-shape.gguf");
+        // mamba2's grouped norm is what keeps the scan's output in range.
+        broken.tensor_by_name.erase("blk.1.ssm_norm.weight");
+        CHECK(throws_code(ErrorCode::MISSING_REQUIRED_TENSOR,
+                          [&]() { (void)build_manifest(broken, "mamba2-shape.gguf"); }),
+              "mamba2 without its grouped norm is refused");
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Chat templates
 // ---------------------------------------------------------------------------
@@ -3960,6 +4088,7 @@ int main(int argc, char **argv) {
     maybe_run("plm_block", test_plm_block);
     maybe_run("mistral3_block", test_mistral3_block);
     maybe_run("mrope_families", test_mrope_families);
+    maybe_run("recurrent_families", test_recurrent_families);
     maybe_run("chat_template_rendering", test_chat_template_rendering);
     maybe_run("chat_template_constructs", test_chat_template_constructs);
     maybe_run("chat_template_engine", test_chat_template_engine);

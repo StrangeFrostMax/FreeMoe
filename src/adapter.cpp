@@ -50,6 +50,10 @@ const AdapterRow kRows[] = {
      "deepseek4 graph with the renormalised router"},
     {"mistral3", "LLM_ARCH_MISTRAL3", "llama_model_mistral3::build_arch_graph",
      "llama block, optional MLP biases, gelu_erf adaptive norm, attention temperature"},
+    {"mamba", "LLM_ARCH_MAMBA", "llm_build_mamba_base::build_mamba_layer",
+     "1D convolution plus a state-space scan, element-wise decay, no attention"},
+    {"mamba2", "LLM_ARCH_MAMBA2", "llm_build_mamba_base::build_mamba2_layer",
+     "grouped scan with a scalar decay and a grouped norm, no attention"},
 };
 
 }  // namespace
@@ -148,11 +152,13 @@ std::vector<std::string> adapter_config_tags(const ModelConfig &cfg) {
     tags.push_back("adapter=" + cfg.adapter);
     tags.push_back("kind=" + cfg.model_kind);
 
-    // Attention shape.
-    if (cfg.kv_heads == cfg.heads) tags.push_back("attn=mha");
-    else if (cfg.kv_heads == 1) tags.push_back("attn=mqa");
-    else tags.push_back("attn=gqa");
-    if (cfg.mla) tags.push_back("attn=mla");
+    // Attention shape. A recurrent file has no attention to describe.
+    if (cfg.ssm_kind.empty()) {
+        if (cfg.kv_heads == cfg.heads) tags.push_back("attn=mha");
+        else if (cfg.kv_heads == 1) tags.push_back("attn=mqa");
+        else tags.push_back("attn=gqa");
+        if (cfg.mla) tags.push_back("attn=mla");
+    }
     if (cfg.qk_norm) tags.push_back("qk_norm=per-head");
     if (cfg.attn_sinks) tags.push_back("sinks=yes");
     if (cfg.ffn_norm_is_post) tags.push_back("ffn_norm=post_attention");
@@ -160,6 +166,16 @@ std::vector<std::string> adapter_config_tags(const ModelConfig &cfg) {
     if (cfg.expert_projection_bias) tags.push_back("expert_bias=per_expert");
     if (!cfg.swa_layers.empty()) tags.push_back("window=per_layer");
     if (cfg.ffn_norm_ada) tags.push_back("ffn_norm=adaptive");
+    if (!cfg.ssm_kind.empty()) {
+        // A recurrent block has no attention at all, so this is the tag a reader
+        // needs to see instead of the attention shape.
+        tags.push_back("recurrent=" + cfg.ssm_kind);
+        tags.push_back("ssm=conv" + std::to_string(cfg.ssm_conv) + "/state" +
+                       std::to_string(cfg.ssm_state) + "/inner" + std::to_string(cfg.ssm_inner));
+        if (cfg.ssm_groups > 1) tags.push_back("ssm_groups=" + std::to_string(cfg.ssm_groups));
+        if (cfg.ssm_vector_norms) tags.push_back("ssm_dt_b_c_rms=yes");
+        if (!cfg.has_ffn) tags.push_back("ffn=none");
+    }
     if (cfg.attn_temp_scale != 0.0) tags.push_back("attn_temp=on");
     if (cfg.ffn_gate_bias) tags.push_back("bias=ffn_gate");
     if (cfg.attn_qkv_bias) tags.push_back("bias=qkv");
@@ -167,9 +183,12 @@ std::vector<std::string> adapter_config_tags(const ModelConfig &cfg) {
     if (cfg.sliding_window) tags.push_back("window=" + std::to_string(cfg.sliding_window));
     if (cfg.attn_logit_softcap > 0.0) tags.push_back("attn_softcap=on");
 
-    // Rotary.
-    tags.push_back("rope=" + (cfg.rope_dim && cfg.rope_dim != cfg.head_dim ? std::string("partial")
-                                                                          : std::string("full")));
+    // Rotary. A recurrent layer has none, so the tag is omitted rather than
+    // claiming a full-width rotation that never runs.
+    if (cfg.ssm_kind.empty())
+        tags.push_back("rope=" + (cfg.rope_dim && cfg.rope_dim != cfg.head_dim
+                                      ? std::string("partial")
+                                      : std::string("full")));
     if (cfg.rope_scaling_type != "none")
         tags.push_back("rope_scaling=" + cfg.rope_scaling_type);
     if (cfg.rope_freqs) tags.push_back("rope_freqs=yes");
@@ -191,10 +210,12 @@ std::vector<std::string> adapter_config_tags(const ModelConfig &cfg) {
     if (cfg.post_norms) tags.push_back("post_norms=yes");
     if (cfg.sub_norms) tags.push_back("subln=yes");
     if (cfg.projection_scales) tags.push_back("proj_scale=yes");
-    tags.push_back("ffn=" + cfg.activation);
-    if (cfg.activation_limit > 0.0)
+    // A pure recurrent block has no feed-forward, so the activation is not a
+    // fact about it; `ffn=none` above already says so.
+    if (cfg.has_ffn) tags.push_back("ffn=" + cfg.activation);
+    if (cfg.has_ffn && cfg.activation_limit > 0.0)
         tags.push_back("ffn_clamp=" + std::to_string(cfg.activation_limit));
-    if (cfg.activation_alpha > 0.0)
+    if (cfg.has_ffn && cfg.activation_alpha > 0.0)
         tags.push_back("ffn_alpha=" + std::to_string(cfg.activation_alpha));
     if (cfg.fused_gate_up_exps) tags.push_back("ffn_exps=fused-gate-up");
 

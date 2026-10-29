@@ -106,6 +106,10 @@ const std::map<std::string, ArchFacts> &known_architectures() {
         // mistral3: the llama block plus optional MLP biases and an adaptive
         // RMSNorm whose MLP is a gelu_erf.
         {"mistral3", {true, false}},
+        // mamba/mamba2: pure state-space models, with no attention and no FFN.
+        // The state rolls forward in place rather than through a kv cache.
+        {"mamba", {true, false}},
+        {"mamba2", {true, false}},
         {"glm4moe", {false, true}},
         {"multimodal", {false, true}},
     };
