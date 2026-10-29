@@ -23,7 +23,18 @@ jobs:
           g++ --version | head -1
           python3 --version
       - name: Build
-        run: make -j"$(nproc)" all build/tests build/vnpu-selftest build/fuzz_gguf
+        run: |
+          set -o pipefail
+          make -j"$(nproc)" all build/tests build/vnpu-selftest build/fuzz_gguf 2>&1 | tee build.log
+      # A failing build on a hosted runner is only diagnosable if the error text
+      # is reachable without downloading the raw log. Annotating the first few
+      # errors puts them on the check run itself, in the PR.
+      - name: Report build errors
+        if: failure()
+        run: |
+          grep -nE "error:|Error [0-9]+|No rule to make target" build.log | head -20 |
+            while IFS= read -r line; do echo "::error title=build::$line"; done
+          exit 1
       - name: Unit and architecture tests
         run: make test
       - name: Fixture and table regeneration checks
