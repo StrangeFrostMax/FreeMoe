@@ -777,7 +777,11 @@ std::vector<float> Engine::forward_token(int32_t token, uint64_t position,
         const float *conv_bias = bias_weights(prefix + "ssm_conv1d.bias");
         for (uint32_t i = 0; i < channels; ++i)
             convolved[i] = static_cast<float>(silu(static_cast<double>(convolved[i] + conv_bias[i])));
-        backend_->record_control("ssm_conv.L" + lp, channels * sizeof(float) * 3,
+        // The convolution reads its kernel and the window it slides (history plus
+        // this token's input) and writes one column.
+        backend_->record_control("ssm_conv.L" + lp,
+                                 static_cast<uint64_t>(channels) * (2 * conv_width - 1) *
+                                     sizeof(float),
                                  channels * sizeof(float));
 
         const float *A = weights(prefix + "ssm_a");

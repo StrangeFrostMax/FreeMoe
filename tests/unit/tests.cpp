@@ -3728,13 +3728,33 @@ void test_recurrent_families() {
         CHECK(result.generated_ids == golden.greedy, tag + "greedy decoding matches the reference");
 
         int convolutions = 0, scans = 0;
+        bool conv_bytes_exact = true, scan_bytes_exact = true;
+        const uint64_t conv_reads = static_cast<uint64_t>(cfg.ssm_conv_channels()) *
+                                    (2 * cfg.ssm_conv - 1) * sizeof(float);
+        const uint64_t conv_writes =
+            static_cast<uint64_t>(cfg.ssm_conv_channels()) * sizeof(float);
+        const uint64_t scan_state =
+            static_cast<uint64_t>(cfg.ssm_state) * cfg.ssm_inner * sizeof(float);
         for (const OpRecord &op : engine.backend().operations()) {
-            if (op.name.rfind("ssm_conv.", 0) == 0) ++convolutions;
-            if (op.name.rfind("ssm_scan.", 0) == 0) ++scans;
+            if (op.name.rfind("ssm_conv.", 0) == 0) {
+                ++convolutions;
+                conv_bytes_exact = conv_bytes_exact && op.input_bytes == conv_reads &&
+                                   op.output_bytes == conv_writes;
+            }
+            if (op.name.rfind("ssm_scan.", 0) == 0) {
+                ++scans;
+                scan_bytes_exact = scan_bytes_exact && op.output_bytes == scan_state &&
+                                   op.input_bytes >= 2 * scan_state;
+            }
         }
         CHECK(convolutions > 0 && convolutions % static_cast<int>(cfg.layers) == 0,
               tag + "the convolution runs once per layer per token");
         CHECK(scans == convolutions, tag + "the scan runs wherever the convolution does");
+        // The per-op accounting has to state the traffic honestly: the kernel and
+        // the window it slides against for the convolution, the state it reads and
+        // the state it writes for the scan.
+        CHECK(conv_bytes_exact, tag + "the convolution reports its window and kernel traffic");
+        CHECK(scan_bytes_exact, tag + "the scan reports the state it reads and writes");
         engine.release_runtime();
     }
 

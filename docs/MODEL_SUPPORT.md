@@ -62,10 +62,16 @@ each family, the tool records what a specific file contains.
 | Built-in templates for 11 marker families + evidence-based selection from the token table | WORKS |
 | `internlm2`, `exaone`, `orion`, `gptneox`, `stablelm` adapters | WORKS |
 | Gate-free `relu²` feed-forward families: `arcee`, `nemotron`, `jais2` | WORKS (fixture + oracle golden each) |
+| `plm`: MLA with a one-step q projection, gate-free `relu²` MLP | WORKS (fixture + oracle golden) |
+| `gpt-oss`: attention sinks, post-attention norm reused as the MoE input norm, biased router, per-expert projection biases, `swiglu_oai` (alpha 1.702, limit 7.0), `softmax-weight` gating, alternating full/windowed layers | WORKS (fixture + oracle golden) |
+| `mistral3`: biases on all three FFN projections, adaptive RMSNorm over the sinusoidal delay embedding (`gelu_erf` + `seq`), per-position attention temperature | WORKS (fixture + oracle golden) |
+| `qwen3vl`, `qwen3vlmoe`: the text block with mRoPE section splits (required key, as upstream) | WORKS (fixture + oracle golden each); vision tower out of scope |
+| `mamba`, `mamba2`: 1D convolution + state-space scan, `dt_b_c_rms`, the recurrent state reserved per layer in place of a kv cache | WORKS (fixtures, oracle goldens, `recurrent_families`) |
+| Hybrid stacks (recurrent layers interleaved with attention, e.g. `jamba`, `nemotron_h`, `falcon-h1`) | **MISSING** — refused by name: the attention layers need a cache beside the state |
 | `glm4-moe`, `minicpm3`, and the remaining architectures in llama.cpp's `src/models/` | **MISSING** — see `docs/MODEL_COVERAGE_STATUS.md` for the per-model reason |
 | PrismML rotated weight basis (`prism.hadamard.*`) and Hadamard activation transform | **MISSING**, hard blocker |
-| Hybrid linear attention (`ssm_*`, `conv1d` state) | **MISSING**, hard blocker |
-| Shared-expert MoE (`expert_shared_count`) | **MISSING**, refused rather than dropped |
+| Linear attention: gated delta-net (`qwen35`, `qwen3next`, `kimi-linear`) | **MISSING**, hard blocker (a different scan: per-head matrix state) |
+| Shared-expert MoE: the tensors are what the forward pass reads, so `expert_shared_count` itself is not gating — a file whose shared-expert tensors the block does not name is refused rather than dropped | WORKS for `qwen2moe`/`deepseek2` |
 | Ternary block formats (`PTQ1_0`, `TQ1_0`, `TQ2_0`) | **MISSING** |
 | Vision towers (MiniCPM-V) | **MISSING**, and out of scope for a text engine |
 
@@ -397,7 +403,8 @@ The activation is the one fact GGUF cannot express for a *gate-free* FFN (up →
 activation → down has no gate to disambiguate it), so it is read from the
 architecture. That table is deliberately small and cites llama.cpp's own model
 files: `phi2` and `gptneox` are `LLM_FFN_GELU` with `LLM_FFN_SEQ`, and
-`arcee`, `nemotron` and `jais2` are `LLM_FFN_RELU_SQR` with `LLM_FFN_SEQ`.
+`arcee`, `nemotron`, `jais2` and `plm` are `LLM_FFN_RELU_SQR` with `LLM_FFN_SEQ`,
+and `mistral3`'s adaptive-norm MLP is `LLM_FFN_GELU_ERF` with `LLM_FFN_SEQ`.
 Any other architecture with a gate-free FFN is still refused rather than
 guessed — a llama checkpoint with its gates removed fails with `NOT_IMPLEMENTED`
 instead of being run with silu. The same three families are what makes the
