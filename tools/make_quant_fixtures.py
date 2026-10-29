@@ -17,7 +17,9 @@ downloaded checkpoint.
 Everything here is generated in-repo and MIT licensed; no third-party weights
 are involved.
 
-Usage: python3 tools/make_quant_fixtures.py
+Usage:
+    python3 tools/make_quant_fixtures.py          # write the fixtures
+    python3 tools/make_quant_fixtures.py --check  # verify them against the manifest
 """
 from __future__ import annotations
 
@@ -40,6 +42,7 @@ MANIFEST = FIXTURES / "quant_fixtures.json"
 Q8_0 = 8
 Q4_0 = 2
 Q4_K = 12
+Q6_K = 14
 BLOCK = 32
 ALIGN = 32
 
@@ -49,6 +52,7 @@ VARIANTS = (
     ("q8_0", Q8_0, 32, 34),
     ("q4_0", Q4_0, 32, 18),
     ("q4_k", Q4_K, 256, 144),
+    ("q6_k", Q6_K, 256, 210),
 )
 
 
@@ -184,10 +188,64 @@ def encode_q4_k(values: list[float]) -> bytes:
     return bytes(payload)
 
 
+def encode_q6_k(values: list[float]) -> bytes:
+    """Q6_K at fixed d: each 16-value group gets its own 8-bit scale.
+
+    Q6_K stores 6-bit fields split across `ql` (4 low bits) and `qh` (2 high
+    bits), an 8-bit scale per 16 values and one f16 block scale. Fixing `d` at
+    2**-8 keeps every product exactly representable, so the independent decoder
+    in `quant_reference.py` reproduces the same values this encoder intended --
+    which is what makes the round-trip assertion below meaningful.
+    """
+    if len(values) % 256:
+        raise SystemExit("Q6_K needs a multiple of 256 values")
+    d = 1.0 / 256.0
+    out = bytearray()
+    for block in range(len(values) // 256):
+        chunk = values[block * 256:(block + 1) * 256]
+        ql = bytearray(128)
+        qh = bytearray(64)
+        scales = bytearray(16)
+        # group g in 0..15 covers 16 values; part = g//2 (which 32-value quarter
+        # of the 128-value half), i = g % 2 (which 16-value scale index).
+        for g in range(16):
+            group = chunk[g * 16:(g + 1) * 16]
+            peak = max(abs(x) for x in group) or 1e-9
+            scale = max(1, min(127, int(round(peak / (d * 31.0)))))
+            scales[g] = scale
+            step = d * scale
+            base = g // 8
+            part = (g % 8) // 2
+            i = g % 2
+            for j, x in enumerate(group):
+                q = max(-32, min(31, int(round(x / step))))
+                code = q + 32  # 0..63
+                l = i * 16 + j
+                # q1/q3 read qlc[l], q2/q4 read qlc[l+32]; q1/q2 take the low
+                # nibble, q3/q4 the high one. Getting either wrong silently
+                # permutes 6-bit codes between quarters of the block.
+                ql_index = base * 64 + l + 32 * (part % 2)
+                qh_index = base * 32 + l
+                ql[ql_index] |= (code & 0xF) << (4 * (part // 2))
+                qh[qh_index] |= ((code >> 4) & 3) << (2 * part)
+        out += bytes(ql) + bytes(qh) + bytes(scales) + encode_f16(d)
+
+        # Round-trip through the independent decoder: an encoder that disagrees
+        # with it would silently write a fixture the runtime cannot match.
+        decoded = qref.q6_k(bytes(ql) + bytes(qh) + bytes(scales) + encode_f16(d))
+        for j, want in enumerate(chunk):
+            got = decoded[j]
+            step = d * scales[j // 16]  # the 16-value group's own scale
+            if abs(got - want) > step / 2 + 1e-6:
+                raise SystemExit(f"Q6_K round-trip mismatch at {j}: {got} vs {want}")
+    return bytes(out)
+
+
 ENCODERS = {
     "q8_0": lambda values: quantize_q8_0(values)[0],
     "q4_0": encode_q4_0,
     "q4_k": encode_q4_k,
+    "q6_k": encode_q6_k,
 }
 
 
@@ -201,6 +259,7 @@ def decode_reference(type_id: int, payload: bytes, block_bytes: int) -> list[flo
         Q8_0: qref.q8_0,
         Q4_0: qref.q4_0,
         Q4_K: qref.q4_k,
+        Q6_K: qref.q6_k,
     }[type_id]
     out: list[float] = []
     for start in range(0, len(payload), block_bytes):
@@ -313,7 +372,172 @@ def metadata(tensors: list[TensorSpec], cfg: Cfg, *, name: str, file_type: int) 
     }
 
 
+MIXED = {
+    "hidden": 256,
+    "intermediate": 256,
+    "vocab": 258,
+    "layers": 1,
+    "heads": 4,
+    "head_dim": 64,
+    "experts": 2,
+    "top_k": 1,
+    "context": 256,
+}
+
+
+def mixed_expert_tensors(fused: bool) -> list[tuple[str, list[int], list[float], int]]:
+    """A qwen3moe-shaped expert stack whose projections use *different* types.
+
+    `ffn_gate`/`ffn_up` are Q4_K and `ffn_down` is Q6_K, so each expert record
+    has two different strides inside it. That is the layout real mixed-precision
+    checkpoints use, and the one a single shared stride silently corrupts.
+    """
+    H, I, V = MIXED["hidden"], MIXED["intermediate"], MIXED["vocab"]
+    E, L = MIXED["experts"], MIXED["layers"]
+    out: list[tuple[str, list[int], list[float], int]] = []
+
+    def add(name: str, dims: list[int], seed: str, scale: float, type_id: int) -> None:
+        count = product(dims)
+        out.append((name, dims, deterministic(seed, count, scale), type_id))
+
+    add("token_embd.weight", [H, V], "mx-embd", 0.06, Q4_K)
+    add("output.weight", [H, V], "mx-output", 0.06, Q4_K)
+    out.append(("output_norm.weight", [H], [1.0 + x for x in deterministic("mx-onorm", H, 0.05)], 0))
+    for layer in range(L):
+        p = f"mx-{layer}."
+        out.append((layer_name(layer, "attn_norm.weight"), [H],
+                    [1.0 + x for x in deterministic(p + "anorm", H, 0.05)], 0))
+        out.append((layer_name(layer, "ffn_norm.weight"), [H],
+                    [1.0 + x for x in deterministic(p + "fnorm", H, 0.05)], 0))
+        for suffix in ("attn_q.weight", "attn_k.weight", "attn_v.weight", "attn_output.weight"):
+            add(layer_name(layer, suffix), [H, H], p + suffix, 0.06, Q4_K)
+        add(layer_name(layer, "ffn_gate_inp.weight"), [H, E], p + "router", 0.10, 0)
+        if fused:
+            add(layer_name(layer, "ffn_gate_up_exps.weight"), [H, 2 * I, E], p + "gu", 0.06, Q4_K)
+        else:
+            add(layer_name(layer, "ffn_gate_exps.weight"), [H, I, E], p + "gate", 0.06, Q4_K)
+            add(layer_name(layer, "ffn_up_exps.weight"), [H, I, E], p + "up", 0.06, Q4_K)
+        # The down projection is the one that uses the other block format.
+        add(layer_name(layer, "ffn_down_exps.weight"), [I, H, E], p + "down", 0.06, Q6_K)
+    return out
+
+
+def mixed_expert_metadata(name: str, file_type: int) -> dict[str, tuple]:
+    H, I, V = MIXED["hidden"], MIXED["intermediate"], MIXED["vocab"]
+    L, HEADS, HD = MIXED["layers"], MIXED["heads"], MIXED["head_dim"]
+    E, TOPK, CTX = MIXED["experts"], MIXED["top_k"], MIXED["context"]
+    return {
+        "general.architecture": ("string", "qwen3moe"),
+        "general.name": ("string", name),
+        "general.alignment": ("u32", ALIGN),
+        "general.file_type": ("u32", file_type),
+        "general.quantization_version": ("u32", 1),
+        "qwen3moe.block_count": ("u32", L),
+        "qwen3moe.embedding_length": ("u32", H),
+        "qwen3moe.feed_forward_length": ("u32", I),
+        "qwen3moe.attention.head_count": ("u32", HEADS),
+        "qwen3moe.attention.head_count_kv": ("u32", HEADS),
+        "qwen3moe.attention.key_length": ("u32", HD),
+        "qwen3moe.attention.value_length": ("u32", HD),
+        "qwen3moe.attention.layer_norm_rms_epsilon": ("f32", 1e-5),
+        "qwen3moe.rope.dimension_count": ("u32", HD),
+        "qwen3moe.rope.freq_base": ("f32", 10000.0),
+        "qwen3moe.context_length": ("u32", CTX),
+        "qwen3moe.vocab_size": ("u32", V),
+        "qwen3moe.expert_count": ("u32", E),
+        "qwen3moe.expert_used_count": ("u32", TOPK),
+        "tokenizer.ggml.model": ("string", "freemoe.byte-v1"),
+        "tokenizer.ggml.bos_token_id": ("u32", 256),
+        "tokenizer.ggml.eos_token_id": ("u32", 257),
+        "tokenizer.ggml.tokens": ("array_string", tokenizer_tokens(V)),
+    }
+
+
+def build_mixed_expert_fixtures() -> dict[str, dict]:
+    """Mixed-type expert stacks, fused and separate.
+
+    The F32 twin stores exactly the values the independent Python decoder reports
+    for the quantised bytes, so an engine match proves the per-projection type
+    dispatch and stride arithmetic rather than merely self-consistency.
+    """
+    report: dict[str, dict] = {}
+    for label, fused in (("fused", True), ("separate", False)):
+        quantised: list[TensorSpec] = []
+        reference: list[TensorSpec] = []
+        payload_bytes = 0
+        for name, dims, values, type_id in mixed_expert_tensors(fused):
+            if type_id == 0:
+                data = f32_bytes(values)
+            else:
+                data = ENCODERS[{Q4_K: "q4_k", Q6_K: "q6_k"}[type_id]](values)
+                decoded = decode_reference(type_id, data,
+                                           {Q4_K: 144, Q6_K: 210}[type_id])
+                if len(decoded) != len(values):
+                    raise SystemExit(f"mixed {label}: {name} decoded to the wrong length")
+                reference.append(TensorSpec(name, list(dims), f32_bytes(decoded), 0))
+                payload_bytes += len(data)
+            quantised.append(TensorSpec(name, list(dims), data, type_id))
+            if type_id == 0:
+                reference.append(TensorSpec(name, list(dims), data, 0))
+        q_path = FIXTURES / f"quant-expert-{label}.gguf"
+        r_path = FIXTURES / f"quant-expert-{label}-f32ref.gguf"
+        q_path.write_bytes(GGUFWriter(
+            mixed_expert_metadata(f"FreeMoe synthetic mixed-type experts ({label})", Q4_K),
+            quantised).build())
+        r_path.write_bytes(GGUFWriter(
+            mixed_expert_metadata(f"FreeMoe synthetic mixed-type experts ({label}) F32 reference", 0),
+            reference).build())
+        report[label] = {
+            "model": q_path.name,
+            "reference": r_path.name,
+            "fused_gate_up_exps": fused,
+            "gate_up_type_id": Q4_K,
+            "down_type_id": Q6_K,
+            "quantised_payload_bytes": payload_bytes,
+            "model_bytes": q_path.stat().st_size,
+            "model_sha256": hashlib.sha256(q_path.read_bytes()).hexdigest(),
+            "reference_sha256": hashlib.sha256(r_path.read_bytes()).hexdigest(),
+        }
+    return report
+
+
+def check() -> int:
+    """Verify the committed fixtures against the manifest's hashes.
+
+    The fixtures are generated, so they can drift from the generator without
+    anything noticing; the manifest records a SHA-256 per file precisely so that
+    drift is a failure instead of a silent difference between what the tests run
+    and what the generator produces.
+    """
+    if not MANIFEST.exists():
+        print(f"{MANIFEST.relative_to(ROOT)} is missing", file=sys.stderr)
+        return 1
+    manifest = json.loads(MANIFEST.read_text())
+    problems: list[str] = []
+    for label, entry in sorted(manifest.get("variants", {}).items()):
+        for kind in ("model", "reference"):
+            name = entry.get(kind)
+            if not name:
+                problems.append(f"{label}: no {kind} recorded")
+                continue
+            path = FIXTURES / name
+            if not path.exists():
+                problems.append(f"{label}: missing {name}")
+                continue
+            digest = hashlib.sha256(path.read_bytes()).hexdigest()
+            if digest != entry.get(f"{kind}_sha256"):
+                problems.append(f"{label}: {name} does not match the manifest hash")
+    if problems:
+        for problem in problems:
+            print(problem, file=sys.stderr)
+        return 1
+    print(f"quant fixtures are up to date ({len(manifest.get('variants', {}))} variants)")
+    return 0
+
+
 def main() -> int:
+    if "--check" in sys.argv[1:]:
+        return check()
     FIXTURES.mkdir(parents=True, exist_ok=True)
     outputs: dict[str, dict] = {}
     for label, type_id, block_size, block_bytes in VARIANTS:
@@ -367,6 +591,8 @@ def main() -> int:
                 "top_k": cfg.top_k,
             },
         }
+
+    outputs.update({f"expert-{key}": value for key, value in build_mixed_expert_fixtures().items()})
 
     manifest = {
         "schema": "freemoe.quant-fixtures.v2",

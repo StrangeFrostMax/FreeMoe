@@ -27,16 +27,7 @@
 #include <vector>
 
 namespace fm {
-namespace {
 
-struct ArchFacts {
-    // Families whose block structure FreeMoe already understands: pre-norm
-    // RMSNorm + RoPE + SwiGLU with the standard tensor names.
-    bool llama_family = false;
-    bool needs_adapter = true;
-};
-
-// Single source of truth for "which architectures have a forward pass".
 // `needs_adapter` is false when this build can actually run the architecture;
 // everything else is inspected and reported, never silently attempted.
 const std::map<std::string, ArchFacts> &known_architectures() {
@@ -88,11 +79,18 @@ const std::map<std::string, ArchFacts> &known_architectures() {
         // router whose gating function, selection bias and group masking all
         // change which experts run.
         {"deepseek2", {true, false}},
+        // smollm3: the llama block with every fourth layer left unrotated.
+        {"smollm3", {true, false}},
+        // bitnet: the llama block plus SUBLN sub-norms and optional one-element
+        // projection scales.
+        {"bitnet", {true, false}},
         {"glm4moe", {false, true}},
         {"multimodal", {false, true}},
     };
     return table;
 }
+
+namespace {
 
 // Tokenizers this build can decode and encode with.
 bool tokenizer_implemented(const std::string &model) {
@@ -458,6 +456,24 @@ Json probe_model(const GGUFDocument &doc, const std::string &source_path) {
               "attention bias tensors are present but attention.qkv_bias is false");
     out.set("attention_qkv_bias", declares_bias || has_bias_tensor);
     out.set("attn_sinks", doc.tensor_by_name.count("blk.0.attn_sinks.weight") != 0);
+    // bitnet's SUBLN pair and its optional one-element projection scales. Both
+    // change the arithmetic inside the block, so a reader needs to see them.
+    const bool has_attn_sub_norm = doc.tensor_by_name.count("blk.0.attn_sub_norm.weight") != 0;
+    const bool has_ffn_sub_norm = doc.tensor_by_name.count("blk.0.ffn_sub_norm.weight") != 0;
+    out.set("sub_norms", has_attn_sub_norm && has_ffn_sub_norm);
+    if (has_attn_sub_norm != has_ffn_sub_norm)
+        block("SUB_NORM_INCOMPLETE",
+              "attn_sub_norm and ffn_sub_norm must both be present or both absent");
+    if (arch == "bitnet" && !has_attn_sub_norm)
+        block("SUB_NORM_MISSING",
+              "bitnet requires attn_sub_norm.weight and ffn_sub_norm.weight");
+    bool has_projection_scale = false;
+    for (const char *suffix : {"attn_q.scale", "attn_k.scale", "attn_v.scale",
+                               "attn_output.scale", "ffn_gate.scale", "ffn_up.scale",
+                               "ffn_down.scale"})
+        if (doc.tensor_by_name.count("blk.0." + std::string(suffix)) != 0)
+            has_projection_scale = true;
+    out.set("projection_scales", has_projection_scale);
     // Context extension. `none`, `linear` and `yarn` are implemented; anything
     // else changes the rotation in a way this build cannot reproduce, so it is a
     // blocker rather than an approximation. Reported even when it is none, so a
@@ -549,6 +565,8 @@ Json probe_model(const GGUFDocument &doc, const std::string &source_path) {
         if (doc.tensor_by_name.count("blk.0.rope_freqs.weight") != 0) tags.push(Json::string("rope_freqs=yes"));
         if (doc.tensor_by_name.count("blk.0.attn_q_norm.weight") != 0)
             tags.push(Json::string("qk_norm=per-head"));
+        if (has_attn_sub_norm && has_ffn_sub_norm) tags.push(Json::string("subln=yes"));
+        if (has_projection_scale) tags.push(Json::string("proj_scale=yes"));
         if (doc.tensor_by_name.count("blk.0.ffn_gate_exps.weight") != 0) tags.push(Json::string("moe=stacked"));
         adapter.set("tags", std::move(tags));
         out.set("adapter", std::move(adapter));

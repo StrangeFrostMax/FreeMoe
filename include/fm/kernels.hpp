@@ -37,6 +37,12 @@ constexpr uint32_t MAX_KERNEL_THREADS = 64;
 KernelIsa resolved_isa(const KernelConfig &config);
 uint32_t resolved_threads(const KernelConfig &config);
 
+// Multiply-adds below which a GEMV stays on the calling thread for `threads`
+// workers. Per thread, because the cost being amortised (a wake-up and a join)
+// is per worker. Exposed so the policy is a tested fact rather than a constant
+// buried in the dispatch.
+uint64_t threading_min_work(uint32_t threads);
+
 // Deterministic scalar reference: out = W * x with W[row, k] at row*in_dim + k,
 // accumulated in ascending k order in float. This is the correctness oracle for
 // every faster path.

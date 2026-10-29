@@ -3,9 +3,23 @@
 #include "fm/common.hpp"
 #include "fm/gguf.hpp"
 
+#include <map>
 #include <string>
 
 namespace fm {
+
+// What the probe knows about one architecture, independent of any file.
+struct ArchFacts {
+    // True when the architecture's block structure is the llama-family block.
+    bool llama_family = false;
+    // False when this build can actually run the architecture.
+    bool needs_adapter = true;
+};
+
+// Single source of truth for "which architectures have a forward pass". Exposed
+// so the tests can require it to agree with the adapter table rather than
+// trusting two hand-maintained lists to stay in step.
+const std::map<std::string, ArchFacts> &known_architectures();
 
 // Architecture-agnostic support probe.
 //

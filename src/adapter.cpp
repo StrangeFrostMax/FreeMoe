@@ -32,6 +32,7 @@ const AdapterRow kRows[] = {
     {"orion", "LLM_ARCH_ORION", "llm_build_orion", "llama block with its own head layout"},
     {"gptneox", "LLM_ARCH_GPTNEOX", "llm_build_gptneox", "LayerNorm, gate-free GELU, parallel attention/FFN"},
     {"stablelm", "LLM_ARCH_STABLELM", "llm_build_stablelm", "llama block with its own rotary width"},
+    {"bitnet", "LLM_ARCH_BITNET", "llm_build_bitnet", "llama block plus SUBLN sub-norms and optional projection scales"},
 };
 
 }  // namespace
@@ -78,7 +79,10 @@ const char *adapter_tensor_op(TensorRole role) {
     case TensorRole::ATTN_Q_NORM:
     case TensorRole::ATTN_K_NORM:
     case TensorRole::ATTN_Q_A_NORM:
-    case TensorRole::ATTN_KV_A_NORM: return "norm";
+    case TensorRole::ATTN_KV_A_NORM:
+    case TensorRole::ATTN_SUB_NORM:
+    case TensorRole::FFN_SUB_NORM: return "norm";
+    case TensorRole::PROJECTION_SCALE: return "mul";
     case TensorRole::ATTN_Q:
     case TensorRole::ATTN_K:
     case TensorRole::ATTN_V:
@@ -150,6 +154,8 @@ std::vector<std::string> adapter_config_tags(const ModelConfig &cfg) {
     tags.push_back(std::string("norm=") + (cfg.layer_norm ? "layernorm" : "rmsnorm"));
     if (cfg.norm_add_one) tags.push_back("norm=zero-centred");
     if (cfg.post_norms) tags.push_back("post_norms=yes");
+    if (cfg.sub_norms) tags.push_back("subln=yes");
+    if (cfg.projection_scales) tags.push_back("proj_scale=yes");
     tags.push_back("ffn=" + cfg.activation);
     if (cfg.activation_limit > 0.0)
         tags.push_back("ffn_clamp=" + std::to_string(cfg.activation_limit));

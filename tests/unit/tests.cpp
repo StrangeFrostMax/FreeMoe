@@ -1,3 +1,4 @@
+#include "fm/activation.hpp"
 #include "fm/backend.hpp"
 #include "fm/engine.hpp"
 #include "fm/gguf.hpp"
@@ -1263,7 +1264,7 @@ void test_quant_model_parity() {
     // produces for those bytes. Matching greedy tokens and matching logits mean
     // the C++ decoder, the fused kernel and the engine path all agree with the
     // format definition, not merely with each other.
-    for (const std::string variant : {"q8_0", "q4_0", "q4_k"}) {
+    for (const std::string variant : {"q8_0", "q4_0", "q4_k", "q6_k"}) {
         const std::string model = "tests/fixtures/quant-moe-" + variant + ".gguf";
         const std::string reference_path = "tests/fixtures/quant-moe-" + variant + "-f32ref.gguf";
         auto run = [](const std::string &model_path) {
@@ -1302,6 +1303,79 @@ void test_quant_model_parity() {
             saw_block = saw_block || tensor.type_id != 0;
         CHECK(saw_block, variant + " fixture really stores block-encoded tensors");
         check_released(engine, "quantised " + variant);
+    }
+}
+
+// A real mixed-precision expert stack: `ffn_gate`/`ffn_up` in Q4_K and
+// `ffn_down` in Q6_K, in both the separate and the fused (`ffn_gate_up_exps`)
+// layouts. Each expert record then holds two different strides, which is the
+// case a single shared stride silently corrupts -- and the case no fixture
+// covered before, because every earlier quantised fixture used one type for
+// every matrix.
+void test_quant_expert_mixed_types() {
+    for (const std::string variant : {"fused", "separate"}) {
+        const std::string model = "tests/fixtures/quant-expert-" + variant + ".gguf";
+        const std::string reference_path =
+            "tests/fixtures/quant-expert-" + variant + "-f32ref.gguf";
+        auto run = [](const std::string &model_path) {
+            auto cfg = make_engine_config(model_path, BackendKind::ScalarCPU,
+                                          ReaderMode::Buffered, 0, false);
+            Engine engine(cfg);
+            engine.initialize();
+            auto result = engine.run_prompt("mixed experts", 6);
+            check_released(engine, model_path);
+            return result;
+        };
+        const PromptResult quantised = run(model);
+        const PromptResult reference = run(reference_path);
+        CHECK(!quantised.generated_ids.empty(), variant + " mixed-type fixture generates tokens");
+        CHECK(quantised.generated_ids == reference.generated_ids,
+              variant + " mixed-type experts match the F32 reference token for token");
+        double worst = 0.0;
+        const size_t n = std::min(quantised.prefill_logits.size(),
+                                  reference.prefill_logits.size());
+        for (size_t i = 0; i < n; ++i)
+            worst = std::max(worst, std::fabs(static_cast<double>(quantised.prefill_logits[i]) -
+                                              reference.prefill_logits[i]));
+        CHECK(n > 0 && worst <= 1e-4, variant + " mixed-type logits match the F32 reference (worst " +
+                                          std::to_string(worst) + ")");
+
+        // The fixture has to really be mixed, and the layout has to be the one
+        // the file declares: a runtime that read both projections with one type
+        // id would still produce numbers, just the wrong ones.
+        auto cfg = make_engine_config(model, BackendKind::ScalarCPU, ReaderMode::Buffered,
+                                      0, false);
+        Engine engine(cfg);
+        engine.initialize();
+        const ModelManifest &manifest = engine.manifest();
+        const std::string gate_name = variant == "fused" ? "blk.0.ffn_gate_up_exps.weight"
+                                                        : "blk.0.ffn_gate_exps.weight";
+        const TensorInfo *gate = manifest.tensor(gate_name);
+        const TensorInfo *down = manifest.tensor("blk.0.ffn_down_exps.weight");
+        CHECK(gate != nullptr && down != nullptr, variant + " fixture carries both expert tensors");
+        if (gate && down) {
+            CHECK(gate->type_id == 12, variant + " gate/up expert tensor is Q4_K");
+            CHECK(down->type_id == 14, variant + " down expert tensor is Q6_K");
+            CHECK(gate->expert_tensor && down->expert_tensor,
+                  variant + " expert tensors are recorded as per-expert");
+            CHECK(down->byte_size / 2 ==
+                      static_cast<uint64_t>(manifest.config.intermediate) *
+                          manifest.config.hidden / 256 * 210,
+                  variant + " the Q6_K expert stride follows the block geometry");
+        }
+        CHECK(manifest.config.fused_gate_up_exps == (variant == "fused"),
+              variant + " the fused gate/up layout is decided by the file");
+        CHECK(manifest.config.model_kind == "moe", variant + " the fixture is an MoE model");
+        CHECK(manifest.expert(0, 0) != nullptr, variant + " expert records are built");
+        if (gate && down && manifest.expert(0, 0) != nullptr) {
+            const ExpertRecord *record = manifest.expert(0, 0);
+            CHECK(record->extents.size() == 3,
+                  variant + " every expert record has three projection extents");
+            if (record->extents.size() == 3)
+                CHECK(record->extents[2].bytes == down->byte_size / 2,
+                      variant + " the down extent uses the Q6_K stride, not the Q4_K one");
+        }
+        check_released(engine, "mixed " + variant);
     }
 }
 
@@ -1509,6 +1583,54 @@ void test_cpu_kernels() {
     CHECK(bench.iterations == 2, "benchmark records its iteration count");
 }
 
+
+// The threaded-dispatch policy. It used to parallelise every GEMV above 65,536
+// multiply-adds, which made a 256x256 projection six times slower on a 2-vCPU
+// host (6.0 us serial, 37.3 us threaded). The threshold is now per worker, and
+// these checks pin both halves: the small shapes stay serial, and the parallel
+// path still produces *bit-identical* rows, because each row is reduced by one
+// worker in the same order.
+void test_thread_dispatch_policy() {
+    CHECK(threading_min_work(1) == (1ull << 20), "one worker needs 1M multiply-adds");
+    CHECK(threading_min_work(2) == 2 * (1ull << 20), "two workers need 2M between them");
+    CHECK(threading_min_work(0) == (1ull << 20), "an unresolved thread count is treated as one");
+    // The shapes the measurement used, and the verdict each must get.
+    CHECK(256ull * 256 <= threading_min_work(2), "a 256x256 projection stays serial");
+    CHECK(256ull * 1024 <= threading_min_work(2), "a 256x1024 projection stays serial");
+    CHECK(1024ull * 4096 >= threading_min_work(2), "a 1024x4096 projection goes wide");
+    CHECK(4096ull * 4096 >= threading_min_work(2), "a 4096x4096 projection goes wide");
+
+    // The parallel path must not change a single bit: every row is one worker's
+    // own sequential reduction, so this is an exactness claim, not a tolerance.
+    const uint32_t out_dim = 1024, in_dim = 4096;
+    std::vector<float> weights(static_cast<size_t>(out_dim) * in_dim);
+    std::vector<float> x(in_dim), serial(out_dim, 0.0f), parallel(out_dim, 0.0f);
+    uint32_t state = 0x51EDu;
+    for (auto &w : weights) {
+        state = state * 1664525u + 1013904223u;
+        w = static_cast<float>((state >> 8) & 0xFFFF) / 65536.0f - 0.5f;
+    }
+    for (auto &v : x) {
+        state = state * 1664525u + 1013904223u;
+        v = static_cast<float>((state >> 8) & 0xFFFF) / 65536.0f - 0.5f;
+    }
+    CHECK(static_cast<uint64_t>(out_dim) * in_dim >= threading_min_work(2),
+          "the determinism check really exercises the parallel path");
+    KernelConfig one;
+    one.threads = 1;
+    KernelConfig two;
+    two.threads = 2;
+    gemv(one, weights.data(), x.data(), serial.data(), out_dim, in_dim);
+    gemv(two, weights.data(), x.data(), parallel.data(), out_dim, in_dim);
+    size_t differing = 0;
+    double worst = 0.0;
+    for (uint32_t i = 0; i < out_dim; ++i) {
+        if (serial[i] != parallel[i]) ++differing;
+        worst = std::max(worst, std::fabs(static_cast<double>(serial[i]) - parallel[i]));
+    }
+    CHECK(differing == 0, "a threaded GEMV is bit-identical to the serial one (worst " +
+                              std::to_string(worst) + ")");
+}
 
 void test_sampling_and_detokenize() {
     // Greedy sampler: highest logit wins, lower id breaks ties.
@@ -2442,6 +2564,123 @@ void test_rope_scaling() {
 // The primitives that change what the feed-forward computes, and the expert
 // layout that changes where its weights live. Parity covers the arithmetic; these
 // checks pin the plumbing so a fixture cannot pass for the wrong reason.
+// The two clamped activation forms agree nowhere near the bound, so they are
+// pinned against hand-computed constants transcribed from the kernels rather
+// than against each other. Values for gate=5, up=3, limit=2:
+//   fused      silu(min(5,2)) * 2  = 3.5231883119115293   (ggml_swiglu_clamp)
+//   non-fused  min(silu(5),2) * 2  = 4.0                  (llama-graph fallback)
+void test_activation_clamp_forms() {
+    ModelConfig cfg;
+    cfg.activation = "silu-clamp";
+    cfg.activation_limit = 2.0;
+    cfg.swiglu_clamp = {2.0};
+
+    const float gate = 5.0f;
+    const float up = 3.0f;
+    cfg.swiglu_clamp_fused = true;
+    CHECK(std::fabs(gated_activation(cfg, gate, up, 0) - 3.5231883119115293f) < 1e-6f,
+          "fused clamp is silu(min(gate,limit)) * clamp(up)");
+    cfg.swiglu_clamp_fused = false;
+    CHECK(std::fabs(gated_activation(cfg, gate, up, 0) - 4.0f) < 1e-6f,
+          "unfused clamp is min(silu(gate),limit) * clamp(up)");
+    CHECK(std::fabs(gated_activation(cfg, gate, up, 0) -
+                    gated_activation(cfg, gate, up, 0)) < 1e-9f,
+          "the activation is deterministic");
+
+    // Below the bound the two forms must coincide: this is the regime every
+    // ordinary token sits in, and it is why the defect only shows up on
+    // saturated activations.
+    const float small_gate = 1.0f;
+    cfg.swiglu_clamp_fused = true;
+    const float fused_small = gated_activation(cfg, small_gate, 0.25f, 0);
+    cfg.swiglu_clamp_fused = false;
+    const float unfused_small = gated_activation(cfg, small_gate, 0.25f, 0);
+    CHECK(std::fabs(fused_small - unfused_small) < 1e-7f,
+          "both clamp forms agree away from the bound");
+
+    // A zero or sub-threshold bound means "this layer is not clamped" in both
+    // forms (llama-graph.cpp:2448 uses 1e-6, not 0).
+    cfg.swiglu_clamp = {0.0, 1e-9};
+    for (bool fused : {true, false}) {
+        cfg.swiglu_clamp_fused = fused;
+        const double expect = static_cast<double>(1.0f) / (1.0 + std::exp(-1.0)) * 3.0;
+        CHECK(std::fabs(gated_activation(cfg, 1.0f, 3.0f, 0) - expect) < 1e-6,
+              "a zero bound leaves the layer unclamped");
+        CHECK(std::fabs(gated_activation(cfg, 1.0f, 3.0f, 1) - expect) < 1e-6,
+              "a 1e-9 bound is also unclamped, matching upstream's epsilon");
+    }
+
+    // Per-layer bounds are indexed, not averaged.
+    cfg.swiglu_clamp = {0.5, 2.0};
+    cfg.swiglu_clamp_fused = true;
+    // layer 0: silu(min(1,0.5)) * clamp(0.5) = silu(0.5) * 0.5
+    CHECK(std::fabs(gated_activation(cfg, 1.0f, 0.5f, 0) - 0.15561483280046365f) < 1e-6f,
+          "layer 0 uses its own bound");
+    // layer 1: silu(min(5,2)) * clamp(0.5) = silu(2) * 0.5
+    CHECK(std::fabs(gated_activation(cfg, 5.0f, 0.5f, 1) - 0.8807970779778823f) < 1e-6f,
+          "layer 1 uses its own bound");
+
+    // swiglu-oai: (min(g,7)/(1+exp(-1.702*min(g,7)))) * (clamp(up)+1).
+    ModelConfig oai;
+    oai.activation = "swiglu-oai";
+    oai.activation_alpha = 1.702;
+    oai.activation_limit = 7.0;
+    CHECK(std::fabs(gated_activation(oai, 5.0f, 3.0f, 0) - 19.99597193493059f) < 1e-5f,
+          "swiglu-oai matches the alpha/limit form");
+    // Above the limit the gate saturates and up is clamped before the +1.
+    CHECK(std::fabs(gated_activation(oai, 50.0f, 9.0f, 0) -
+                    (7.0 / (1.0 + std::exp(-1.702 * 7.0))) * 8.0) < 1e-5,
+          "swiglu-oai saturates at the limit");
+
+    // Plain silu must be untouched by all of this.
+    ModelConfig plain;
+    plain.activation = "silu";
+    CHECK(std::fabs(gated_activation(plain, 1.0f, 3.0f, 0) -
+                    static_cast<float>(1.0 / (1.0 + std::exp(-1.0)) * 3.0)) < 1e-6f,
+          "plain silu is silu(gate) * up");
+}
+
+// The un-gated activation forms. No adapter selects relu/relu_sq/gelu_erf/
+// softplus today -- every family in the table uses silu or gelu -- but they are
+// upstream `llm_ffn_op_type` members (nemotron-h, arcee, lfm2, mistral3 …), so
+// they stay implemented and are pinned here: an untested primitive that a future
+// row turns on is a guess, not an implementation. Four of the seven forms had no
+// test at all before this.
+void test_pointwise_activations() {
+    ModelConfig cfg;
+    cfg.activation = "relu";
+    CHECK(pointwise_activation(cfg, 0.5f) == 0.5f, "relu passes positives through");
+    CHECK(pointwise_activation(cfg, -1.0f) == 0.0f, "relu clamps negatives to zero");
+    cfg.activation = "relu_sq";
+    CHECK(near(pointwise_activation(cfg, 0.5f), 0.25f, 1e-6f), "relu_sq squares the positive part");
+    CHECK(pointwise_activation(cfg, -1.0f) == 0.0f, "relu_sq clamps negatives to zero");
+    cfg.activation = "gelu_erf";
+    CHECK(near(pointwise_activation(cfg, 0.5f), 0.34573123063700656f, 1e-6f),
+          "gelu_erf matches the exact erf form");
+    CHECK(near(pointwise_activation(cfg, -1.0f), -0.15865525393145707f, 1e-6f),
+          "gelu_erf is not clamped at zero for negatives");
+    cfg.activation = "softplus";
+    CHECK(near(pointwise_activation(cfg, 0.5f), 0.9740769841801067f, 1e-6f),
+          "softplus matches log1p(exp(x))");
+    CHECK(near(pointwise_activation(cfg, -1.0f), 0.31326168751822286f, 1e-6f),
+          "softplus is positive for negative inputs");
+    // The gated form multiplies the gate's activation by the up projection, and
+    // the clamp variants must not leak into these plain forms.
+    cfg.activation = "relu_sq";
+    CHECK(near(gated_activation(cfg, 1.5f, 0.5f, 0), 1.125f, 1e-6f),
+          "gated relu_sq is relu(gate)^2 * up");
+    cfg.activation = "relu";
+    CHECK(gated_activation(cfg, -2.0f, 0.5f, 0) == 0.0f, "gated relu zeroes a negative gate");
+    cfg.activation = "gelu_erf";
+    CHECK(near(gated_activation(cfg, 1.0f, 0.5f, 0), 0.42067237303427146f, 1e-6f),
+          "gated gelu_erf is gelu_erf(gate) * up");
+    // A clamp bound in the config must not change an unclamped form.
+    cfg.swiglu_clamp = {2.0, 2.0};
+    cfg.activation_limit = 2.0;
+    CHECK(near(gated_activation(cfg, 1.0f, 0.5f, 0), 0.42067237303427146f, 1e-6f),
+          "a declared clamp bound does not leak into gelu_erf");
+}
+
 void test_ffn_variants() {
     // Fused gate+up experts: both extents point inside one tensor, and the up
     // extent starts exactly where the gate extent ends.
@@ -2610,7 +2849,7 @@ void test_architecture_parity() {
                                            "gptneox", "stablelm", "llama-yarn", "qwen2-linear",
                                            "llama-yarn-mscale", "llama-sinks", "llama-ropfreqs", "smollm3-nope",
                                            "qwen3moe-fused-up", "qwen3moe-clamp",
-                                           "glm4-mrope"};
+                                           "glm4-mrope", "bitnet"};
     for (const std::string &slug : slugs) {
         const std::string model = "tests/fixtures/" + slug + "-shape.gguf";
         ArchGolden golden = read_arch_golden("tests/golden/" + slug + "_reference.txt");
@@ -2699,6 +2938,196 @@ void test_rotated_and_ternary_blockers() {
     }
 }
 
+
+// Three hand-maintained lists decide whether an architecture runs: the adapter
+// table, `is_llama_family` and the probe's known-architecture table. They drifted:
+// `smollm3` and `bitnet` had adapters but the probe reported them as known-but-
+// unsupported. This test makes the drift a failure instead of a wrong report.
+void test_adapter_binding() {
+    CHECK(!adapter_rows().empty(), "the adapter table is not empty");
+    const auto &known = known_architectures();
+    for (const AdapterRow &row : adapter_rows()) {
+        const std::string arch = row.arch;
+        if (arch == "freemoe-tiny") continue;  // native reference block
+        auto it = known.find(arch);
+        CHECK(it != known.end(), "the probe knows every mapped architecture: " + arch);
+        if (it != known.end()) {
+            CHECK(!it->second.needs_adapter,
+                  "an adapter row means the probe reports the architecture runnable: " + arch);
+            CHECK(it->second.llama_family,
+                  "an adapter row is a llama-family block: " + arch);
+        }
+        CHECK(is_llama_family(arch),
+              "an adapter row is claimed by the loader's family list: " + arch);
+        CHECK(row.upstream_enum != nullptr && std::string(row.upstream_enum) != "n/a (native)",
+              "an adapter row names its upstream LLM_ARCH_* enum: " + arch);
+        CHECK(row.graph != nullptr && row.block != nullptr,
+              "an adapter row names its graph and block: " + arch);
+    }
+    // The other direction: the probe must not claim an architecture has a
+    // forward pass when no adapter row exists for it.
+    for (const auto &entry : known) {
+        if (entry.second.needs_adapter) {
+            CHECK(adapter_row(entry.first) == nullptr,
+                  "an architecture needing an adapter has no adapter row: " + entry.first);
+            continue;
+        }
+        CHECK(adapter_row(entry.first) != nullptr || entry.first == "freemoe-tiny",
+              "a runnable architecture has an adapter row: " + entry.first);
+        CHECK(entry.second.llama_family || entry.first == "freemoe-tiny",
+              "a runnable architecture is a llama-family block: " + entry.first);
+        CHECK(is_llama_family(entry.first) || entry.first == "freemoe-tiny",
+              "the loader's family list agrees with the probe: " + entry.first);
+    }
+    // The two architectures this test was written for.
+    CHECK(is_llama_family("smollm3") && is_llama_family("bitnet"),
+          "smollm3 and bitnet are in the loader's family list");
+    CHECK(known.count("smollm3") != 0 && known.count("bitnet") != 0,
+          "smollm3 and bitnet are in the probe's known table");
+}
+
+// A refusal is a first-class outcome, so it gets its own assertions: the error
+// code has to be the specific one (a caller can branch on it), the message has
+// to name what is missing, and `probe` has to report the same fact as a
+// machine-readable blocker instead of exiting with prose. None of that was
+// covered before -- the tests only ever built files that load.
+void test_refusal_paths() {
+    // 1. An architecture no adapter claims.
+    GGUFDocument unknown = parse_gguf_file("tests/fixtures/llama-gqa-shape.gguf");
+    unknown.metadata["general.architecture"].s = "nonsense-arch";
+    std::string message;
+    try {
+        (void)build_manifest(unknown, "nonsense-shape.gguf");
+    } catch (const Error &e) {
+        CHECK(e.code == ErrorCode::UNSUPPORTED_ARCHITECTURE,
+              "an unmapped architecture fails with UNSUPPORTED_ARCHITECTURE");
+        message = e.what();
+    }
+    CHECK(message.find("nonsense-arch") != std::string::npos,
+          "the refusal names the architecture it could not map");
+    CHECK(message.find("probe") != std::string::npos,
+          "the refusal points at `probe` for the exact blockers");
+
+    const Json blocked = probe_model(unknown, "nonsense-shape.gguf");
+    const std::string dump = blocked.dump();
+    CHECK(dump.find("\"runnable\":false") != std::string::npos,
+          "an unmapped architecture is not reported runnable");
+    CHECK(dump.find("UNKNOWN_ARCHITECTURE") != std::string::npos,
+          "the probe names the blocker with a stable code");
+    CHECK(dump.find("nonsense-arch") != std::string::npos,
+          "the blocker detail names the architecture");
+    CHECK(dump.find("\"adapter_available\":false") != std::string::npos,
+          "the probe reports that no adapter is available");
+    CHECK(dump.find("\"blocker_count\":1") != std::string::npos,
+          "the blocker count matches the single defect");
+
+    // 2. The same file, one defect at a time: a missing output projection and a
+    // token table is a blocker, not a crash and not a silent bad result.
+    GGUFDocument no_head = parse_gguf_file("tests/fixtures/llama-gqa-shape.gguf");
+    no_head.tensor_by_name.erase("output.weight");
+    no_head.tensor_by_name.erase("token_embd.weight");
+    const Json headless = probe_model(no_head, "headless.gguf");
+    CHECK(headless.dump().find("NO_OUTPUT_WEIGHT") != std::string::npos,
+          "a file with neither head nor token table is refused by the probe");
+    CHECK(headless.dump().find("\"runnable\":false") != std::string::npos,
+          "a headless file is not reported runnable");
+
+    // 3. A quantisation with no execution kernel is refused where it is used:
+    // the probe says which type, and the loader refuses to run the file.
+    GGUFDocument bad_type = parse_gguf_file("tests/fixtures/llama-gqa-shape.gguf");
+    bad_type.tensors[bad_type.tensor_by_name.at("blk.0.attn_q.weight")].type_id = 143;
+    CHECK(throws_code(ErrorCode::UNSUPPORTED_QUANTISATION,
+                      [&]() { (void)build_manifest(bad_type, "ptq1_0.gguf"); }),
+          "an undecodable tensor type fails with UNSUPPORTED_QUANTISATION");
+    const Json typed = probe_model(bad_type, "ptq1_0.gguf");
+    CHECK(typed.dump().find("UNSUPPORTED_TENSOR_TYPE") != std::string::npos,
+          "the probe names the unsupported tensor type");
+
+    // 4. Every blocker is an object with a code and a detail, so a caller never
+    // has to parse prose. This is the contract `probe --json` publishes.
+    const Json *blockers = nullptr;
+    for (const auto &member : blocked.members())
+        if (member.first == "blockers") blockers = &member.second;
+    CHECK(blockers != nullptr && blockers->type() == Json::Type::Array,
+          "the probe publishes blockers as a JSON array");
+    const bool has_blocker = blockers != nullptr && !blockers->items().empty();
+    CHECK(has_blocker, "the probe publishes at least one blocker for a refused file");
+    if (has_blocker) {
+        const Json &first = blockers->items().front();
+        CHECK(first.type() == Json::Type::Object, "each blocker is a JSON object");
+        bool code_ok = false, detail_ok = false;
+        for (const auto &member : first.members()) {
+            if (member.first == "code" && member.second.type() == Json::Type::String &&
+                !member.second.str().empty())
+                code_ok = true;
+            if (member.first == "detail" && member.second.type() == Json::Type::String &&
+                !member.second.str().empty())
+                detail_ok = true;
+        }
+        CHECK(code_ok, "each blocker carries a non-empty code");
+        CHECK(detail_ok, "each blocker carries a non-empty detail");
+    }
+}
+
+// bitnet's SUBLN: two RMSNorms *inside* the block, plus optional one-element
+// scales on every projection. The parity fixture proves the arithmetic matches
+// the reference; these checks pin the parts a fixture cannot: that the adapter
+// reports the structure, and that a half-written file is refused instead of
+// being run with the sub-norms silently dropped.
+void test_bitnet_sub_norms() {
+    const std::string path = "tests/fixtures/bitnet-shape.gguf";
+    const GGUFDocument doc = parse_gguf_file(path);
+    const ModelManifest manifest = build_manifest(doc, path);
+    CHECK(manifest.config.sub_norms, "a checkpoint with sub-norm tensors enables SUBLN");
+    CHECK(manifest.config.projection_scales,
+          "a checkpoint with one-element scales enables projection scaling");
+    CHECK(manifest.tensor("blk.0.attn_sub_norm.weight") != nullptr,
+          "the attention sub-norm is mapped");
+    if (manifest.tensor("blk.0.attn_sub_norm.weight"))
+        CHECK(manifest.tensor("blk.0.attn_sub_norm.weight")->role == TensorRole::ATTN_SUB_NORM,
+              "the attention sub-norm gets its own role");
+    if (manifest.tensor("blk.0.ffn_sub_norm.weight"))
+        CHECK(manifest.tensor("blk.0.ffn_sub_norm.weight")->role == TensorRole::FFN_SUB_NORM,
+              "the FFN sub-norm gets its own role");
+    if (manifest.tensor("blk.0.attn_q.scale"))
+        CHECK(manifest.tensor("blk.0.attn_q.scale")->role == TensorRole::PROJECTION_SCALE,
+              "the projection scale is claimed rather than ignored");
+    if (manifest.tensor("blk.0.attn_q.scale"))
+        CHECK(manifest.tensor("blk.0.attn_q.scale")->op == "mul",
+              "the projection scale is reported as a multiply");
+    CHECK(manifest.config.architecture == "bitnet", "the bitnet adapter is selected");
+
+    // A file missing either side of the pair would run a different graph while
+    // claiming to be bitnet, so it is a mapping error.
+    GGUFDocument no_ffn_sub = doc;
+    no_ffn_sub.tensor_by_name.erase("blk.0.ffn_sub_norm.weight");
+    CHECK(throws_code(ErrorCode::MISSING_REQUIRED_TENSOR,
+                      [&]() { (void)build_manifest(no_ffn_sub, path); }),
+          "sub-norms on one path only are refused");
+
+    // Likewise for a file that defines them on some layers only.
+    GGUFDocument partial = doc;
+    partial.tensor_by_name.erase("blk.1.attn_sub_norm.weight");
+    CHECK(throws_code(ErrorCode::MISSING_REQUIRED_TENSOR,
+                      [&]() { (void)build_manifest(partial, path); }),
+          "a partially sub-normed checkpoint is refused rather than half-applied");
+
+    // A scale that holds more than one element would broadcast in a way no
+    // checkpoint means, so the shape is enforced at load time.
+    GGUFDocument bad_scale = doc;
+    bad_scale.tensors[bad_scale.tensor_by_name.at("blk.0.attn_q.scale")].dims = {2};
+    CHECK(throws_code(ErrorCode::SHAPE_MISMATCH,
+                      [&]() { (void)build_manifest(bad_scale, path); }),
+          "a projection scale must hold exactly one element");
+
+    // The probe reports both facts, so a reader can see which graph runs.
+    const Json probe = probe_model(doc, path);
+    const std::string dump = probe.dump();
+    CHECK(dump.find("sub_norms") != std::string::npos,
+          "the probe reports the sub-norms");
+    CHECK(dump.find("projection_scales") != std::string::npos,
+          "the probe reports the projection scales");
+}
 
 // llama.cpp parses minicpm's residual_scale and logit_scale, logs them, and
 // never uses them in the graph. Applying them here would quietly disagree with
@@ -3176,8 +3605,10 @@ int main(int argc, char **argv) {
     maybe_run("quant_reference_decode", test_quant_reference_decode);
     maybe_run("quant_gemv", test_quant_gemv);
     maybe_run("quant_model_parity", test_quant_model_parity);
+    maybe_run("quant_expert_mixed_types", test_quant_expert_mixed_types);
     maybe_run("model_probe", test_model_probe);
     maybe_run("cpu_kernels", test_cpu_kernels);
+    maybe_run("thread_dispatch_policy", test_thread_dispatch_policy);
     maybe_run("generic_inspect_and_roundtrip", test_generic_inspect_and_roundtrip);
     maybe_run("sampling_and_detokenize", test_sampling_and_detokenize);
     maybe_run("residency_manager", test_residency_manager);
@@ -3193,10 +3624,15 @@ int main(int argc, char **argv) {
     maybe_run("model_map_and_tied_output", test_model_map_and_tied_output);
     maybe_run("rope_mrope", test_rope_mrope);
     maybe_run("rope_scaling", test_rope_scaling);
+    maybe_run("activation_clamp_forms", test_activation_clamp_forms);
+    maybe_run("pointwise_activations", test_pointwise_activations);
     maybe_run("ffn_variants", test_ffn_variants);
     maybe_run("adapter_tags", test_adapter_tags);
     maybe_run("attention_sinks", test_attention_sinks);
     maybe_run("architecture_parity", test_architecture_parity);
+    maybe_run("bitnet_sub_norms", test_bitnet_sub_norms);
+    maybe_run("refusal_paths", test_refusal_paths);
+    maybe_run("adapter_binding", test_adapter_binding);
     maybe_run("rotated_and_ternary_blockers", test_rotated_and_ternary_blockers);
     maybe_run("minicpm_scales", test_minicpm_scales);
     maybe_run("shared_expert", test_shared_expert);

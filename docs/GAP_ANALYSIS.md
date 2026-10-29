@@ -7,21 +7,29 @@
 > attention sinks are implemented, and `auto` no longer dispatches AVX-512 on a
 > Zen 3 target. The measurements below are the state at `f704e4b` and are kept
 > as the baseline this work is measured against; current numbers live in
-> `docs/MODEL_COVERAGE_STATUS.md` (2235 checks, 26 architecture fixtures).
+> `docs/MODEL_COVERAGE_STATUS.md` (2555 checks, 27 architecture fixtures).
 >
 > What changed since the baseline, in the terms this document uses:
 >
 > * **C7 closed.** The IQ family (IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S,
 >   IQ3_XXS, IQ3_S, IQ4_XS) and both FP4 formats (MXFP4, NVFP4) decode and
->   execute. Every decoder is bit-exact against llama.cpp's own
->   `dequantize_row_*` (`tools/quant_upstream_check.py`, 26 types, 0 failures),
->   and the grids come from a generated table file so the transcription is
->   mechanical. Only `PTQ1_0` stays geometry-only: no verifiable layout exists,
->   so it is refused by name rather than guessed.
+>   execute. Every decoder **matches** llama.cpp's own `dequantize_row_*` to
+>   within 1e-6 relative of the block magnitude -- not bit-exactly, because the
+>   comparison is between two differently-ordered float reductions
+>   (`tools/quant_upstream_check.py`, 26 types, 0 failures, worst absolute
+>   5.0e-06 on IQ4_NL, MXFP4/NVFP4 exact). The grids come from a generated table
+>   file so the transcription is mechanical, and `make test` re-checks that table
+>   structurally (`tools/gen_quant_tables.py --check`, no upstream checkout
+>   needed). Only `PTQ1_0` stays geometry-only: no verifiable layout exists, so
+>   it is refused by name rather than guessed.
 > * **C9 half closed.** `swiglu-oai` (gpt-oss, minimax-m3) and per-layer
->   `swiglu_clamp` (`deepseek4/4.1`, glm5-next) are implemented, along with the
+>   `swiglu_clamp` (`deepseek4/4.1`, glm5-next) are implemented in
+>   `include/fm/activation.hpp`, in both upstream clamp forms, along with the
 >   fused `ffn_gate_up_exps` layout and the router's renormalisation floor.
->   `SITU` and `GEGLU_ERF` remain open.
+>   `SITU` remains open -- it is unimplemented upstream too (`GGML_ABORT`).
+>   `GEGLU_ERF` exists as a pointwise primitive and is pinned by
+>   `pointwise_activations`, but no adapter row selects it yet, so it is a
+>   primitive, not a supported family.
 > * **mRoPE primitive landed.** Sections are parsed, validated against the head
 >   width, and drive a per-axis position selection in `RopePlan`; the text path
 >   is unchanged by construction because all four axes carry the same position.

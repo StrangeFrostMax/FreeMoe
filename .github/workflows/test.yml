@@ -1,0 +1,36 @@
+name: test
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  build-and-test:
+    # The kernels are compiled for the baseline ISA; AVX2/FMA paths are selected
+    # at runtime, so a stock hosted runner exercises the same code this project
+    # ships. `make zen3-fallback` is the separate Zen 3 evidence target and runs
+    # on the real machine, not here.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Configure
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq build-essential python3
+          g++ --version | head -1
+          python3 --version
+      - name: Build
+        run: make -j"$(nproc)" all build/tests build/vnpu-selftest build/fuzz_gguf
+      - name: Unit and architecture tests
+        run: make test
+      - name: Fixture and table regeneration checks
+        run: |
+          python3 tools/gen_quant_tables.py --check
+          python3 tools/quant_reference.py --check
+          python3 tools/make_arch_fixtures.py --check
+          python3 tools/gen_unicode_tables.py --check
+          python3 scripts/check_architecture.py
+          python3 scripts/check_dependencies.py

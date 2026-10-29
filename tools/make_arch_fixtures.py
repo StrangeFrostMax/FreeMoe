@@ -223,6 +223,22 @@ def arch_tensors(spec: dict[str, Any]) -> list[TensorSpec]:
             ]
         if spec.get("post_norms"):
             out += [tensor(p + "ffn_post_norm.weight", [h], 0.0, norm=True)]
+        if spec.get("sub_norms"):
+            # BitNet's SUBLN: one norm on the attention output (hidden wide) and
+            # one on the gated FFN output (intermediate wide). Both are inside
+            # the block, so a post-norm cannot stand in for them.
+            out += [
+                tensor(p + "attn_sub_norm.weight", [h], 0.0, norm=True),
+                tensor(p + "ffn_sub_norm.weight", [i], 0.0, norm=True),
+            ]
+        if spec.get("projection_scales"):
+            # One-element scales, deliberately not 1.0 and different from each
+            # other: a runtime that ignores them, or applies one to the wrong
+            # projection, cannot match the golden.
+            for name, value in (("attn_q", 1.5), ("attn_k", 0.5), ("attn_v", 2.0),
+                                ("attn_output", 0.75), ("ffn_gate", 1.25),
+                                ("ffn_up", 0.5), ("ffn_down", 2.0)):
+                out += [tensor(p + name + ".scale", [1], 0.0, values=[value])]
     out += [tensor("output_norm.weight", [h], 0.0, norm=True)]
     if spec.get("layernorm"):
         out += [tensor("output_norm.bias", [h], 0.05)]
@@ -322,6 +338,21 @@ def arch_metadata(spec: dict[str, Any]) -> dict[str, tuple[Any, ...]]:
 
 
 SPECS: list[dict[str, Any]] = [
+    {
+        # bitnet (llama.cpp's models/bitnet.cpp): the plain pre-norm block plus
+        # two SUBLNs -- an RMSNorm on the attention output before `attn_output`
+        # and one on the gated FFN output before `ffn_down` -- and the optional
+        # one-element `*.scale` on every projection. The output head is tied to
+        # the token table, as upstream's FIXME comment describes.
+        "slug": "bitnet",
+        "arch": "bitnet",
+        "name": "FreeMoe synthetic bitnet with SUBLN sub-norms and projection scales",
+        "kv_heads": 2,
+        "rope_dim": SHAPE["head_dim"],
+        "tied_output": True,
+        "sub_norms": True,
+        "projection_scales": True,
+    },
     {
         # glm4: fused gate+up FFN (gate first, then up), and post-attention /
         # post-FFN norms applied before each residual add. No separate gate.

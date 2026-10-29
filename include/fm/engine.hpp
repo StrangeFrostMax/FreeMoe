@@ -10,6 +10,7 @@
 #include <map>
 #include <random>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -189,6 +190,14 @@ private:
     const float *norm_weights(const std::string &name) const;
     const float *bias_weights(const std::string &name) const;
     bool has_bias(const std::string &name) const;
+    // A one-element tensor (BitNet's `*.scale`), or nothing when the file does
+    // not carry it. Kept separate from `weights()` because absence is normal.
+    std::optional<float> scalar_weight(const std::string &name) const;
+    // Multiply a projection's output by its optional scale, in place. Returns
+    // whether a scale was applied so the caller can log it; llama.cpp applies
+    // this inside `build_lora_mm`, i.e. before any bias is added.
+    bool apply_projection_scale(std::vector<float> &vec, const std::string &name,
+                                const std::string &op);
     std::vector<float> matvec_view(const TensorView &view, const std::vector<float> &x,
                                    uint32_t out_dim, uint32_t in_dim,
                                    const std::string &op);
