@@ -202,7 +202,13 @@ void Engine::load_fixed_weights() {
     // the optional attention biases. Both may be stored in a block format.
     for (const auto &tensor : manifest_.doc.tensors) {
         if (tensor.expert_tensor) continue;
-        if (tensor.dims.size() != 1) continue;
+        // Per-expert bias columns are 2-D ([width, n_expert]) and live in the
+        // fixed buffer, unlike the stacked expert weights they belong to, so
+        // they are decoded here rather than paged.
+        const bool proj_bias_2d = tensor.role == TensorRole::FFN_GATE_EXPS_BIAS ||
+                                  tensor.role == TensorRole::FFN_UP_EXPS_BIAS ||
+                                  tensor.role == TensorRole::FFN_DOWN_EXPS_BIAS;
+        if (tensor.dims.size() != 1 && !proj_bias_2d) continue;
         // Every 1-D vector is either a norm scale (read as a scale, possibly
         // with a bias) or a projection bias (added). phi2 adds biases to the
         // norms, the FFN and the output, so this is a role test rather than a
@@ -217,12 +223,17 @@ void Engine::load_fixed_weights() {
                              tensor.role == TensorRole::OUTPUT_NORM_BIAS ||
                              tensor.role == TensorRole::FFN_UP_BIAS ||
                              tensor.role == TensorRole::FFN_DOWN_BIAS ||
+                             tensor.role == TensorRole::FFN_GATE_BIAS ||
                              tensor.role == TensorRole::OUTPUT_BIAS ||
-                             tensor.role == TensorRole::FFN_EXP_PROBS_B;
+                             tensor.role == TensorRole::FFN_EXP_PROBS_B ||
+                             tensor.role == TensorRole::FFN_ROUTER_BIAS ||
+                             proj_bias_2d;
         if (tensor.type_id == 0 && !is_bias) continue; // already plain floats
-        std::vector<float> values(tensor.dims[0]);
+        size_t count = 1;
+        for (uint32_t d : tensor.dims) count *= d;
+        std::vector<float> values(count);
         dequantize_row(tensor.type_id, file_->data() + tensor.absolute_offset,
-                       values.data(), tensor.dims[0]);
+                       values.data(), count);
         const std::string key = tensor.canonical.empty() ? tensor.name : tensor.canonical;
         if (is_bias) decoded_biases_.emplace(key, std::move(values));
         else decoded_norms_.emplace(key, std::move(values));
@@ -876,6 +887,20 @@ std::vector<float> Engine::forward_token(int32_t token, uint64_t position,
         const bool rotate = c.no_rope_layer_step == 0 ||
                             (layer + 1) % c.no_rope_layer_step != 0;
         if (!c.mla && rotate) rope_half(q, c.heads, k, c.kv_heads, position);
+        // llama.cpp's per-position attention temperature (mistral3, llama4-style
+        // checkpoints): every query component is scaled by
+        //   log(floor(pos / floor) + 1) * temperature_scale + 1
+        // *after* the rotation, so it is a multiplier on the logits of the whole
+        // head rather than on a part of the score.
+        if (c.attn_temp_scale != 0.0) {
+            const double temperature =
+                std::log(std::floor(static_cast<double>(position) / c.attn_temp_floor) + 1.0) *
+                    c.attn_temp_scale +
+                1.0;
+            for (float &v : q) v = static_cast<float>(v * temperature);
+            backend_->record_control("attn_temperature.L" + std::to_string(layer),
+                                     q.size() * sizeof(float), q.size() * sizeof(float));
+        }
 
         size_t current_base = (static_cast<size_t>(layer) * c.context + position) * kv_stride;
         std::memcpy(kv_ + current_base, k.data(), static_cast<size_t>(kv_dim) * sizeof(float));
@@ -886,10 +911,12 @@ std::vector<float> Engine::forward_token(int32_t token, uint64_t position,
         for (uint32_t head = 0; head < c.heads; ++head) {
             const size_t hb = static_cast<size_t>(head) * c.head_dim;
             const size_t kvb = static_cast<size_t>(head / group) * c.head_dim;
-            // gemma2/3 restrict most layers to a sliding window. The first
-            // position that is visible is max(0, position + 1 - window).
+            // gemma2/3 restrict most layers to a sliding window, and gpt-oss
+            // alternates windowed and full layers, so the decision is per layer.
+            // The first position that is visible is max(0, position + 1 - window).
+            const bool windowed = c.layer_uses_window(layer);
             const uint64_t first_visible =
-                c.sliding_window == 0 || position < c.sliding_window
+                !windowed || position < c.sliding_window
                     ? 0
                     : position + 1 - c.sliding_window;
             std::vector<double> scores(position + 1);
@@ -963,7 +990,48 @@ std::vector<float> Engine::forward_token(int32_t token, uint64_t position,
         if (c.parallel_residual) {
             h = attn_normed;
         } else {
-            h = norm(x, prefix + "ffn_norm", "ffn_norm.L" + std::to_string(layer));
+            // gpt-oss normalises after the attention residual and calls that
+            // tensor attn_post_norm; the block arithmetic is unchanged.
+            h = norm(x, prefix + (c.ffn_norm_is_post ? "attn_post_norm" : "ffn_norm"),
+                     "ffn_norm.L" + std::to_string(layer));
+        }
+        if (c.ffn_norm_ada) {
+            // mistral3's adaptive RMSNorm: the normalised input is scaled by
+            // 1 + mlp(t_cond), where t_cond is the sinusoidal embedding of the
+            // configured output delay (constant for the whole session) and the
+            // mlp is down -> gelu_erf -> up.
+            const TensorInfo *down_info = manifest_.tensor(prefix + "ffn_norm_ada_down.weight");
+            const uint32_t bottleneck =
+                down_info && down_info->dims.size() == 2 ? down_info->dims[1] : 0;
+            // cos of the first half, sin of the second, at geometrically spaced
+            // frequencies -- upstream's `input_t_cond`, which is a session
+            // constant rather than a per-token value.
+            const uint32_t half = c.hidden / 2;
+            std::vector<float> t_cond(c.hidden, 0.0f);
+            for (uint32_t i = 0; i < half; ++i) {
+                const double freq = std::exp(-std::log(10000.0) * static_cast<double>(i) / half) *
+                                    c.realtime_delay;
+                t_cond[i] = static_cast<float>(std::cos(freq));
+                t_cond[half + i] = static_cast<float>(std::sin(freq));
+            }
+            std::vector<float> ada =
+                matvec_view(tensor_view(prefix + "ffn_norm_ada_down.weight"), t_cond, bottleneck,
+                            c.hidden, "ffn_norm_ada_down.L" + std::to_string(layer));
+            // gelu_erf, the activation llama.cpp builds this MLP with
+            // (`build_ffn(..., LLM_FFN_GELU_ERF, LLM_FFN_SEQ, il)`).
+            for (float &v : ada) {
+                const double x = v;
+                v = static_cast<float>(0.5 * x * (1.0 + std::erf(x / std::sqrt(2.0))));
+            }
+            backend_->record_control("gelu_erf.L" + std::to_string(layer),
+                                     ada.size() * sizeof(float), ada.size() * sizeof(float));
+            std::vector<float> scale =
+                matvec_view(tensor_view(prefix + "ffn_norm_ada_up.weight"), ada, c.hidden,
+                            bottleneck, "ffn_norm_ada_up.L" + std::to_string(layer));
+            for (uint32_t j = 0; j < c.hidden; ++j)
+                h[j] = static_cast<float>(h[j] * (1.0f + scale[j]));
+            backend_->record_control("ffn_norm_ada.L" + std::to_string(layer),
+                                     h.size() * sizeof(float), h.size() * sizeof(float));
         }
         std::vector<float> ffn(c.hidden, 0.0f);
         // The leading blocks of an MoE model can still carry a plain FFN.
@@ -1006,6 +1074,20 @@ std::vector<float> Engine::forward_token(int32_t token, uint64_t position,
                 up = matvec_view(tensor_view(prefix + "ffn_up.weight"), h, c.intermediate,
                                  c.hidden, "ffn_up.L" + std::to_string(layer));
             }
+            if (c.ffn_gate_bias) {
+                // mistral3 can carry a bias on the gate projection alone; it is
+                // added before the activation, like every other FFN bias.
+                const float *b = bias_weights(prefix + "ffn_gate.bias");
+                for (uint32_t i = 0; i < c.intermediate; ++i) gate[i] += b[i];
+                backend_->record_control("ffn_gate_bias.L" + std::to_string(layer),
+                                         gate.size() * sizeof(float), 0);
+            }
+            if (c.ffn_bias) {
+                const float *b = bias_weights(prefix + "ffn_up.bias");
+                for (uint32_t i = 0; i < c.intermediate; ++i) up[i] += b[i];
+                backend_->record_control("ffn_up_bias.L" + std::to_string(layer),
+                                         up.size() * sizeof(float), 0);
+            }
             if (c.projection_scales) {
                 // Applied to the projection outputs, before the gate product
                 // (`build_ffn` multiplies `up`/`gate` by their scales first).
@@ -1025,6 +1107,12 @@ std::vector<float> Engine::forward_token(int32_t token, uint64_t position,
                               "rmsnorm.ffn_sub.L" + std::to_string(layer));
             ffn = matvec_view(tensor_view(prefix + "ffn_down.weight"), act, c.hidden,
                               c.intermediate, "ffn_down.L" + std::to_string(layer));
+            if (c.ffn_bias) {
+                const float *b = bias_weights(prefix + "ffn_down.bias");
+                for (uint32_t i = 0; i < c.hidden; ++i) ffn[i] += b[i];
+                backend_->record_control("ffn_down_bias.L" + std::to_string(layer),
+                                         ffn.size() * sizeof(float), 0);
+            }
             if (c.projection_scales)
                 apply_projection_scale(ffn, prefix + "ffn_down.scale",
                                        "ffn_down_scale.L" + std::to_string(layer));
@@ -1032,6 +1120,17 @@ std::vector<float> Engine::forward_token(int32_t token, uint64_t position,
             std::vector<float> scores =
                 matvec_view(tensor_view(prefix + "ffn_router.weight"), h, c.expert_count, c.hidden,
                             "router.L" + std::to_string(layer));
+            // gpt-oss biases the router *logits* before any gating function
+            // runs (llama.cpp's gate_inp_b). This is a different tensor from
+            // `ffn_exp_probs_b`, which is added after gating and only steers
+            // selection, so applying one in place of the other would route a
+            // real file wrong.
+            if (c.expert_router_bias) {
+                const float *b = bias_weights(prefix + "ffn_gate_inp.bias");
+                for (size_t i = 0; i < scores.size(); ++i) scores[i] += b[i];
+                backend_->record_control("router_logit_bias.L" + std::to_string(layer),
+                                         scores.size() * sizeof(float), 0);
+            }
             // Which function turns logits into probabilities is a per-family
             // fact: V2 softmaxes, V3 and later use a sigmoid. The weights that
             // come out are always the *unbiased* probabilities; a selection
@@ -1163,6 +1262,19 @@ std::vector<float> Engine::forward_token(int32_t token, uint64_t position,
                     std::vector<float> up = matvec_view(
                         up_view, h, ewidth, c.hidden,
                         "expert_up.L" + std::to_string(layer) + ".E" + std::to_string(expert));
+                    if (c.expert_projection_bias) {
+                        // One bias column per expert, added after the matmul and
+                        // before the activation, matching llama.cpp's
+                        // `ggml_add_id(gate_exps_b, selected_experts)`.
+                        const float *gb = bias_weights(prefix + "ffn_gate_exps.bias");
+                        const float *ub = bias_weights(prefix + "ffn_up_exps.bias");
+                        for (uint32_t j = 0; j < ewidth; ++j) {
+                            gate[j] += gb[static_cast<size_t>(expert) * ewidth + j];
+                            up[j] += ub[static_cast<size_t>(expert) * ewidth + j];
+                        }
+                        backend_->record_control("expert_proj_bias.L" + std::to_string(layer),
+                                                 (ewidth * 2) * sizeof(float), 0);
+                    }
                     std::vector<float> act(ewidth);
                     for (uint32_t j = 0; j < ewidth; ++j) act[j] = gated(gate[j], up[j], layer);
                     backend_->record_control("expert_swiglu.L" + std::to_string(layer),
@@ -1171,6 +1283,11 @@ std::vector<float> Engine::forward_token(int32_t token, uint64_t position,
                     std::vector<float> down = matvec_view(
                         down_view, act, c.hidden, ewidth,
                         "expert_down.L" + std::to_string(layer) + ".E" + std::to_string(expert));
+                    if (c.expert_projection_bias) {
+                        const float *db = bias_weights(prefix + "ffn_down_exps.bias");
+                        for (uint32_t j = 0; j < c.hidden; ++j)
+                            down[j] += db[static_cast<size_t>(expert) * c.hidden + j];
+                    }
                     for (uint32_t j = 0; j < c.hidden; ++j) ffn[j] += weight * down[j];
                 });
             }

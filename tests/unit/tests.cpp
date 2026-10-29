@@ -2864,7 +2864,8 @@ void test_architecture_parity() {
                                            "llama-yarn-mscale", "llama-sinks", "llama-ropfreqs", "smollm3-nope",
                                            "qwen3moe-fused-up", "qwen3moe-clamp",
                                            "glm4-mrope", "bitnet", "arcee", "nemotron",
-                                           "jais2"};
+                                           "jais2", "gpt-oss", "plm", "mistral3",
+                                           "qwen3vl", "qwen3vlmoe"};
     for (const std::string &slug : slugs) {
         const std::string model = "tests/fixtures/" + slug + "-shape.gguf";
         ArchGolden golden = read_arch_golden("tests/golden/" + slug + "_reference.txt");
@@ -2932,6 +2933,7 @@ void test_gate_free_families() {
         {"arcee", "arcee", "relu_sq", false, false, false},
         {"nemotron", "nemotron", "relu_sq", true, true, false},
         {"jais2", "jais2", "relu_sq", true, true, true},
+        {"plm", "plm", "relu_sq", false, false, false},
     };
     for (const Expect &c : cases) {
         const std::string path = std::string("tests/fixtures/") + c.slug + "-shape.gguf";
@@ -3426,6 +3428,255 @@ void test_deepseek2_mla() {
           "the probe reports the selection bias");
 }
 
+// gpt-oss (`src/models/openai-moe.cpp`): attention sinks, a post-attention norm
+// that is the MoE's input norm (there is no ffn_norm), a biased router, a bias
+// on each routed projection, `swiglu_oai` and alternating full/windowed layers.
+// Every one of those changes a number, so each is checked on its own.
+void test_gpt_oss_block() {
+    const std::string path = "tests/fixtures/gpt-oss-shape.gguf";
+    RunConfig config;
+    config.model_path = path;
+    config.budget.total_hot_bytes = 64ull * 1024 * 1024;
+    Engine engine(config);
+    engine.initialize();
+
+    const ModelConfig &cfg = engine.manifest().config;
+    CHECK(cfg.architecture == "gpt-oss", "gpt-oss adapter is selected");
+    CHECK(!cfg.parallel_residual,
+          "a post-attention norm is not a parallel residual: the block is pre-norm");
+    CHECK(cfg.ffn_norm_is_post, "the FFN norm is the post-attention norm");
+    CHECK(!cfg.post_norms, "gpt-oss has no post-FFN norm, so it is not a post-norm block");
+    CHECK(cfg.attn_sinks, "the attention sinks are read from the file");
+    CHECK(cfg.activation == "swiglu-oai",
+          "gpt-oss uses swiglu_oai, not SwiGLU: the activation comes from the family");
+    CHECK(cfg.activation_limit == 7.0 && cfg.activation_alpha == 1.702,
+          "swiglu_oai's limit and alpha are llama.cpp's 7.0 and 1.702");
+    CHECK(cfg.expert_router_bias, "the router bias is detected from the file");
+    CHECK(cfg.expert_projection_bias, "the per-expert projection biases are detected");
+    CHECK(!cfg.expert_selection_bias,
+          "a router-logit bias is not the selection bias; the two are different tensors");
+    CHECK(cfg.expert_gating == "softmax-weight",
+          "gpt-oss gates with softmax-weight (LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX_WEIGHT)");
+
+    // Alternating windows: 12 wide, every second layer. The period form marks
+    // layers whose index is not a multiple of the period, so 0 and 2 are full.
+    CHECK(cfg.sliding_window == 12, "the window width is read");
+    CHECK(cfg.swa_layers.size() == 4, "one window flag per layer");
+    if (cfg.swa_layers.size() == 4) {
+        CHECK(cfg.swa_layers[0] == 0 && cfg.swa_layers[2] == 0,
+              "the first and third layers attend to the whole context");
+        CHECK(cfg.swa_layers[1] == 1 && cfg.swa_layers[3] == 1,
+              "the second and fourth layers are windowed");
+    }
+    CHECK(!cfg.layer_uses_window(0) && cfg.layer_uses_window(1),
+          "the per-layer decision is exposed, not just the model-wide window");
+
+    ArchGolden golden = read_arch_golden("tests/golden/gpt-oss_reference.txt");
+    PromptResult result = engine.run_prompt(golden.prompt, 8);
+    CHECK(result.input_ids == golden.input_ids, "prompt tokenization matches the reference");
+    CHECK(result.generated_ids == golden.greedy,
+          "greedy decoding matches the reference, windows and all");
+
+    bool router_bias = false, expert_bias = false, post_norm_ffn = false;
+    for (const OpRecord &op : engine.backend().operations()) {
+        if (op.name == "router_logit_bias.L0") router_bias = true;
+        if (op.name == "expert_proj_bias.L0") expert_bias = true;
+        if (op.name == "ffn_norm.L0") post_norm_ffn = true;
+    }
+    CHECK(router_bias, "the router bias is added to the logits as its own step");
+    CHECK(expert_bias, "each expert's projection bias is added as its own step");
+    CHECK(post_norm_ffn, "the FFN normalises through the post-attention norm");
+    engine.release_runtime();
+
+    auto doc = parse_gguf_file(path);
+    // A pattern shorter than the layer count would silently describe only the
+    // first layers, so it is refused.
+    {
+        GGUFDocument broken = doc;
+        MetadataValue pattern;
+        pattern.type = GGUFValueType::ARRAY;
+        for (int i = 0; i < 3; ++i) {
+            MetadataValue entry;
+            entry.type = GGUFValueType::BOOL;
+            entry.b = i % 2 == 1;
+            pattern.array.push_back(entry);
+        }
+        broken.metadata["gpt-oss.attention.sliding_window_pattern"] = pattern;
+        CHECK(throws_code(ErrorCode::METADATA_MISMATCH,
+                          [&]() { (void)build_manifest(broken, path); }),
+              "a window pattern that does not cover every layer is refused");
+    }
+    // Half a bias: the flag is per model but the tensors are per layer, so one
+    // missing layer would run that block with a different router.
+    {
+        GGUFDocument broken = doc;
+        broken.tensor_by_name.erase("blk.1.ffn_gate_inp.bias");
+        CHECK(throws_code(ErrorCode::MISSING_REQUIRED_TENSOR,
+                          [&]() { (void)build_manifest(broken, path); }),
+              "a router bias on only some layers is refused");
+    }
+    {
+        GGUFDocument broken = doc;
+        broken.tensor_by_name.erase("blk.2.ffn_down_exps.bias");
+        CHECK(throws_code(ErrorCode::MISSING_REQUIRED_TENSOR,
+                          [&]() { (void)build_manifest(broken, path); }),
+              "an expert projection bias on only some layers is refused");
+    }
+    // A post-attention norm with an ordinary ffn_norm beside it is neither
+    // gpt-oss nor gemma: the block would use one of the two and drop the other.
+    {
+        GGUFDocument broken = doc;
+        TensorInfo fake;
+        fake.name = "blk.0.ffn_norm.weight";
+        fake.dims = {cfg.hidden};
+        fake.type_id = 0;
+        broken.tensors.push_back(fake);
+        broken.tensor_by_name[fake.name] = broken.tensors.size() - 1;
+        CHECK(throws_code(ErrorCode::MISSING_REQUIRED_TENSOR,
+                          [&]() { (void)build_manifest(broken, path); }),
+              "the norm layout has to be one known shape, not a mix");
+    }
+}
+
+// plm (`src/models/plm.cpp`): multi-head latent attention with a one-step q
+// projection, a gate-free relu^2 FFN and the output head tied to the token
+// table. This is the file that makes `relu_sq` reachable end to end.
+void test_plm_block() {
+    const std::string path = "tests/fixtures/plm-shape.gguf";
+    RunConfig config;
+    config.model_path = path;
+    config.budget.total_hot_bytes = 64ull * 1024 * 1024;
+    Engine engine(config);
+    engine.initialize();
+
+    const ModelConfig &cfg = engine.manifest().config;
+    CHECK(cfg.architecture == "plm", "plm adapter is selected");
+    CHECK(cfg.mla, "the kv latent marks multi-head latent attention");
+    CHECK(cfg.q_lora_rank == 0, "a zero q rank means the one-step q projection");
+    CHECK(cfg.kv_lora_rank == 16, "the kv latent width is read");
+    CHECK(cfg.head_v_dim() != cfg.head_dim, "the value width is its own number here");
+    CHECK(cfg.ffn_no_gate, "the FFN has one projection, not a gate and an up");
+    CHECK(cfg.activation == "relu_sq",
+          "plm's activation is relu^2 (LLM_FFN_RELU_SQR), not a default");
+
+    ArchGolden golden = read_arch_golden("tests/golden/plm_reference.txt");
+    PromptResult result = engine.run_prompt(golden.prompt, 8);
+    CHECK(result.input_ids == golden.input_ids, "prompt tokenization matches the reference");
+    CHECK(result.generated_ids == golden.greedy, "greedy decoding matches the reference");
+
+    bool q_rope = false, kv_rope = false, mla_expand = false, gate = false;
+    for (const OpRecord &op : engine.backend().operations()) {
+        if (op.name == "mla_rope_q.L0") q_rope = true;
+        if (op.name == "mla_rope_k.L0") kv_rope = true;
+        if (op.name == "mla_expand.L0") mla_expand = true;
+        if (op.name == "ffn_gate.L0") gate = true;
+    }
+    CHECK(q_rope && kv_rope, "rotary runs on the query heads and the shared k_pe");
+    CHECK(mla_expand, "the latent is expanded per head");
+    CHECK(!gate, "a gate-free FFN must not run a gate");
+    engine.release_runtime();
+}
+
+// mistral3 (`src/models/mistral3.cpp`): the llama block plus biases on all three
+// FFN projections, an adaptive RMSNorm whose MLP is a gelu_erf over a sinusoidal
+// delay embedding, and llama.cpp's per-position attention temperature. Each of
+// the three is checked on its own, and the temperature's missing-floor case is
+// refused rather than silently replaced by 1.0.
+void test_mistral3_block() {
+    const std::string path = "tests/fixtures/mistral3-shape.gguf";
+    RunConfig config;
+    config.model_path = path;
+    config.budget.total_hot_bytes = 64ull * 1024 * 1024;
+    Engine engine(config);
+    engine.initialize();
+
+    const ModelConfig &cfg = engine.manifest().config;
+    CHECK(cfg.architecture == "mistral3", "mistral3 adapter is selected");
+    CHECK(cfg.ffn_gate_bias && cfg.ffn_bias, "all three FFN projections carry a bias");
+    CHECK(cfg.ffn_norm_ada, "the adaptive norm is detected from its tensors");
+    CHECK(cfg.realtime_delay == 7, "the delay driving the embedding is read");
+    CHECK(cfg.attn_temp_scale != 0.0 && cfg.attn_temp_floor == 32.0,
+          "the attention temperature and its ramp floor are read");
+    CHECK(cfg.activation == "silu",
+          "the FFN itself is SwiGLU; gelu_erf belongs to the adaptive norm only");
+
+    ArchGolden golden = read_arch_golden("tests/golden/mistral3_reference.txt");
+    PromptResult result = engine.run_prompt(golden.prompt, 8);
+    CHECK(result.input_ids == golden.input_ids, "prompt tokenization matches the reference");
+    CHECK(result.generated_ids == golden.greedy, "greedy decoding matches the reference");
+
+    bool ada = false, gelu_erf = false, temp = false, gate_bias = false, down_bias = false;
+    for (const OpRecord &op : engine.backend().operations()) {
+        if (op.name == "ffn_norm_ada.L0") ada = true;
+        if (op.name == "gelu_erf.L0") gelu_erf = true;
+        if (op.name == "attn_temperature.L0") temp = true;
+        if (op.name == "ffn_gate_bias.L0") gate_bias = true;
+        if (op.name == "ffn_down_bias.L0") down_bias = true;
+    }
+    CHECK(ada && gelu_erf, "the adaptive norm runs, and its MLP is a gelu_erf");
+    CHECK(temp, "the attention temperature is applied per position");
+    CHECK(gate_bias && down_bias, "the FFN biases are added as their own steps");
+    engine.release_runtime();
+
+    auto doc = parse_gguf_file(path);
+    {
+        // The floor is a required key, not a default: upstream throws when it is
+        // missing, and 1.0 would be a silently different model.
+        GGUFDocument broken = doc;
+        broken.metadata.erase("mistral3.rope.scaling.original_context_length");
+        CHECK(throws_code(ErrorCode::METADATA_MISMATCH,
+                          [&]() { (void)build_manifest(broken, path); }),
+              "a temperature scale without a ramp floor is refused");
+    }
+    {
+        // Half an adaptive norm: the down projection without its partner would
+        // silently become an identity-prefixed scale.
+        GGUFDocument broken = doc;
+        broken.tensor_by_name.erase("blk.0.ffn_norm_ada_up.weight");
+        CHECK(throws_code(ErrorCode::MISSING_REQUIRED_TENSOR,
+                          [&]() { (void)build_manifest(broken, path); }),
+              "the adaptive norm needs both of its projections");
+    }
+}
+
+// The mRoPE families (qwen3vl/qwen3vlmoe, and qwen35 once its recurrent layers
+// run): llama.cpp reads `rope.dimension_sections` as a required key for them and
+// selects the interleaved layout by architecture, not by a file flag. A file
+// without the split is refused rather than run as plain RoPE.
+void test_mrope_families() {
+    struct Expect {
+        const char *slug;
+        const char *arch;
+        bool moe;
+    };
+    const Expect cases[] = {
+        {"qwen3vl", "qwen3vl", false},
+        {"qwen3vlmoe", "qwen3vlmoe", true},
+    };
+    for (const Expect &c : cases) {
+        const std::string path = std::string("tests/fixtures/") + c.slug + "-shape.gguf";
+        const ModelManifest manifest = build_manifest(parse_gguf_file(path), path);
+        const std::string tag = std::string(c.slug) + ": ";
+        CHECK(manifest.config.architecture == c.arch, tag + "architecture comes from the file");
+        CHECK(manifest.config.mrope, tag + "the section split turns mRoPE on");
+        CHECK(manifest.config.mrope_interleaved,
+              tag + "qwen3vl's layout is interleaved (llama_rope_type)");
+        CHECK(manifest.config.qk_norm, tag + "per-head q/k norm is present");
+        CHECK((manifest.config.expert_count != 0) == c.moe, tag + "routed experts match the file");
+        const std::vector<std::string> tags = adapter_config_tags(manifest.config);
+        const bool mrope_tag = std::find_if(tags.begin(), tags.end(), [](const std::string &t) {
+                                   return t.rfind("mrope=interleaved", 0) == 0;
+                               }) != tags.end();
+        CHECK(mrope_tag, tag + "the adapter reports the interleaved section layout");
+
+        GGUFDocument broken = parse_gguf_file(path);
+        broken.metadata.erase(std::string(c.arch) + ".rope.dimension_sections");
+        CHECK(throws_code(ErrorCode::METADATA_MISMATCH,
+                          [&]() { (void)build_manifest(broken, path); }),
+              tag + "a file without the required section split is refused");
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Chat templates
 // ---------------------------------------------------------------------------
@@ -3705,6 +3956,10 @@ int main(int argc, char **argv) {
     maybe_run("shared_expert", test_shared_expert);
     maybe_run("phi2_block", test_phi2_block);
     maybe_run("deepseek2_mla", test_deepseek2_mla);
+    maybe_run("gpt_oss_block", test_gpt_oss_block);
+    maybe_run("plm_block", test_plm_block);
+    maybe_run("mistral3_block", test_mistral3_block);
+    maybe_run("mrope_families", test_mrope_families);
     maybe_run("chat_template_rendering", test_chat_template_rendering);
     maybe_run("chat_template_constructs", test_chat_template_constructs);
     maybe_run("chat_template_engine", test_chat_template_engine);

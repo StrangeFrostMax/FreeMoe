@@ -36,6 +36,20 @@ const AdapterRow kRows[] = {
     {"arcee", "LLM_ARCH_ARCEE", "llm_build_arcee", "RMSNorm llama block, gate-free FFN with relu^2"},
     {"nemotron", "LLM_ARCH_NEMOTRON", "llm_build_nemotron", "LayerNorm llama block with biases, gate-free relu^2 FFN"},
     {"jais2", "LLM_ARCH_JAIS2", "llm_build_jais2", "LayerNorm llama block, biased projections, gate-free relu^2 FFN"},
+    {"gpt-oss", "LLM_ARCH_OPENAI_MOE", "llama_model_openai_moe::build_arch_graph",
+     "sinks, post-attention norm as FFN norm, biased MoE, swiglu_oai, alternating windows"},
+    {"plm", "LLM_ARCH_PLM", "llama_model_plm::build_arch_graph",
+     "MLA with one-step q, gate-free relu^2 FFN, tied output"},
+    {"qwen3vl", "LLM_ARCH_QWEN3VL", "llama_model_qwen3vl::build_arch_graph",
+     "qwen3 text path with mRoPE sections"},
+    {"qwen3vlmoe", "LLM_ARCH_QWEN3VLMOE", "llama_model_qwen3vlmoe::build_arch_graph",
+     "qwen3moe text path with mRoPE sections"},
+    {"deepseek4", "LLM_ARCH_DEEPSEEK4", "llama_model_deepseek4::build_arch_graph",
+     "MLA plus per-layer swiglu clamp bounds"},
+    {"deepseek41", "LLM_ARCH_DEEPSEEK41", "llama_model_deepseek41::build_arch_graph",
+     "deepseek4 graph with the renormalised router"},
+    {"mistral3", "LLM_ARCH_MISTRAL3", "llama_model_mistral3::build_arch_graph",
+     "llama block, optional MLP biases, gelu_erf adaptive norm, attention temperature"},
 };
 
 }  // namespace
@@ -63,6 +77,13 @@ const char *adapter_tensor_tag(TensorRole role) {
     case TensorRole::ATTN_K_B: return "ATTN_K_B";
     case TensorRole::ATTN_V_B: return "ATTN_V_B";
     case TensorRole::FFN_EXP_PROBS_B: return "FFN_EXP_PROBS_B";
+    case TensorRole::FFN_ROUTER_BIAS: return "FFN_GATE_INP";       // + ".bias"
+    case TensorRole::FFN_GATE_BIAS: return "FFN_GATE_BIAS";
+    case TensorRole::FFN_NORM_ADA_DOWN: return "FFN_NORM_ADA_DOWN";
+    case TensorRole::FFN_NORM_ADA_UP: return "FFN_NORM_ADA_UP";
+    case TensorRole::FFN_GATE_EXPS_BIAS: return "FFN_GATE_EXPS";   // + ".bias"
+    case TensorRole::FFN_UP_EXPS_BIAS: return "FFN_UP_EXPS";       // + ".bias"
+    case TensorRole::FFN_DOWN_EXPS_BIAS: return "FFN_DOWN_EXPS";   // + ".bias"
     case TensorRole::OUTPUT: return "OUTPUT";
     case TensorRole::OUTPUT_NORM: return "OUTPUT_NORM";
     case TensorRole::TOKEN_EMBD: return "TOKEN_EMBD";
@@ -107,6 +128,10 @@ const char *adapter_tensor_op(TensorRole role) {
     case TensorRole::FFN_GATE_EXPS:
     case TensorRole::FFN_UP_EXPS:
     case TensorRole::FFN_DOWN_EXPS: return "matmul (per selected expert)";
+    case TensorRole::FFN_ROUTER_BIAS: return "add (router logits)";
+    case TensorRole::FFN_GATE_EXPS_BIAS:
+    case TensorRole::FFN_UP_EXPS_BIAS:
+    case TensorRole::FFN_DOWN_EXPS_BIAS: return "add (per selected expert)";
     case TensorRole::ATTN_SINKS: return "softmax denominator";
     case TensorRole::ROPE_FREQS: return "rope divisor";
     default: return "add";
@@ -130,6 +155,13 @@ std::vector<std::string> adapter_config_tags(const ModelConfig &cfg) {
     if (cfg.mla) tags.push_back("attn=mla");
     if (cfg.qk_norm) tags.push_back("qk_norm=per-head");
     if (cfg.attn_sinks) tags.push_back("sinks=yes");
+    if (cfg.ffn_norm_is_post) tags.push_back("ffn_norm=post_attention");
+    if (cfg.expert_router_bias) tags.push_back("router_bias=yes");
+    if (cfg.expert_projection_bias) tags.push_back("expert_bias=per_expert");
+    if (!cfg.swa_layers.empty()) tags.push_back("window=per_layer");
+    if (cfg.ffn_norm_ada) tags.push_back("ffn_norm=adaptive");
+    if (cfg.attn_temp_scale != 0.0) tags.push_back("attn_temp=on");
+    if (cfg.ffn_gate_bias) tags.push_back("bias=ffn_gate");
     if (cfg.attn_qkv_bias) tags.push_back("bias=qkv");
     if (cfg.fused_qkv) tags.push_back("qkv=fused");
     if (cfg.sliding_window) tags.push_back("window=" + std::to_string(cfg.sliding_window));

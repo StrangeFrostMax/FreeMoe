@@ -157,7 +157,19 @@ def arch_tensors(spec: dict[str, Any]) -> list[TensorSpec]:
             out += [tensor(p + "attn_output.bias", [h], 0.05)]
         if spec.get("post_norms"):
             out += [tensor(p + "attn_post_norm.weight", [h], 0.0, norm=True)]
-        if not spec.get("parallel_residual"):
+        if spec.get("ffn_norm_ada"):
+            # mistral3's adaptive RMSNorm MLP: one down and one up projection
+            # around a gelu_erf, applied to the delay embedding.
+            ada_width = spec.get("ada_width", 10)
+            out += [
+                tensor(p + "ffn_norm_ada_down.weight", [h, ada_width], 0.20),
+                tensor(p + "ffn_norm_ada_up.weight", [ada_width, h], 0.20),
+            ]
+        if spec.get("ffn_norm_from_post"):
+            # gpt-oss normalises after the attention residual and calls that
+            # tensor attn_post_norm; there is no ffn_norm of its own.
+            out += [tensor(p + "attn_post_norm.weight", [h], 0.0, norm=True)]
+        elif not spec.get("parallel_residual"):
             out += [tensor(p + "ffn_norm.weight", [h], 0.0, norm=True)]
             if spec.get("layernorm"):
                 out += [tensor(p + "ffn_norm.bias", [h], 0.05)]
@@ -196,6 +208,18 @@ def arch_tensors(spec: dict[str, Any]) -> list[TensorSpec]:
             ]
             if spec.get("expert_bias"):
                 out += [tensor(p + "ffn_exp_probs_b.bias", [experts], 0.10)]
+            if spec.get("router_bias"):
+                # gpt-oss biases the router logits themselves; this is a
+                # different tensor from the selection bias above, and applying
+                # one in place of the other routes a real file wrong.
+                out += [tensor(p + "ffn_gate_inp.bias", [experts], 0.10)]
+            if spec.get("expert_proj_bias"):
+                # One bias column per expert on each projection.
+                out += [
+                    tensor(p + "ffn_gate_exps.bias", [ew, experts], 0.05),
+                    tensor(p + "ffn_up_exps.bias", [ew, experts], 0.05),
+                    tensor(p + "ffn_down_exps.bias", [h, experts], 0.05),
+                ]
             if spec.get("shared_expert"):
                 # A dense FFN beside the routed experts, plus the one-vector
                 # projection that produces its per-token scalar gate.
@@ -221,6 +245,12 @@ def arch_tensors(spec: dict[str, Any]) -> list[TensorSpec]:
                 tensor(p + "ffn_up.weight", [h, i], 0.16),
                 tensor(p + "ffn_down.weight", [i, h], 0.16),
             ]
+            if spec.get("ffn_mlp_bias"):
+                out += [
+                    tensor(p + "ffn_gate.bias", [i], 0.05),
+                    tensor(p + "ffn_up.bias", [i], 0.05),
+                    tensor(p + "ffn_down.bias", [h], 0.05),
+                ]
         if spec.get("post_norms"):
             out += [tensor(p + "ffn_post_norm.weight", [h], 0.0, norm=True)]
         if spec.get("sub_norms"):
@@ -324,6 +354,10 @@ def arch_metadata(spec: dict[str, Any]) -> dict[str, tuple[Any, ...]]:
         # mRoPE section split, four counts of rotary pairs. llama.cpp only turns
         # mRoPE on when the first two are non-zero.
         md[f"{arch}.rope.dimension_sections"] = ("array_i32", list(spec["rope_sections"]))
+    if spec.get("realtime_delay") is not None:
+        md[f"{arch}.realtime_delay_tokens"] = ("u32", spec["realtime_delay"])
+    if spec.get("attn_temp_scale") is not None:
+        md[f"{arch}.attention.temperature_scale"] = ("f32", spec["attn_temp_scale"])
     if spec.get("swiglu_clamp"):
         # Per-layer clamp bounds, the shape llama.cpp reads for deepseek4/4.1.
         rows = spec["swiglu_clamp"]
@@ -334,10 +368,101 @@ def arch_metadata(spec: dict[str, Any]) -> dict[str, tuple[Any, ...]]:
         md[f"{arch}.final_logit_softcapping"] = ("f32", spec["final_softcap"])
     if spec.get("sliding_window"):
         md[f"{arch}.attention.sliding_window"] = ("u32", spec["sliding_window"])
+    if spec.get("sliding_window_pattern") is not None:
+        # The period form llama.cpp reads: every layer whose index is not a
+        # multiple of the period is windowed.
+        md[f"{arch}.attention.sliding_window_pattern"] = (
+            "u32", spec["sliding_window_pattern"])
     return md
 
 
 SPECS: list[dict[str, Any]] = [
+    {
+        # gpt-oss (llama.cpp models/openai-moe.cpp): attention sinks, a
+        # post-attention norm that feeds the MoE (there is no ffn_norm), a biased
+        # router, per-expert projection biases, alternating full/windowed layers,
+        # and `swiglu_oai` rather than SwiGLU. Five separate facts, and every one
+        # of them changes a number.
+        "slug": "gpt-oss",
+        "arch": "gpt-oss",
+        "name": "FreeMoe synthetic gpt-oss with sinks, biased MoE and swiglu_oai",
+        "kv_heads": 2,
+        "rope_dim": SHAPE["head_dim"],
+        "attn_sinks": True,
+        "attn_output_bias": True,
+        "ffn_norm_from_post": True,
+        "experts": 4,
+        "expert_used": 2,
+        "expert_width": 48,
+        "router_bias": True,
+        "expert_proj_bias": True,
+        "sliding_window": 12,
+        "sliding_window_pattern": 2,
+        "layers": 4,
+    },
+    {
+        # qwen3vl (llama.cpp models/qwen3vl.cpp): the qwen3 text block with
+        # multi-resolution rotary sections, in the interleaved layout llama.cpp
+        # selects by architecture rather than by file flag.
+        "slug": "qwen3vl",
+        "arch": "qwen3vl",
+        "name": "FreeMoe synthetic qwen3vl text path with mRoPE sections",
+        "kv_heads": 2,
+        "rope_dim": 4,
+        "rope_sections": [1, 1, 0, 0],
+        "qk_norm": True,
+    },
+    {
+        # qwen3vlmoe: the same mRoPE text path with stacked experts.
+        "slug": "qwen3vlmoe",
+        "arch": "qwen3vlmoe",
+        "name": "FreeMoe synthetic qwen3vlmoe text path with mRoPE sections",
+        "kv_heads": 2,
+        "rope_dim": 4,
+        "rope_sections": [1, 1, 0, 0],
+        "qk_norm": True,
+        "experts": 4,
+        "expert_used": 2,
+        "expert_width": 48,
+        "fused_exps": True,
+    },
+    {
+        # mistral3 (llama.cpp models/mistral3.cpp): the llama block plus three
+        # optional pieces that all change numbers — biases on all three FFN
+        # projections, an adaptive RMSNorm whose MLP is a gelu_erf over a
+        # sinusoidal delay embedding, and llama.cpp's per-position attention
+        # temperature. This is the file that makes `gelu_erf` reachable.
+        "slug": "mistral3",
+        "arch": "mistral3",
+        "name": "FreeMoe synthetic mistral3 with an adaptive norm and FFN biases",
+        "kv_heads": 2,
+        "rope_dim": 4,
+        "ffn_mlp_bias": True,
+        "ffn_norm_ada": True,
+        "ada_width": 10,
+        "realtime_delay": 7,
+        "attn_temp_scale": 0.25,
+        "rope_scaling": {"type": "yarn", "factor": 2.0,
+                         "original_context_length": 32, "attn_factor": 1.0},
+        "layers": 2,
+    },
+    {
+        # plm (llama.cpp models/plm.cpp): multi-head latent attention with a
+        # one-step q projection (q_lora_rank 0), a gate-free relu^2 FFN and the
+        # output head tied to the token table. This is what makes the plain
+        # `relu_sq` primitive reachable end to end.
+        "slug": "plm",
+        "arch": "plm",
+        "name": "FreeMoe synthetic plm with MLA-lite and a gate-free relu^2 FFN",
+        "kv_heads": SHAPE["heads"],
+        "rope_dim": 4,
+        "mla": True,
+        "q_lora_rank": 0,
+        "kv_lora_rank": 16,
+        "head_v": 10,
+        "ffn_no_gate": True,
+        "tied_output": True,
+    },
     {
         # arcee (llama.cpp models/arcee.cpp): the llama block with a gate-free
         # FFN and relu^2 in place of SwiGLU. GGUF metadata cannot state an

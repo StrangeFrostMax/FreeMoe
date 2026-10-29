@@ -90,6 +90,22 @@ const std::map<std::string, ArchFacts> &known_architectures() {
         {"arcee", {true, false}},
         {"nemotron", {true, false}},
         {"jais2", {true, false}},
+        // gpt-oss: attention sinks, a post-attention norm that feeds the MoE,
+        // a biased router, per-expert projection biases, swiglu_oai and
+        // alternating full/windowed layers.
+        {"gpt-oss", {true, false}},
+        // plm: multi-head latent attention, a gate-free relu^2 FFN and a tied
+        // output head.
+        {"plm", {true, false}},
+        // The mRoPE text paths and the two clamped deepseek revisions share the
+        // llama block; their differences are metadata the adapter reads.
+        {"qwen3vl", {true, false}},
+        {"qwen3vlmoe", {true, false}},
+        {"deepseek4", {true, false}},
+        {"deepseek41", {true, false}},
+        // mistral3: the llama block plus optional MLP biases and an adaptive
+        // RMSNorm whose MLP is a gelu_erf.
+        {"mistral3", {true, false}},
         {"glm4moe", {false, true}},
         {"multimodal", {false, true}},
     };
