@@ -692,12 +692,26 @@ bool opt_string(const GGUFDocument &doc, const std::set<std::string> &keys, std:
     return false;
 }
 
-const MetadataValue &require_metadata(const GGUFDocument &doc, const std::string &key) {
+// Same lookup, returning a pointer instead of a reference.
+//
+// `require_metadata` returns a reference *into `doc`*, but a call with a literal
+// key also constructs a temporary `std::string` for the parameter, and GCC 13's
+// `-Wdangling-reference` (part of `-Wextra`, so fatal under this project's
+// `-Werror`) then assumes the returned reference may point at that temporary and
+// refuses to compile the file. It is a false positive, and it is real: the
+// project did not build on current Ubuntu/Debian toolchains until this became a
+// pointer, which cannot dangle.
+const MetadataValue *require_metadata_ptr(const GGUFDocument &doc, const std::string &key) {
     auto it = doc.metadata.find(key);
     if (it == doc.metadata.end())
         fail(ErrorCode::METADATA_MISMATCH, "missing required metadata key " + key);
-    return it->second;
+    return &it->second;
 }
+
+const MetadataValue &require_metadata(const GGUFDocument &doc, const std::string &key) {
+    return *require_metadata_ptr(doc, key);
+}
+
 
 std::string require_string(const GGUFDocument &doc, const std::string &key) {
     return require_metadata(doc, key).as_string();
@@ -1817,26 +1831,27 @@ ModelManifest build_manifest(const GGUFDocument &doc, const std::string &source_
         cfg.eos_id >= cfg.vocab)
         fail(ErrorCode::SHAPE_MISMATCH, "model dimension exceeds adapter safety bounds");
 
-    const MetadataValue &tokens = require_metadata(doc, "tokenizer.ggml.tokens");
-    if (!tokens.is_array() || tokens.array.size() != cfg.vocab ||
-        tokens.element_type != GGUFValueType::STRING)
+    const MetadataValue *tokens = require_metadata_ptr(doc, "tokenizer.ggml.tokens");
+    if (!tokens->is_array() || tokens->array.size() != cfg.vocab ||
+        tokens->element_type != GGUFValueType::STRING)
         fail(ErrorCode::INVALID_TOKENIZER, "tokenizer token table has wrong shape");
-    for (const auto &token : tokens.array) {
+    for (const auto &token : tokens->array) {
         if (!token.is_string()) fail(ErrorCode::INVALID_TOKENIZER, "non-string tokenizer token");
         m.tokenizer_tokens.push_back(token.s);
     }
 
-    const MetadataValue &checksums = require_metadata(doc, "freemoe.expert_checksums");
-    if (!checksums.is_array() || checksums.element_type != GGUFValueType::UINT64)
+    const MetadataValue *checksums = require_metadata_ptr(doc, "freemoe.expert_checksums");
+    if (!checksums->is_array() || checksums->element_type != GGUFValueType::UINT64)
         fail(ErrorCode::METADATA_MISMATCH, "expert checksum array has wrong type");
 
     bool moe = cfg.model_kind == "moe";
-    if (!moe && (cfg.expert_count != 0 || cfg.expert_top_k != 0 || !checksums.array.empty() || cfg.expert_layout != "none"))
+    if (!moe && (cfg.expert_count != 0 || cfg.expert_top_k != 0 || !checksums->array.empty() ||
+                 cfg.expert_layout != "none"))
         fail(ErrorCode::METADATA_MISMATCH, "dense model declares MoE metadata");
     if (moe && (cfg.expert_count == 0 || cfg.expert_top_k == 0 ||
                 cfg.expert_top_k > cfg.expert_count || cfg.expert_layout != "stacked-f32"))
         fail(ErrorCode::METADATA_MISMATCH, "MoE model has inconsistent expert metadata");
-    if (moe && checksums.array.size() != static_cast<size_t>(cfg.layers) * cfg.expert_count)
+    if (moe && checksums->array.size() != static_cast<size_t>(cfg.layers) * cfg.expert_count)
         fail(ErrorCode::METADATA_MISMATCH, "expert checksum count mismatch");
 
     std::set<std::string> expected = {"token_embd.weight", "output.weight", "output_norm.weight"};
@@ -1945,7 +1960,7 @@ ModelManifest build_manifest(const GGUFDocument &doc, const std::string &source_
                 rec.expert = e;
                 rec.payload_bytes = checked_mul(3, expert_stride, "expert payload");
                 size_t checksum_index = static_cast<size_t>(l) * cfg.expert_count + e;
-                rec.checksum = checksums.array[checksum_index].as_u64();
+                rec.checksum = checksums->array[checksum_index].as_u64();
                 rec.checksum_known = true;
                 for (int r = 0; r < 3; ++r) {
                     const TensorInfo &tensor = t(layer_name(l, extent_suffixes[r]));
