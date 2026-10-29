@@ -64,7 +64,7 @@ jobs:
       - name: Report test failures
         if: failure()
         run: |
-          grep -nE "^FAIL:|^\[FAIL\]|FAILED|Traceback|Error [0-9]+|error:|checks," test.log | head -30 |
+          grep -nE "^FAIL:|^\[FAIL\]|FAILED|Traceback|Error [0-9]+|error:|checks,|stale|is not compared|SKIP " test.log | head -30 |
             while IFS= read -r line; do echo "::error title=tests::$line"; done
           exit 1
       - name: Fixture and table regeneration checks

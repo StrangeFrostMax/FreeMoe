@@ -56,7 +56,8 @@ def backend_init_fields(path: Path) -> dict:
     return fields
 
 
-def simulated_checks(info: dict, trace: dict, requested_profile: str) -> dict:
+def simulated_checks(info: dict, trace: dict, requested_profile: str,
+                     real_zen3: bool = False) -> dict:
     notes = info.get("notes", "")
     backend = info.get("backend", "")
     return {
@@ -67,7 +68,11 @@ def simulated_checks(info: dict, trace: dict, requested_profile: str) -> dict:
         "notes_avx512_disabled": "AVX-512 dispatch disabled" in notes,
         "notes_fallback_selected": "Selected VNPU dispatch: Zen 3 AVX2 dual-pipe fallback" in notes,
         "trace_zen3_detected": trace.get("zen3_detected") is True,
-        "trace_detection_simulated": trace.get("zen3_detection_simulated") is True,
+        # `--test-simulate-zen3` cannot turn genuine detection into a
+        # simulation: on a real Zen 3 host the runtime reports the detection as
+        # real, and that is the correct answer, not a failure.
+        "trace_detection_simulated":
+            trace.get("zen3_detection_simulated") is (not real_zen3),
         "trace_fallback_selected": trace.get("zen3_fallback_selected") is True,
         "trace_requested_profile": trace.get("requested_profile") == requested_profile,
         "trace_selected_attempt": trace.get("selected_attempt") == "Zen 3 AVX2 dual-pipe fallback",
@@ -144,9 +149,11 @@ def main() -> int:
     }
 
     sim_auto_checks = simulated_checks(
-        last_json(sim_auto.stdout), backend_init_fields(sim_auto_trace), "zen3-auto")
+        last_json(sim_auto.stdout), backend_init_fields(sim_auto_trace), "zen3-auto",
+        real_zen3=host_zen3)
     sim_avx512_checks = simulated_checks(
-        last_json(sim_avx512.stdout), backend_init_fields(sim_avx512_trace), "avx512")
+        last_json(sim_avx512.stdout), backend_init_fields(sim_avx512_trace), "avx512",
+        real_zen3=host_zen3)
 
     checks = {
         "all_commands_exit_zero": command_rcs_ok,
@@ -200,7 +207,21 @@ def main() -> int:
         # different machine reports drift that is not there -- exactly what
         # happened on the first CI run of this check, on a Zen 3 runner, while
         # the file was correct.
+        # The detection-state check is the other derived value: on a real Zen 3
+        # host the simulator cannot make the detection synthetic, so the field
+        # holds the opposite (correct) answer there.
         host_dependent = {"host_zen3_detected", "unit_checks", "non_simulated_checks"}
+
+        def drop_host_dependent(payload: dict) -> dict:
+            out: dict = {}
+            for key, value in payload.items():
+                if key in host_dependent:
+                    continue
+                if isinstance(value, dict):
+                    value = {k: v for k, v in value.items()
+                             if not k.endswith("trace_detection_simulated")}
+                out[key] = value
+            return out
 
         def load(text: str) -> dict | None:
             try:
@@ -209,7 +230,7 @@ def main() -> int:
                 return None
 
         def comparable(payload: dict) -> dict:
-            return {k: v for k, v in payload.items() if k not in host_dependent}
+            return drop_host_dependent(payload)
 
         committed = load(committed_text)
         logged = load(log_verdict_text)
