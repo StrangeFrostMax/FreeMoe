@@ -91,6 +91,7 @@ test: all $(BUILD)/tests $(BUILD)/vnpu-selftest $(BUILD)/fuzz_gguf
 	python3 tools/check_trace.py $(BUILD)/test-tmp/replay-trace.jsonl $(BUILD)/test-tmp/prefetch-trace.jsonl $(BUILD)/test-tmp/cachehit-trace.jsonl
 	python3 scripts/check_architecture.py
 	python3 scripts/check_dependencies.py
+	python3 scripts/zen3_fallback_check.py --check
 	python3 tools/gen_unicode_tables.py --check
 	python3 tools/make_arch_fixtures.py --check
 	python3 tools/gen_quant_tables.py --check
