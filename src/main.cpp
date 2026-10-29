@@ -1,3 +1,4 @@
+#include "fm/adapter.hpp"
 #include "fm/backend.hpp"
 #include "fm/engine.hpp"
 #include "fm/gguf.hpp"
@@ -112,6 +113,8 @@ void print_usage() {
         "  --queue-depth N --coalesce-gap N       --t-wait-ms N\n"
         "  --prefetch 0|1 --budget-mb N           --vnpu-isa PROFILE\n"
         "      PROFILE = zen3-auto|auto|avx2_dual|zen3|avx2|avx512|scalar\n"
+        "  inspect --tags       # adapter tags per tensor, plus the branch tags\n"
+        "  adapters [--json]    # every implemented adapter row and its llama.cpp enum\n"
         "  --kernels auto|scalar|avx2|zen3|avx512 --threads N   # CPU kernel dispatch\n"
         "      auto never picks AVX-512: the target is Zen 3, which has none\n"
         "  --temperature X --top-k N --top-p X --seed N    # sampling (run only)\n"
@@ -258,6 +261,68 @@ Json json_result(const std::string &status) {
     return j;
 }
 
+// `inspect --tags`: the debugging view. One line per tensor with the adapter tag
+// it resolved to, plus the branch tags that decided how the block runs. This is
+// the same information llama.cpp prints when it names an `LLM_TENSOR_*` in an
+// error, and it is the fastest way to answer "which row was selected, and what
+// did it decide?" without reading JSON.
+int print_adapter_tags(const fm::ModelManifest &manifest, const std::string &path) {
+    const fm::ModelConfig &cfg = manifest.config;
+    std::cout << "model: " << path << "\n";
+    std::cout << "adapter: " << cfg.adapter << " (" << cfg.model_kind << ")\n";
+    if (const fm::AdapterRow *row = fm::adapter_row(cfg.architecture)) {
+        std::cout << "arch: " << row->arch << "  upstream: " << row->upstream_enum
+                  << "  graph: " << row->graph << "\n";
+        std::cout << "block: " << row->block << "\n";
+    } else {
+        std::cout << "arch: " << cfg.architecture << "  upstream: (not an implemented row)\n";
+    }
+    std::cout << "tags:";
+    for (const std::string &tag : fm::adapter_config_tags(cfg)) std::cout << " " << tag;
+    std::cout << "\n";
+    std::vector<const fm::TensorInfo *> tensors;
+    for (const auto &tensor : manifest.doc.tensors) tensors.push_back(&tensor);
+    std::sort(tensors.begin(), tensors.end(), [](const auto *a, const auto *b) {
+        return a->name < b->name;
+    });
+    for (const fm::TensorInfo *tensor : tensors) {
+        std::cout << "  " << tensor->tag;
+        // Pad the tag column so the eye can scan it; no tag is longer than 22.
+        for (size_t i = tensor->tag.size(); i < 22; ++i) std::cout << ' ';
+        std::cout << " " << tensor->op;
+        for (size_t i = tensor->op.size(); i < 26; ++i) std::cout << ' ';
+        std::cout << " " << tensor->name << "  " << tensor->type_name << " [";
+        for (size_t i = 0; i < tensor->dims.size(); ++i)
+            std::cout << (i ? "," : "") << tensor->dims[i];
+        std::cout << "]";
+        if (tensor->role == fm::TensorRole::IGNORED)
+            std::cout << "  (ignored: not part of the forward pass)";
+        std::cout << "\n";
+    }
+    return 0;
+}
+
+int command_adapters(const Args &args) {
+    // The catalogue itself: every row this build maps, with the upstream enum it
+    // mirrors. `--json` emits the same rows as an array.
+    const bool json = args.has("json");
+    Json rows = Json::array();
+    for (const fm::AdapterRow &row : fm::adapter_rows()) {
+        Json entry = Json::object();
+        entry.set("arch", row.arch);
+        entry.set("upstream_enum", row.upstream_enum ? row.upstream_enum : "");
+        entry.set("graph", row.graph ? row.graph : "");
+        entry.set("block", row.block ? row.block : "");
+        rows.push(std::move(entry));
+        if (!json) {
+            std::printf("%-14s %-24s %-24s %s\n", row.arch, row.upstream_enum ? row.upstream_enum : "",
+                        row.graph ? row.graph : "", row.block ? row.block : "");
+        }
+    }
+    if (json) std::cout << rows.dump() << "\n";
+    return 0;
+}
+
 int command_inspect(const Args &args) {
     std::string path = model_path(args);
     auto doc = fm::parse_gguf_file(path);
@@ -289,6 +354,7 @@ int command_inspect(const Args &args) {
         return 0;
     }
     auto manifest = fm::build_manifest(doc, path);
+    if (args.has("tags")) return print_adapter_tags(manifest, path);
     Json report = fm::inspect_json(manifest, path);
     if (args.has("json") || args.has("output")) {
         std::string output = report.dump() + "\n";
@@ -656,6 +722,7 @@ int main(int argc, char **argv) {
         if (command == "bench") return command_bench(args);
         if (command == "tokenize") return command_tokenize(args);
         if (command == "probe" || command == "support") return command_probe(args);
+        if (command == "adapters") return command_adapters(args);
         if (command == "version") {
             std::cout << "FreeMoe 0.1.0 correctness prototype\n";
             return 0;

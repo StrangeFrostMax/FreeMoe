@@ -24,7 +24,10 @@ what the work is: the 50 model names reduce to about eight capabilities.
 | Attention sinks, NoPE layers | `attention_sinks`, `rope_scaling`, fixtures |
 | MLA (DeepSeek-V2/V3 style), sigmoid/softmax/sqrt-softplus gating, group-limited routing, selection bias, shared expert | `deepseek2-mla` fixture + oracle |
 | GQA/MQA, per-head qk-norm, partial rotary, fused qkv, fused gate-up, post-norms, sliding window, tanh softcap, LayerNorm variants, silu/gelu | 23 architecture fixtures |
-| 26 quantisation types incl. ternary `TQ1_0`/`TQ2_0`/`Q1_0`/`Q2_0`/`PQ2_0` | `quant_reference_decode`, `quant_model_parity` |
+| 36 quantisation types incl. ternary `TQ1_0`/`TQ2_0`/`Q1_0`/`Q2_0`/`PQ2_0`, the whole IQ family (IQ1_S/M, IQ2_XXS/XS/S, IQ3_XXS/S, IQ4_XS/NL) and FP4 (MXFP4, NVFP4) | `quant_reference_decode`, `quant_model_parity`; bit-exact against llama.cpp's own dequantizers via `tools/quant_upstream_check.py` (26 types, 0 failures) |
+| Fused `ffn_gate_up_exps`, clamped SwiGLU (`swiglu-oai`, per-layer `swiglu_clamp`), router renormalisation floor | `ffn_variants`, `qwen3moe-fused-up` and `qwen3moe-clamp` fixtures |
+| mRoPE section split (`rope.dimension_sections`), plain and interleaved | `rope_mrope`; `glm4-mrope` fixture |
+| Adapter rows tagged in llama.cpp's vocabulary (`inspect --tags`, `freemoe adapters`) | `adapter_tags`, 85 checks |
 
 Supported architecture strings today (each has a fixture unless noted):
 `llama`, `qwen2`, `qwen3`, `qwen2moe`, `qwen3moe`, `gemma`, `gemma2`, `gemma3`,
@@ -51,7 +54,7 @@ native `freemoe-tiny`. `smollm`/`smollm2`/`tinyllama` are the same llama block.
 
 | Requested model | GGUF arch | Blocked by |
 | --- | --- | --- |
-| Qwen3-VL (text path), Qwen3.5-MoE, Qwen3.5 dense, Ernie 4.5 / 4.5-MoE, Ling/Ring (Bailing-MoE3), GLM-4 / 4.5 MoE, Hunyuan MoE/dense | `qwen3vl`, `qwen35`, `qwen35moe`, `ernie4_5*`, `bailingmoe*`, `glm4moe`, `hunyuan-*` | **mRoPE**: sectioned rotary with four position ids. Text-only prompts use one position for all four sections, so the text path is a small change; the vision path stays out of scope |
+| Qwen3-VL (text path), Qwen3.5-MoE, Qwen3.5 dense, Ernie 4.5 / 4.5-MoE, Ling/Ring (Bailing-MoE3), GLM-4 / 4.5 MoE, Hunyuan MoE/dense | `qwen3vl`, `qwen35`, `qwen35moe`, `ernie4_5*`, `bailingmoe*`, `glm4moe`, `hunyuan-*` | **mRoPE implemented** (`rope_mrope`, `glm4-mrope` fixture): sections are parsed, validated against the head width and drive per-axis positions, plain and interleaved. Remaining work is the adapter row per architecture plus their block variants; the vision path stays out of scope |
 | DeepSeek-V4, V4.1, V4-Flash-Vision (text), Mimo-2.5, MiniMax-M2/M3 | `deepseek4`, `deepseek41`, `mimo*`, `minimax-m2`, `minimax-m3` | **clamped SwiGLU** (`SWIGLU_OAI_MOE`) plus sinks and a `1e-20` router-sum epsilon. Sinks landed in this change; the clamp and the epsilon have not |
 | dots.llm1 / dots3note, Cohere2-MoE (North Mini Code), Gemma 4, GLM-DSA, DeepSeek-3.2 | `dots3note`, `cohere2moe`, `gemma4`, `glm-dsa`, `deepseek32` | **fused `ffn_gate_up_exps`**: gate and up stacked in one expert tensor. The expert record layout assumes three separate projections, so this is a residency/extent change, not a rename |
 | Qwen3-Next, Qwen3.5-Next, Kimi-Linear | `qwen3next`, `qwen35*`, `kimi-linear` | **gated delta-net** (linear attention with a per-head state). New cache shape, new kernel; the largest single item left |
@@ -80,13 +83,18 @@ path" above mean exactly that: the language model runs, the tower does not.
 
 ## Order the remaining work, and why
 
-1. **mRoPE** (+6 architectures, one rotary change, text path immediate).
-2. **Fused `ffn_gate_up_exps`** (+6, one residency/extent change).
-3. **Clamped SwiGLU + router epsilon** (unblocks the DeepSeek-V4/MiniMax/Mimo
-   group once sinks are in, which they now are).
-4. **`I2_S` + BitNet block** (one family, but a named request).
-5. **Short convolution** (+4) and **recurrent/SSM** (+17) — the second needs a
-   new cache shape and scan kernels, so it is the first item that is not a
-   variant of the existing block.
+1. ~~**mRoPE**~~ **done** — sections parsed, validated, and applied per axis,
+   plain and interleaved (`rope_mrope`, `glm4-mrope`). The six architectures now
+   need their adapter rows, not rotary work.
+2. ~~**Fused `ffn_gate_up_exps`**~~ **done** (`qwen3moe-fused-up`).
+3. ~~**Clamped SwiGLU + router epsilon**~~ **done** (`qwen3moe-clamp`).
+   `SITU` and `GEGLU_ERF` are what remains of this group.
+4. ~~**IQ family + MXFP4/NVFP4 decoders**~~ **done**, bit-exact against upstream.
+   `I2_S` is *not* a llama.cpp type: it is bitnet.cpp's private type 36, and the
+   ternary checkpoints llama.cpp reads are `TQ1_0`/`TQ2_0`, which decode here.
+   A file carrying type 36 is refused by name with that explanation.
+5. **Short convolution** (+4: `lfm2`, `lfm2moe`, `lfm3`, `lfm-base`) and
+   **recurrent/SSM** (+17) — the second needs a new cache shape and scan
+   kernels, so it is the first item that is not a variant of the existing block.
 6. **Gated delta-net** (+9) — same size class, and it shares the state work with
    the recurrent group.
