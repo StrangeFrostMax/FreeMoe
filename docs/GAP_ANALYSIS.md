@@ -7,7 +7,7 @@
 > attention sinks are implemented, and `auto` no longer dispatches AVX-512 on a
 > Zen 3 target. The measurements below are the state at `f704e4b` and are kept
 > as the baseline this work is measured against; current numbers live in
-> `docs/MODEL_COVERAGE_STATUS.md` (3006 checks, 42 architecture fixtures).
+> `docs/MODEL_COVERAGE_STATUS.md` (3241 checks, 55 architecture fixtures).
 >
 > What changed since the baseline, in the terms this document uses:
 >
@@ -334,6 +334,53 @@ engine requires the stacked layout and fails otherwise. Recorded in
 No `attn_sinks`, no `SWIGLU_OAI_MOE` (clamped SwiGLU), no `SITU`, no
 `GEGLU_ERF`. Small self-contained kernels — but they are what `gpt-oss`,
 `minimax-*`, `deepseek4/41` and `kimi-k3` need.
+
+### C11. Architecture census: 171 upstream families, 48 mapped — the rest need named work
+
+`tools/triage_upstream_archs.py` classifies every `src/models/*.cpp` in a
+llama.cpp checkout by what its graph *calls*, not by its tensor names: 171 files,
+81 whose graph body is a llama-shaped block and 90 that build something else
+(mamba, delta-net, AltUp, MTP, vision towers). A marker scan is only a first
+pass, so each candidate then went through three further checks, and a row was
+added only when all three passed:
+
+1. **Tensor roles.** Every `LLM_TENSOR_*` the architecture's file names is
+   resolved through `LLM_TENSOR_NAMES` and looked up in `role_from_name`. A
+   single unresolved name means the file would load and then fail on a tensor
+   the engine never asked for — the "name-only row" this repo refuses.
+2. **Graph read.** The block body was read for norm placement, activation,
+   rotary and residual structure, because tensor names do not distinguish a
+   weightless LayerNorm from a weighted one (`olmo2`, `arcee`).
+3. **Parity.** A fixture shaped like that family's checkpoint and an oracle
+   golden; the engine must match it, or the row does not stay.
+
+Twelve rows survived (see `docs/MODEL_COVERAGE_STATUS.md`); this is what the
+other candidates are blocked on, in the terms of the file that blocks them:
+
+| Blocking fact | Architectures | What it needs |
+| --- | --- | --- |
+| `ggml_xielu` with per-layer `alpha_n/alpha_p/beta/eps` | `apertus` | A new activation with four per-layer parameters |
+| Attention output gate (`attn_gate`), applied before the output projection | `muse-glimmer`, `spark2_5`, `hrm-text` | A tensor role and one multiply; `hrm-text` also needs `hrm.z_l_init` |
+| Post-norm-only block (no pre-norm tensors at all) | `olmo2`, `exaone4`, `seed_oss` | A block whose residual additions run before the norms; the current post-norm support assumes both |
+| Fused qkv plus per-layer head counts / widths | `openelm`, `plamo3` | Per-layer attention geometry; the manifest currently holds one head count |
+| MLA variant with a single `attn_kv_b` (no `attn_k_b`/`attn_v_b`) | `minicpm3`, `plm`-adjacent | A second MLA layout |
+| Dual dense+MoE FFN in one layer (both branches summed) | `arctic`, `ernie4_5`, `granite-moe` | A block that runs both, as `arctic` does |
+| No kv cache at all (diffusion / embedding decoders) | `dream`, `llada`, `eurobert` | A caching policy, not a tensor |
+| Encoder-only with `cls.*`/`token_types`/pooling | `modern-bert`, `neo-bert`, `jina-bert-v2/v3`, `nomic-bert*`, `gemma-embedding*` | A pooling head and a segment embedding |
+| ALiBi instead of rotary | `bloom`, `falcon`, `mpt`, `jais` | The ALiBi bias, which no other mapped family uses |
+| Absolute position embeddings | `gpt2`, `starcoder`, `mpt` (`position_embd`) | A position-embedding tensor role |
+| T5 encoder/decoder with relative-position buckets | `t5` | Two graphs and a bucket bias |
+
+**Fixed alongside:** llama.cpp renamed the sandwich-norm tensors
+(`attn_post_norm` → `post_attention_norm`, `ffn_post_norm` → `post_ffw_norm`).
+A checkpoint converted today therefore failed to load in a build that claimed
+`gemma2`, `gemma3` or `glm4`. The loader now normalises both spellings to one
+name at parse time (`canonical_layer_name`, `src/gguf.cpp`), the oracle does the
+same independently, and a `gemma2-renamed` fixture — byte-identical arithmetic,
+current names — holds a parity row. Mutating the rename table makes that row
+fail, so the alias cannot be dropped silently.
+
+---
 
 ### C10. Benchmarks run on an ISA the target CPU does not have
 

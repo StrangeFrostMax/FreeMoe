@@ -81,6 +81,19 @@ def tokenizer_tokens() -> list[str]:
     return tokens
 
 
+def post_norm_name(spec: dict[str, Any], which: str) -> str:
+    """The post-norm tensor name: this repo's spelling, or upstream's current one.
+
+    llama.cpp renamed these tensors `post_attention_norm` / `post_ffw_norm`.
+    Either spelling names the same tensor in the same place in the block, so one
+    fixture of each vintage proves the loader accepts both.
+    """
+    if spec.get("upstream_post_norms"):
+        return ("post_attention_norm.weight" if which == "attn"
+                else "post_ffw_norm.weight")
+    return ("attn_post_norm.weight" if which == "attn" else "ffn_post_norm.weight")
+
+
 def arch_tensors(spec: dict[str, Any]) -> list[TensorSpec]:
     h, i, layers = spec["hidden"], spec["intermediate"], spec["layers"]
     heads, hd = spec["heads"], spec["head_dim"]
@@ -140,7 +153,7 @@ def arch_tensors(spec: dict[str, Any]) -> list[TensorSpec]:
                     tensor(p + "ffn_down.weight", [i, h], 0.16),
                 ]
             continue
-        if spec.get("layernorm"):
+        if spec.get("layernorm") and spec.get("norm_bias", True):
             out += [tensor(p + "attn_norm.bias", [h], 0.05)]
         if spec.get("parallel_residual"):
             # No ffn_norm at all: the FFN consumes the attention norm.
@@ -206,7 +219,7 @@ def arch_tensors(spec: dict[str, Any]) -> list[TensorSpec]:
         if spec.get("attn_output_bias"):
             out += [tensor(p + "attn_output.bias", [h], 0.05)]
         if spec.get("post_norms"):
-            out += [tensor(p + "attn_post_norm.weight", [h], 0.0, norm=True)]
+            out += [tensor(p + post_norm_name(spec, "attn"), [h], 0.0, norm=True)]
         if spec.get("ffn_norm_ada"):
             # mistral3's adaptive RMSNorm MLP: one down and one up projection
             # around a gelu_erf, applied to the delay embedding.
@@ -222,7 +235,8 @@ def arch_tensors(spec: dict[str, Any]) -> list[TensorSpec]:
         elif not spec.get("parallel_residual"):
             out += [tensor(p + "ffn_norm.weight", [h], 0.0, norm=True)]
             if spec.get("layernorm"):
-                out += [tensor(p + "ffn_norm.bias", [h], 0.05)]
+                if spec.get("norm_bias", True):
+                    out += [tensor(p + "ffn_norm.bias", [h], 0.05)]
         moe_here = (spec.get("experts") and layer >= spec.get("dense_lead", 0)
                     and layer in spec.get("moe_layers", range(layers)))
         if spec.get("experts") and not moe_here:
@@ -303,7 +317,7 @@ def arch_tensors(spec: dict[str, Any]) -> list[TensorSpec]:
                     tensor(p + "ffn_down.bias", [h], 0.05),
                 ]
         if spec.get("post_norms"):
-            out += [tensor(p + "ffn_post_norm.weight", [h], 0.0, norm=True)]
+            out += [tensor(p + post_norm_name(spec, "ffn"), [h], 0.0, norm=True)]
         if spec.get("sub_norms"):
             # BitNet's SUBLN: one norm on the attention output (hidden wide) and
             # one on the gated FFN output (intermediate wide). Both are inside
@@ -321,7 +335,7 @@ def arch_tensors(spec: dict[str, Any]) -> list[TensorSpec]:
                                 ("ffn_up", 0.5), ("ffn_down", 2.0)):
                 out += [tensor(p + name + ".scale", [1], 0.0, values=[value])]
     out += [tensor("output_norm.weight", [h], 0.0, norm=True)]
-    if spec.get("layernorm"):
+    if spec.get("layernorm") and spec.get("norm_bias", True):
         out += [tensor("output_norm.bias", [h], 0.05)]
     if not spec.get("tied_output"):
         out += [tensor("output.weight", [h, V], 0.25)]
@@ -549,6 +563,88 @@ SPECS: list[dict[str, Any]] = [
         "ssm_dt_rank": 3,
         "ssm_flag_only": True,
         "layers": 2,
+    },
+    {
+        # deci (llama.cpp src/models/deci.cpp): RMSNorm, SwiGLU, separate q/k/v and optional YaRN rope factors.
+        # The block itself is llama's.
+        "slug": "deci",
+        "arch": "deci",
+        "name": "FreeMoe synthetic deci",
+    },
+    {
+        # nanbeige (llama.cpp src/models/nanbeige.cpp): RMSNorm and SwiGLU with a plain rope, plus optional rope_freqs.
+        "slug": "nanbeige",
+        "arch": "nanbeige",
+        "name": "FreeMoe synthetic nanbeige",
+    },
+    {
+        # xverse (llama.cpp src/models/xverse.cpp): RMSNorm, SwiGLU, no biases anywhere; the llama block verbatim.
+        "slug": "xverse",
+        "arch": "xverse",
+        "name": "FreeMoe synthetic xverse",
+    },
+    {
+        # maincoder (llama.cpp src/models/maincoder.cpp): RMSNorm on q and k inside the block, then RMSNorm + SwiGLU.
+        "slug": "maincoder",
+        "arch": "maincoder",
+        "name": "FreeMoe synthetic maincoder",
+        "qk_norm": True,
+    },
+    {
+        # qwen (llama.cpp src/models/qwen.cpp): one fused qkv projection with a bias, not three separate ones.
+        "slug": "qwen",
+        "arch": "qwen",
+        "name": "FreeMoe synthetic qwen",
+        "fused_qkv": True, "qkv_bias": True,
+    },
+    {
+        # codeshell (llama.cpp src/models/codeshell.cpp): LayerNorm with bias, GeGLU applied to a single up projection.
+        "slug": "codeshell",
+        "arch": "codeshell",
+        "name": "FreeMoe synthetic codeshell",
+        "layernorm": True, "ffn_no_gate": True,
+    },
+    {
+        # starcoder2 (llama.cpp src/models/starcoder2.cpp): LayerNorm with bias, a gate-free GeGLU FFN, and rope.
+        "slug": "starcoder2",
+        "arch": "starcoder2",
+        "name": "FreeMoe synthetic starcoder2",
+        "layernorm": True, "ffn_no_gate": True,
+    },
+    {
+        # pockettts (llama.cpp src/models/pockettts.cpp): LayerNorm with bias, gate-free GeGLU, output projection absent.
+        "slug": "pockettts",
+        "arch": "pockettts",
+        "name": "FreeMoe synthetic pockettts",
+        "layernorm": True, "ffn_no_gate": True,
+    },
+    {
+        # cohere2 (llama.cpp src/models/cohere2.cpp): bias-free LayerNorm and an SWA pattern: every layer whose index is
+        # not a multiple of four is windowed.
+        "slug": "cohere2",
+        "arch": "cohere2",
+        "name": "FreeMoe synthetic cohere2",
+        "layernorm": True, "norm_bias": False, "sliding_window": 8,
+        "sliding_window_pattern": 4,
+    },
+    {
+        # paddleocr (llama.cpp src/models/paddleocr.cpp): RMSNorm + SwiGLU language decoder, plain rope.
+        "slug": "paddleocr",
+        "arch": "paddleocr",
+        "name": "FreeMoe synthetic paddleocr",
+    },
+    {
+        # hunyuan-dense (llama.cpp src/models/hunyuan-dense.cpp): reuses the hunyuan-vl decoder: q/k RMSNorm then the llama block.
+        "slug": "hunyuan-dense",
+        "arch": "hunyuan-dense",
+        "name": "FreeMoe synthetic hunyuan-dense",
+        "qk_norm": True,
+    },
+    {
+        # llama-embed (llama.cpp src/models/llama-embed.cpp): llama's graph with an embedding head: same block, same tensors.
+        "slug": "llama-embed",
+        "arch": "llama-embed",
+        "name": "FreeMoe synthetic llama-embed",
     },
     {
         # mamba2 (llama.cpp models/mamba2.cpp): a scalar decay per head and
@@ -896,6 +992,23 @@ SPECS: list[dict[str, Any]] = [
         "tied_output": False,
     },
     {
+        # gemma2, written with the post-norm names current llama.cpp converters
+        # emit (`post_attention_norm` / `post_ffw_norm`). Identical arithmetic.
+        # original: adds post-attention/post-FFN norms, tanh softcapping on both
+        # attention scores and final logits, and a sliding window.
+        "slug": "gemma2-renamed",
+        "arch": "gemma2",
+        "name": "FreeMoe synthetic gemma2 (current post-norm names)",
+        "kv_heads": 2,
+        "rope_dim": SHAPE["head_dim"],
+        "post_norms": True,
+        "attn_softcap": 50.0,
+        "final_softcap": 30.0,
+        "sliding_window": 4,
+        "tied_output": False,
+        "upstream_post_norms": True,
+    },
+    {
         # Grouped-query attention with an exact head ratio, no bias. This is the
         # shape most current small checkpoints use.
         "slug": "llama-gqa",
@@ -1164,6 +1277,11 @@ def build(spec: dict[str, Any]) -> dict[str, Any]:
 
     model_path = fixture_path(spec["slug"])
     corpus = {**SHAPE, **spec}
+    # The defaults `resolved` computed above are what `--check` validates, so
+    # they have to reach the writer too: a spec that omits them would otherwise
+    # serialise a file the checker could never reproduce.
+    corpus.setdefault("rope_dim", spec.get("head_dim", SHAPE["head_dim"]))
+    corpus["kv_heads"] = spec.get("kv_heads", SHAPE["heads"])
     write_gguf(model_path, arch_metadata(corpus), arch_tensors(corpus))
 
     cfg = oracle.load_model(model_path)

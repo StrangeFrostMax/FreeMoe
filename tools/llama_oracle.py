@@ -219,7 +219,8 @@ def load_model(path: Path) -> dict[str, Any]:
         # keying this off the architecture name silently skipped glm4's norms.
         # Both post-norms or neither: gpt-oss has the attention one alone,
         # which is not a post-norm block at all but a re-named FFN norm.
-        "post_norms": (has("attn_post_norm.weight") and has("ffn_post_norm.weight")),
+        "post_norms": ((has("attn_post_norm.weight") or has("post_attention_norm.weight"))
+                        and (has("ffn_post_norm.weight") or has("post_ffw_norm.weight"))),
         # BitNet's SUBLN: an RMSNorm on the attention output before the output
         # projection, and one on the gated FFN output before the down
         # projection. Tensor-presence evidence, like every other structure here.
@@ -318,7 +319,12 @@ def load_model(path: Path) -> dict[str, Any]:
         # A gate-free FFN cannot say which activation it means, so the
         # architecture has to. Read from llama.cpp's model files: both phi2 and
         # gpt-neox use `LLM_FFN_GELU` with `LLM_FFN_SEQ`.
+        # Read from llama.cpp's per-architecture files: the gate-free MLPs are
+        # GeGLU in the two code models and in PocketTTS, and ReLU-squared in the
+        # four named below.
         seq_activation = {"phi2": "gelu", "gptneox": "gelu",
+                          "codeshell": "gelu", "starcoder2": "gelu",
+                          "pockettts": "gelu",
                           "arcee": "relu_sq", "nemotron": "relu_sq",
                           "jais2": "relu_sq", "plm": "relu_sq"}
         if arch not in seq_activation:
@@ -652,12 +658,29 @@ class Session:
             [] for _ in range(cfg["L"])
         ]
         self.kv_dim = kv_dim
-        self.tensors = cfg["tensors"]
+        # Normalise upstream's current post-norm names once, at load, so every
+        # later lookup (and every tensor-presence test) sees one spelling.
+        self.tensors = {self.canonical(k): v for k, v in cfg["tensors"].items()}
         # One rolling recurrent state per layer: the convolution history
         # (d_conv - 1 columns) followed by one state vector per channel.
         self.ssm: list[dict[str, Any]] = [{} for _ in range(cfg["L"])]
 
+    def canonical(self, name: str) -> str:
+        """Map upstream's current post-norm names onto this module's spelling.
+
+        llama.cpp renamed `attn_post_norm` -> `post_attention_norm` and
+        `ffn_post_norm` -> `post_ffw_norm`. The tensors did not move, so a file
+        of either vintage describes the same block.
+        """
+        stem, _, suffix = name.rpartition(".")
+        for new, old in (("post_attention_norm", "attn_post_norm"),
+                         ("post_ffw_norm", "ffn_post_norm")):
+            if stem.endswith("." + new):
+                return stem[: -len(new)] + old + "." + suffix
+        return name
+
     def tensor(self, name: str) -> list[float]:
+        name = self.canonical(name)
         if name not in self.tensors:
             raise ReferenceError(f"missing tensor {name}")
         return self.tensors[name][1]
@@ -799,7 +822,12 @@ class Session:
             """The one place both norm types are chosen, mirroring the engine."""
             w = self.tensor(prefix + ".weight")
             if cfg["layer_norm"]:
-                return layernorm(vec, w, self.tensor(prefix + ".bias"), cfg["eps"])
+                # Upstream passes the bias pointer straight through, so a file
+                # without `*.bias` is a bias-free LayerNorm, not a broken one
+                # (cohere2's decoder passes NULL there).
+                bias = (self.tensor(prefix + ".bias")
+                        if prefix + ".bias" in self.tensors else [0.0] * len(w))
+                return layernorm(vec, w, bias, cfg["eps"])
             return rmsnorm(vec, w, cfg["eps"], cfg["norm_add_one"])
 
         for layer in range(cfg["L"]):

@@ -2896,7 +2896,11 @@ void test_architecture_parity() {
                                            "glm4-mrope", "bitnet", "arcee", "nemotron",
                                            "jais2", "gpt-oss", "plm", "mistral3",
                                            "qwen3vl", "qwen3vlmoe", "mamba", "mamba2",
-                                           "mamba-dtrms", "jamba"};
+                                           "mamba-dtrms", "jamba",
+                                           "deci", "nanbeige", "xverse", "maincoder",
+                                           "qwen", "codeshell", "starcoder2", "pockettts",
+                                           "cohere2", "paddleocr", "hunyuan-dense",
+                                           "llama-embed", "gemma2-renamed"};
     for (const std::string &slug : slugs) {
         const std::string model = "tests/fixtures/" + slug + "-shape.gguf";
         ArchGolden golden = read_arch_golden("tests/golden/" + slug + "_reference.txt");

@@ -651,7 +651,8 @@ std::vector<float> Engine::forward_token(int32_t token, uint64_t position,
         const double scale = 1.0 / std::sqrt(var + c.rms_eps);
         std::vector<float> y(x.size());
         for (uint32_t i = 0; i < x.size(); ++i)
-            y[i] = static_cast<float>((static_cast<double>(x[i]) - mean) * scale * w[i] + b[i]);
+            y[i] = static_cast<float>((static_cast<double>(x[i]) - mean) * scale * w[i] +
+                                      (b == nullptr ? 0.0 : static_cast<double>(b[i])));
         backend_->record_control(name, x.size() * sizeof(float) * 3, y.size() * sizeof(float));
         return y;
     };
@@ -661,7 +662,11 @@ std::vector<float> Engine::forward_token(int32_t token, uint64_t position,
                     const std::string &label) {
         const std::string w = prefix + ".weight";
         const std::string b = prefix + ".bias";
-        if (c.layer_norm) return layernorm(x, norm_weights(w), bias_weights(b), label);
+        // llama.cpp passes the bias pointer through unchanged, so a LayerNorm
+        // with no `*.bias` tensor is a bias-free LayerNorm, not a broken file
+        // (cohere2's decoder passes NULL for both norms).
+        if (c.layer_norm)
+            return layernorm(x, norm_weights(w), has_bias(b) ? bias_weights(b) : nullptr, label);
         return rmsnorm(x, norm_weights(w), label);
     };
     // The activation is a per-family fact read from the checkpoint: llama's
