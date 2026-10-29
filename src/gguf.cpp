@@ -876,6 +876,37 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
     cfg.layers = static_cast<uint32_t>(require_key("block_count", "layer count"));
     cfg.hidden = static_cast<uint32_t>(require_key("embedding_length", "embedding length"));
 
+    // --- structures this build does not model ---------------------------------
+    // Refused from the metadata, before any tensor is mapped, because both change
+    // the forward pass without changing the tensor set:
+    //
+    //  * hyper-connections widen the residual stream to `hc_mult * n_embd` and
+    //    apply `dsv4_hc_affine` in every layer (models/deepseek4.cpp);
+    //  * the DSA indexer selects which positions attention reads, so a file that
+    //    carries its keys expects attention to see a subset.
+    //
+    // Running either with the plain block produces different numbers with no
+    // tensor missing and no shape disagreeing. `hc_mult == 1` is the ordinary
+    // residual and is allowed. It is parsed here rather than with the other
+    // scalar keys so every later consumer sees the real value.
+    double hc_count = 0.0;
+    if (opt_double(doc, keys("hyper_connection.count"), &hc_count))
+        cfg.hyper_connection_count = hc_count;
+    if (cfg.hyper_connection_count > 1.0)
+        fail(ErrorCode::NOT_IMPLEMENTED,
+             "hyper-connections (hyper_connection.count = " +
+                 std::to_string(static_cast<int>(cfg.hyper_connection_count)) +
+                 ") are a block this build does not have: they change the residual stream, "
+                 "not just one projection");
+    for (const char *indexer_key : {"attention.indexer.head_count", "attention.indexer.key_length",
+                                    "attention.indexer.top_k"}) {
+        if (doc.metadata.find(arch + "." + indexer_key) != doc.metadata.end())
+            fail(ErrorCode::NOT_IMPLEMENTED,
+                 "the DSA indexer (" + arch + "." + indexer_key +
+                     ") is a block this build does not have; attention would read every "
+                     "position instead of the indexed subset");
+    }
+
     // --- recurrent (state-space) layers -------------------------------------
     // A layer with `ssm_in` has no attention: llama.cpp's mamba block is a 1D
     // convolution followed by a state-space scan. A *pure* mamba model is then

@@ -7,7 +7,7 @@
 > attention sinks are implemented, and `auto` no longer dispatches AVX-512 on a
 > Zen 3 target. The measurements below are the state at `f704e4b` and are kept
 > as the baseline this work is measured against; current numbers live in
-> `docs/MODEL_COVERAGE_STATUS.md` (3006 checks, 42 architecture fixtures).
+> `docs/MODEL_COVERAGE_STATUS.md` (3019 checks, 42 architecture fixtures).
 >
 > What changed since the baseline, in the terms this document uses:
 >
@@ -258,6 +258,20 @@ round-tripping.
 Fix: GPT-2 pre-tokenisation regex (`'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+`),
 lowest-rank merge loop, byte-level `Ġ` remapping on decode, then a reference
 test against a real vocabulary.
+
+### C11. Unmodelled structures ran as a reduced graph — **FIXED; found at `a05e27a`**
+
+`deepseek4`/`deepseek41` were accepted by the loader and by `probe` while two
+structures in their graph were absent: hyper-connections (which widen the
+residual stream to `hc_mult * n_embd` and are applied per layer) and the DSA
+indexer (which chooses which positions attention reads). A file declaring
+`hyper_connection.count = 2` produced **identical ids** with and without the
+declaration, because the value was parsed and used only to pick a clamp form for
+another architecture, and `probe` still said `runnable: true`.
+
+Both are now refused from the metadata before any tensor is mapped, and the
+probe reports `HYPER_CONNECTIONS_UNMODELLED` / `INDEXER_UNMODELLED`. The
+reproduction lives in `test_unmodelled_structures`.
 
 ### C2. Prefill is sequential
 

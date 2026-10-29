@@ -3806,6 +3806,108 @@ void test_metadata_array_forms() {
     }
 }
 
+// deepseek4 / deepseek41: the architectures are accepted, but two of the
+// structures their graph needs are not modelled here, and neither shows up as a
+// missing tensor:
+//
+//   * hyper-connections widen the residual stream (`hc_mult * n_embd`) and apply
+//     `dsv4_hc_affine` in every layer (models/deepseek4.cpp);
+//   * the DSA indexer chooses which positions attention reads.
+//
+// Before this test existed the engine loaded such a file and produced the same
+// ids with and without `hyper_connection.count`, while `probe` called it
+// runnable -- a reduced graph that looks like a working model. The reproduction
+// is kept here so that cannot come back.
+void test_unmodelled_structures() {
+    const std::string source = "tests/fixtures/deepseek2-mla-shape.gguf";
+    auto as_deepseek4 = [&]() {
+        const GGUFDocument base = parse_gguf_file(source);
+        GGUFDocument doc = base;
+        doc.metadata.clear();
+        for (const auto &[key, value] : base.metadata) {
+            // The GGUF convention is one prefix per architecture, so the keys have
+            // to move with the name or the manifest would read nothing.
+            const std::string prefix = "deepseek2.";
+            doc.metadata[key.rfind(prefix, 0) == 0 ? "deepseek4." + key.substr(prefix.size())
+                                                  : key] = value;
+        }
+        // The architecture is a metadata *value*, so it moves separately from the
+        // key prefixes.
+        doc.metadata["general.architecture"] = make_string("deepseek4");
+        return doc;
+    };
+    auto set_f64 = [](GGUFDocument &doc, const std::string &key, double value) {
+        MetadataValue v;
+        v.type = GGUFValueType::FLOAT32;
+        v.f = value;
+        doc.metadata[key] = v;
+    };
+
+    // The architecture alone is accepted: without the keys below, the file is the
+    // MLA block this build does model.
+    {
+        GGUFDocument doc = as_deepseek4();
+        const ModelManifest manifest = build_manifest(doc, source);
+        CHECK(manifest.config.architecture == "deepseek4",
+              "deepseek4 is mapped by name");
+        CHECK(manifest.config.hyper_connection_count == 0.0,
+              "a file without hyper-connection metadata reports none");
+    }
+
+    // Hyper-connections: refused, and the message names the parameter.
+    {
+        GGUFDocument doc = as_deepseek4();
+        set_f64(doc, "deepseek4.hyper_connection.count", 2.0);
+        CHECK(throws_code(ErrorCode::NOT_IMPLEMENTED,
+                          [&]() { (void)build_manifest(doc, source); }),
+              "a file declaring hyper-connections is refused");
+        bool named = false;
+        try {
+            (void)build_manifest(doc, source);
+        } catch (const Error &e) {
+            named = std::string(e.what()).find("hyper_connection.count") != std::string::npos;
+        }
+        CHECK(named, "the refusal names hyper_connection.count");
+    }
+
+    // hc_mult == 1 is the ordinary residual stream.
+    {
+        GGUFDocument doc = as_deepseek4();
+        set_f64(doc, "deepseek4.hyper_connection.count", 1.0);
+        CHECK(build_manifest(doc, source).config.hyper_connection_count == 1.0,
+              "a single hyper-connection is the plain residual and is accepted");
+    }
+
+    // The DSA indexer: refused from its metadata, before any tensor is mapped.
+    for (const char *key : {"deepseek4.attention.indexer.head_count",
+                            "deepseek4.attention.indexer.key_length",
+                            "deepseek4.attention.indexer.top_k"}) {
+        GGUFDocument doc = as_deepseek4();
+        MetadataValue v;
+        v.type = GGUFValueType::UINT32;
+        v.u = 4;
+        doc.metadata[key] = v;
+        CHECK(throws_code(ErrorCode::NOT_IMPLEMENTED,
+                          [&]() { (void)build_manifest(doc, source); }),
+              std::string("the DSA indexer is refused via ") + key);
+        // And the probe has to say the same thing before a run is attempted.
+        const Json probe = probe_model(doc, "synthetic.gguf");
+        CHECK(probe.dump().find("INDEXER_UNMODELLED") != std::string::npos,
+              std::string("the probe reports the indexer as a blocker via ") + key);
+    }
+
+    // The probe agrees about hyper-connections too: a blocker, not "runnable".
+    {
+        GGUFDocument doc = as_deepseek4();
+        set_f64(doc, "deepseek4.hyper_connection.count", 2.0);
+        const Json probe = probe_model(doc, "synthetic.gguf");
+        CHECK(probe.dump().find("HYPER_CONNECTIONS_UNMODELLED") != std::string::npos,
+              "the probe reports hyper-connections as a blocker");
+        CHECK(probe.dump().find("\"runnable\":true") == std::string::npos,
+              "the probe does not call a file with hyper-connections runnable");
+    }
+}
+
 void test_recurrent_families() {
     struct Expect {
         const char *slug;
@@ -4405,6 +4507,7 @@ int main(int argc, char **argv) {
     maybe_run("mistral3_block", test_mistral3_block);
     maybe_run("mrope_families", test_mrope_families);
     maybe_run("metadata_array_forms", test_metadata_array_forms);
+    maybe_run("unmodelled_structures", test_unmodelled_structures);
     maybe_run("recurrent_families", test_recurrent_families);
     maybe_run("chat_template_rendering", test_chat_template_rendering);
     maybe_run("chat_template_constructs", test_chat_template_constructs);

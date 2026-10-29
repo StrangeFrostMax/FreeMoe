@@ -107,12 +107,14 @@ path" above mean exactly that: the language model runs, the tower does not.
   rolling state next to the per-position cache, jamba's mix of dense and MoE
   layers), but no file of those families can be loaded. `qwen35` needs the gated
   delta-net scan (a per-head matrix state, not the mamba one). `deepseek4` and
-  `deepseek41` are accepted by `probe` and carry adapter rows, while their graph
-  also carries the DSA indexer, hyper-connections and an MTP head that this
-  build does not model; the MTP tensors are skipped with a recorded reason, the
-  indexer's would be refused as unknown tensors, and `hyper_connection.count` is
-  read but consumed only for `dflash`, so a real V4 file is not gated by this
-  build's own metadata checks. Treat that pair as unverified, not supported.
+  `deepseek41` carry adapter rows, but two structures their graph needs are
+  **refused by name** rather than run without: hyper-connections
+  (`hyper_connection.count > 1` widens the residual stream) and the DSA indexer
+  (`attention.indexer.*`). A real V4 file declares both, so it fails closed with
+  a named error instead of running a reduced graph — which is what it did before
+  this was found: the same ids with and without `hyper_connection.count`, while
+  `probe` called it runnable. MTP tensors are skipped with a recorded reason
+  (speculative decoding only).
   None of these is a wiring detail behind a working path: each is a block this
   build does not have, and the tables above say so per architecture.
 

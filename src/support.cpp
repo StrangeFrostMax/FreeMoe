@@ -180,6 +180,27 @@ bool read_u64(const GGUFDocument &doc, const std::string &arch, const std::strin
     return false;
 }
 
+// Reads a real-valued hyperparameter, for the keys llama.cpp stores as F32 or
+// F64 (`hyper_connection.count` is one). Integers are accepted too, because a
+// converter that writes 2 instead of 2.0 means the same thing.
+bool read_double(const GGUFDocument &doc, const std::string &arch, const std::string &name,
+                 double *out) {
+    for (const std::string &key : {arch + "." + name, name}) {
+        const MetadataValue *value = find(doc, key);
+        if (value == nullptr) continue;
+        if (value->type == GGUFValueType::FLOAT32 || value->type == GGUFValueType::FLOAT64) {
+            *out = value->as_double();
+            return true;
+        }
+        if (value->type == GGUFValueType::UINT32 || value->type == GGUFValueType::UINT64 ||
+            value->type == GGUFValueType::INT32 || value->type == GGUFValueType::INT64) {
+            *out = static_cast<double>(value->as_i64());
+            return true;
+        }
+    }
+    return false;
+}
+
 std::string read_string(const GGUFDocument &doc, const std::string &key) {
     const MetadataValue *value = find(doc, key);
     if (!value || value->type != GGUFValueType::STRING) return std::string();
@@ -310,6 +331,27 @@ Json probe_model(const GGUFDocument &doc, const std::string &source_path) {
         block("MISSING_ADAPTER",
               "architecture '" + arch + "' is recognised but its forward pass is not "
               "implemented; only the llama-family block structure is understood today");
+    }
+    // Structures the loader refuses, reported here for the same reason: `probe`
+    // is only useful if it agrees with the answer a run would give. Both change
+    // the forward pass without changing the tensor set.
+    {
+        double hc_count = 0.0;
+        if (read_double(doc, arch, "hyper_connection.count", &hc_count) && hc_count > 1.0) {
+            block("HYPER_CONNECTIONS_UNMODELLED",
+                  "hyper_connection.count = " + std::to_string(static_cast<int>(hc_count)) +
+                      ": hyper-connections widen the residual stream and are a block this build "
+                      "does not have");
+        }
+        for (const char *indexer_key : {"attention.indexer.head_count", "attention.indexer.key_length",
+                                        "attention.indexer.top_k"}) {
+            if (find(doc, arch + "." + indexer_key) != nullptr) {
+                block("INDEXER_UNMODELLED",
+                      "the DSA indexer (" + arch + "." + indexer_key +
+                          ") selects which positions attention reads and is not modelled here");
+                break;
+            }
+        }
     }
     for (uint32_t type_id : unsupported_types) {
         block("UNSUPPORTED_TENSOR_TYPE",
