@@ -23,8 +23,17 @@
 namespace fm {
 namespace {
 
-// Below this many multiply-adds a threaded dispatch costs more than it saves.
-constexpr uint64_t THREAD_MIN_WORK = 1ull << 16;
+// Work per thread below which a threaded dispatch costs more than it saves.
+//
+// This used to be a single 2^16 (65,536 multiply-adds) threshold, which
+// parallelised a 256x256 projection -- measured on a 2-vCPU host at 6.0 us
+// single-threaded versus 37.3 us threaded, six times slower, and that shape is
+// the most common one in a small model. The measured crossover is about 1M
+// multiply-adds for two threads, so the threshold is per thread and set at
+// 2^20: 256x1024 (262k) and 1024x1024 (1.05M) stay on one thread, 1024x4096
+// (4.2M) and 4096x4096 (16.8M) go wide, where threading is 1.5x and 2.1x
+// faster respectively. See `docs/KERNELS.md` for the table.
+constexpr uint64_t THREAD_MIN_WORK_PER_THREAD = 1ull << 20;
 
 // std::thread::hardware_concurrency() is not free (it may consult sysfs), so it
 // must never be called on a per-GEMV path. Cached once per process.
@@ -385,6 +394,10 @@ void WorkerPool::parallel_for(uint32_t total, uint32_t max_threads,
     for (Impl *impl : workers_) impl->body = nullptr;
 }
 
+uint64_t threading_min_work(uint32_t threads) {
+    return THREAD_MIN_WORK_PER_THREAD * (threads == 0 ? 1 : threads);
+}
+
 void gemv(const KernelConfig &config, const float *weights, const float *x, float *y,
           uint32_t out_dim, uint32_t in_dim) {
     if (out_dim == 0 || in_dim == 0) return;
@@ -394,7 +407,7 @@ void gemv(const KernelConfig &config, const float *weights, const float *x, floa
     if (kernel_trace_enabled())
         std::fprintf(stderr, "gemv out=%u in=%u work=%llu threads=%u isa=%s\n", out_dim, in_dim,
                      static_cast<unsigned long long>(work), threads, kernel_isa_name(isa));
-    if (threads <= 1 || work < THREAD_MIN_WORK) {
+    if (threads <= 1 || work < threading_min_work(threads)) {
         gemv_isa(isa, weights, x, y, out_dim, in_dim);
         return;
     }
@@ -786,7 +799,7 @@ void gemv_quant(const KernelConfig &config, uint32_t type_id, const uint8_t *wei
     ctx.in_dim = in_dim;
     ctx.block_size = geo.block_size;
     ctx.block_bytes = geo.block_bytes;
-    if (threads <= 1 || work < THREAD_MIN_WORK) {
+    if (threads <= 1 || work < threading_min_work(threads)) {
         gemv_quant_rows(ctx, weights, x, y, 0, out_dim);
         return;
     }

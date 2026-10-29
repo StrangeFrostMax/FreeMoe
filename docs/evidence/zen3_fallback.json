@@ -63,7 +63,7 @@
     "trace_zen3_detected": true
   },
   "status": "pass",
-  "unit_checks": 61,
+  "unit_checks": 64,
   "unit_failures": 0,
   "vendor_failures": 0,
   "vendor_tests": 1

@@ -319,8 +319,10 @@ clock equivalence, operation logs, trace replay and three soak sessions.
 
 Recorded evidence in `docs/evidence/` reports:
 
-- `make test`: **587 checks, 0 failures** and VNPU selftest **19 tests, 0
-  failures**;
+- `make test`: **2555 checks, 0 failures** and VNPU selftest **19 tests, 0
+  failures** (current tree). The recorded artifact
+  `docs/evidence/test_summary.json` reports `unit_checks` from the commit it was
+  captured at, not this number, so the two are expected to differ;
 - 72-second ASan/UBSan fuzz: **72,000 iterations, 0 sanitizer findings**;
 - dense CPU, MoE CPU, MoE VNPU and MoE direct final comparisons: **20/20
   prompts pass**;

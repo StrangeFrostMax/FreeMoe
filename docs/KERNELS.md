@@ -41,8 +41,30 @@ Key properties:
 - **Zen 3 policy is shared.** `resolve_kernel_isa(Auto)` calls the same
   `host_is_zen3()` detection as the NPU layer, so a Zen 3 host never selects
   AVX-512 even though the capability bit may be set.
-- **Threading has a work threshold** (`2^16` multiply-adds). Below it, the pool
-  is not touched, because waking a worker costs more than the GEMV itself.
+- **Threading has a per-worker work threshold** (`2^20` multiply-adds per
+  worker). Below it, the pool is not touched, because waking and joining a worker
+  costs more than the GEMV itself. The threshold used to be a flat `2^16`, which
+  parallelised a 256×256 projection; measured on a 2-vCPU host that shape took
+  **6.0 µs serial and 37.3 µs threaded** — six times slower — and it is the most
+  common shape in a small model. The measured crossover is ≈1M multiply-adds for
+  two workers, hence the `2^20`-per-worker rule. All numbers below are the same
+  kernel at 2 threads:
+
+  | out × in | multiply-adds | 1 thread | 2 threads | decision |
+  | --- | --- | --- | --- | --- |
+  | 256 × 256 | 65,536 | 6.0 µs | 37.3 µs | serial |
+  | 256 × 1024 | 262,144 | 21.4 µs | 45.2 µs | serial |
+  | 1024 × 1024 | 1,048,576 | 135.3 µs | 131.9 µs | serial (break-even) |
+  | 1024 × 4096 | 4,194,304 | 554.0 µs | 373.6 µs | wide (1.5×) |
+  | 4096 × 4096 | 16,777,216 | 5670 µs | 2693 µs | wide (2.1×) |
+
+  End to end on a synthetic 8-layer, hidden-256 checkpoint (205 forward passes),
+  the policy change took the run from **1305 ms to 1035 ms** with `--threads 0`
+  (hardware concurrency), against 968 ms forced single-threaded — i.e. the
+  automatic path no longer loses to serial. `thread_dispatch_policy` pins the
+  threshold and requires a threaded GEMV to be *bit-identical* to the serial one
+  (each row is one worker's sequential reduction, so this is exactness, not a
+  tolerance).
 - **No hidden per-call allocation.** An earlier revision called
   `std::thread::hardware_concurrency()` on every GEMV, which cost ~2.5 µs per
   call and made small operations 40× slower than scalar. It is now cached once

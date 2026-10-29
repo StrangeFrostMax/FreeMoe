@@ -205,111 +205,6 @@ ROLE_SUFFIXES = {
 }
 
 
-def role_for(name: str) -> tuple[str, int]:
-    if name == "token_embd.weight":
-        return "TOKEN_EMBD", -1
-    if name == "output.weight":
-        return "OUTPUT", -1
-    if name == "output_norm.weight":
-        return "OUTPUT_NORM", -1
-    if name.startswith("blk."):
-        parts = name.split(".", 2)
-        if len(parts) == 3 and parts[0] == "blk" and parts[1].isdigit() and parts[2] in ROLE_SUFFIXES:
-            return ROLE_SUFFIXES[parts[2]], int(parts[1])
-    return "UNKNOWN", -1
-
-
-def golden_inspect(kind: str, source_path: str, blob: bytes, layout: dict[str, Any], md: dict[str, tuple[Any, ...]], tensors: list[TensorSpec]) -> dict[str, Any]:
-    tlayouts = {t.name: t for t in layout["tensors"]}
-    roles = []
-    total_bytes = 0
-    for spec in sorted(tensors, key=lambda t: t.name):
-        info = tlayouts[spec.name]
-        role, layer = role_for(spec.name)
-        size = tensor_byte_size(spec.dims, spec.type_id)
-        total_bytes += size
-        roles.append({
-            "name": spec.name,
-            "role": role,
-            "layer": layer,
-            "expert": -1,
-            "type": "F32",
-            "dims": spec.dims,
-            "offset": info.absolute_offset,
-            "bytes": size,
-        })
-    expert_records = []
-    if kind == "moe":
-        checksums = md["freemoe.expert_checksums"][1]
-        for layer in range(L):
-            for expert in range(E):
-                extents = []
-                for role_name in ("FFN_GATE_EXPS", "FFN_UP_EXPS", "FFN_DOWN_EXPS"):
-                    suffix = {
-                        "FFN_GATE_EXPS": "ffn_gate_exps.weight",
-                        "FFN_UP_EXPS": "ffn_up_exps.weight",
-                        "FFN_DOWN_EXPS": "ffn_down_exps.weight",
-                    }[role_name]
-                    tname = f"blk.{layer}.{suffix}"
-                    tinfo = tlayouts[tname]
-                    stride = H * I * 4
-                    extents.append({
-                        "role": role_name,
-                        "offset": tinfo.absolute_offset + expert * stride,
-                        "bytes": stride,
-                    })
-                expert_records.append({
-                    "layer": layer,
-                    "expert": expert,
-                    "bytes": 3 * H * I * 4,
-                    "checksum": f"{checksums[layer * E + expert]:016x}",
-                    "extents": extents,
-                })
-    summary_keys = [
-        "general.architecture", "general.name", "general.alignment",
-        "freemoe.adapter", "freemoe.model_kind", "freemoe.hidden_size",
-        "freemoe.intermediate_size", "freemoe.num_hidden_layers",
-        "freemoe.num_attention_heads", "freemoe.num_key_value_heads",
-        "freemoe.head_dim", "freemoe.vocab_size", "freemoe.max_context_length",
-        "freemoe.rope_mode", "freemoe.tokenizer_model",
-        "freemoe.router_operation", "freemoe.shared_expert",
-        "freemoe.expert_layout", "freemoe.expert_count",
-        "freemoe.expert_top_k", "freemoe.seed", "tokenizer.chat_template",
-    ]
-    summary = {}
-    for key in summary_keys:
-        value = md[key][1]
-        if isinstance(value, bool):
-            summary[key] = "true" if value else "false"
-        else:
-            summary[key] = str(value)
-    return {
-        "schema": "freemoe.inspect.v1",
-        "status": "validated",
-        "source_path": source_path,
-        "file_size": len(blob),
-        "data_offset": layout["data_offset"],
-        "gguf_version": 3,
-        "alignment": ALIGN,
-        "metadata_count": len(md),
-        "tensor_count": len(tensors),
-        "tensor_bytes": total_bytes,
-        "source_fingerprint": f"{layout['source_fingerprint']:016x}",
-        "architecture_adapter": {"id": "freemoe-tiny-v1", "version": 1},
-        "model_kind": kind,
-        "quantization_types": ["F32"],
-        "tokenizer": {"model": "freemoe.byte-v1", "bos_token_id": 256, "eos_token_id": 257, "chat_template": "raw-v1"},
-        "metadata_summary": summary,
-        "expert_count": E if kind == "moe" else 0,
-        "expert_top_k": TOPK if kind == "moe" else 0,
-        "expert_layout": "stacked-f32" if kind == "moe" else "none",
-        "roles": roles,
-        "unresolved_roles": [],
-        "expert_records": expert_records,
-        "validation": {"errors": [], "warnings": []},
-    }
-
-
 def prompts() -> list[str]:
     base = "the quick brown fox jumps over lazy dogs while free moe pages experts from disk and verifies every selected weight "
     out = []
@@ -536,12 +431,13 @@ def generate_all() -> None:
     make_metadata_types_fixture()
     q8_blob, q8_layout = make_quant_fixture()
 
-    dense_golden = golden_inspect("dense", DENSE_PATH, dense_blob, dense_layout, dense_md, dense_tensors)
-    moe_golden = golden_inspect("moe", MOE_PATH, moe_blob, moe_layout, moe_md, moe_tensors)
-    (ROOT / "tests" / "golden" / "inspect_dense.json").write_text(
-        json.dumps(dense_golden, separators=(",", ":"), ensure_ascii=False) + "\n", encoding="utf-8")
-    (ROOT / "tests" / "golden" / "inspect_moe.json").write_text(
-        json.dumps(moe_golden, separators=(",", ":"), ensure_ascii=False) + "\n", encoding="utf-8")
+    # `tests/golden/inspect_{dense,moe}.json` are deliberately NOT written here.
+    # They used to be produced by a Python reimplementation of `inspect --json`,
+    # which drifted from the C++ report -- it still emitted a `roles` array after
+    # the report renamed that to `model_map` -- so regenerating the fixtures
+    # silently replaced working goldens with an obsolete schema. They are now
+    # produced from the built binary by `make inspect-goldens`, and the
+    # `gguf_parser_and_golden` test is what holds them to the current schema.
 
     prompt_list = prompts()
     prompts_path = ROOT / "tests" / "reference" / "prompts.txt"

@@ -23,17 +23,24 @@ what the work is: the 50 model names reduce to about eight capabilities.
 | Linear + YaRN context extension, `rope_freqs` divisors | `rope_scaling` checks, 4 fixtures |
 | Attention sinks, NoPE layers | `attention_sinks`, `rope_scaling`, fixtures |
 | MLA (DeepSeek-V2/V3 style), sigmoid/softmax/sqrt-softplus gating, group-limited routing, selection bias, shared expert | `deepseek2-mla` fixture + oracle |
-| GQA/MQA, per-head qk-norm, partial rotary, fused qkv, fused gate-up, post-norms, sliding window, tanh softcap, LayerNorm variants, silu/gelu | 23 architecture fixtures |
-| 36 quantisation types incl. ternary `TQ1_0`/`TQ2_0`/`Q1_0`/`Q2_0`/`PQ2_0`, the whole IQ family (IQ1_S/M, IQ2_XXS/XS/S, IQ3_XXS/S, IQ4_XS/NL) and FP4 (MXFP4, NVFP4) | `quant_reference_decode`, `quant_model_parity`; bit-exact against llama.cpp's own dequantizers via `tools/quant_upstream_check.py` (26 types, 0 failures) |
-| Fused `ffn_gate_up_exps`, clamped SwiGLU (`swiglu-oai`, per-layer `swiglu_clamp`), router renormalisation floor | `ffn_variants`, `qwen3moe-fused-up` and `qwen3moe-clamp` fixtures |
+| GQA/MQA, per-head qk-norm, partial rotary, fused qkv, fused gate-up, post-norms, sliding window, tanh softcap, LayerNorm variants, silu/gelu | 27 architecture fixtures (`architecture_parity`, 189 checks) |
+| 36 quantisation types incl. ternary `TQ1_0`/`TQ2_0`/`Q1_0`/`Q2_0`/`PQ2_0`, the whole IQ family (IQ1_S/M, IQ2_XXS/XS/S, IQ3_XXS/S, IQ4_XS/NL) and FP4 (MXFP4, NVFP4) | `quant_reference_decode`, `quant_model_parity` (Q8_0/Q4_0/Q4_K/Q6_K end to end); **matches llama.cpp's own dequantizers to ≤1e-6 relative** of block magnitude via `tools/quant_upstream_check.py` (26 types, 0 failures; worst absolute 5.0e-06 on IQ4_NL, MXFP4/NVFP4 exact). Not claimed bit-exact — see `docs/GAP_ANALYSIS.md` |
+| Fused `ffn_gate_up_exps`, clamped SwiGLU (`swiglu-oai`, per-layer `swiglu_clamp`), router renormalisation floor | `ffn_variants`, `activation_clamp_forms` (13 checks), `qwen3moe-fused-up` and `qwen3moe-clamp` fixtures |
+| Mixed-precision expert stacks: per-projection types inside one expert record (Q4_K gate/up + Q6_K down), fused and separate | `quant_expert_mixed_types` (32 checks), `quant-expert-{fused,separate}.gguf` + F32 twins |
+| Pointwise activation primitives (`relu`, `relu_sq`, `gelu_erf`, `softplus`) as upstream's `llm_ffn_op_type` defines them | `pointwise_activations` (12 checks) — implemented and pinned, but no adapter row selects them yet |
+| Refusal paths: unmapped architecture, undecodable tensor type, missing output head | `refusal_paths` (17 checks) — error code, message and probe blocker JSON |
 | mRoPE section split (`rope.dimension_sections`), plain and interleaved | `rope_mrope`; `glm4-mrope` fixture |
 | Adapter rows tagged in llama.cpp's vocabulary (`inspect --tags`, `freemoe adapters`) | `adapter_tags`, 85 checks |
 
 Supported architecture strings today (each has a fixture unless noted):
 `llama`, `qwen2`, `qwen3`, `qwen2moe`, `qwen3moe`, `gemma`, `gemma2`, `gemma3`,
 `phi2`, `phi3`, `glm4`, `minicpm`, `deepseek2`, `internlm2`, `exaone`, `orion`,
-`gptneox`, `stablelm`, `smollm`, `smollm2`, `smollm3`, `tinyllama`, plus the
-native `freemoe-tiny`. `smollm`/`smollm2`/`tinyllama` are the same llama block.
+`gptneox`, `stablelm`, `smollm`, `smollm2`, `smollm3`, `tinyllama`, `bitnet`,
+plus the native `freemoe-tiny`. `smollm`/`smollm2`/`tinyllama` are the same llama
+block. The three lists that decide this — the adapter table, the loader's family
+list and the probe's known-architecture table — are bound to each other by the
+`adapter_binding` test (215 checks), which is what caught `smollm3` and `bitnet`
+missing from the probe's table while their adapters existed.
 
 ## The requested list
 
@@ -49,18 +56,19 @@ native `freemoe-tiny`. `smollm`/`smollm2`/`tinyllama` are the same llama block.
 | GLM-4 text | `glm4` | **WORKS** |
 | SmolLM3 | `smollm3` | **WORKS** (NoPE layers implemented in this change) |
 | DeepSeek-R1 distills on Qwen/Llama | `qwen2`, `llama` | **WORKS** |
+| BitNet-b1.58 block, any decoded tensor type | `bitnet` | **WORKS** for the block (`bitnet` fixture); the published `I2_S` files stay refused by type (see the row below) |
 
 ### One primitive away
 
 | Requested model | GGUF arch | Blocked by |
 | --- | --- | --- |
-| Qwen3-VL (text path), Qwen3.5-MoE, Qwen3.5 dense, Ernie 4.5 / 4.5-MoE, Ling/Ring (Bailing-MoE3), GLM-4 / 4.5 MoE, Hunyuan MoE/dense | `qwen3vl`, `qwen35`, `qwen35moe`, `ernie4_5*`, `bailingmoe*`, `glm4moe`, `hunyuan-*` | **mRoPE implemented** (`rope_mrope`, `glm4-mrope` fixture): sections are parsed, validated against the head width and drive per-axis positions, plain and interleaved. Remaining work is the adapter row per architecture plus their block variants; the vision path stays out of scope |
-| DeepSeek-V4, V4.1, V4-Flash-Vision (text), Mimo-2.5, MiniMax-M2/M3 | `deepseek4`, `deepseek41`, `mimo*`, `minimax-m2`, `minimax-m3` | **clamped SwiGLU** (`SWIGLU_OAI_MOE`) plus sinks and a `1e-20` router-sum epsilon. Sinks landed in this change; the clamp and the epsilon have not |
-| dots.llm1 / dots3note, Cohere2-MoE (North Mini Code), Gemma 4, GLM-DSA, DeepSeek-3.2 | `dots3note`, `cohere2moe`, `gemma4`, `glm-dsa`, `deepseek32` | **fused `ffn_gate_up_exps`**: gate and up stacked in one expert tensor. The expert record layout assumes three separate projections, so this is a residency/extent change, not a rename |
+| Qwen3-VL (text path), Qwen3.5-MoE, Qwen3.5 dense, Ernie 4.5 / 4.5-MoE, Ling/Ring (Bailing-MoE3), GLM-4 / 4.5 MoE, Hunyuan MoE/dense | `qwen3vl`, `qwen35`, `qwen35moe`, `ernie4_5*`, `bailingmoe*`, `glm4moe`, `hunyuan-*` | **Adapter row missing, not the block.** mRoPE is implemented (`rope_mrope`, `glm4-mrope` fixture): sections are parsed, validated against the head width and drive per-axis positions, plain and interleaved. Remaining work is the adapter row per architecture plus their block variants; the vision path stays out of scope |
+| DeepSeek-V4, V4.1, V4-Flash-Vision (text), Mimo-2.5, MiniMax-M2/M3 | `deepseek4`, `deepseek41`, `mimo*`, `minimax-m2`, `minimax-m3` | **Primitives are in place**: both upstream clamp forms (`swiglu-oai` for gpt-oss/minimax-m3, per-layer `swiglu_clamp` for deepseek4/4.1 and glm5-next, fused and unfused, `activation_clamp_forms` 13 checks), attention sinks, and deepseek4.1's `+1e-20` router-sum epsilon. What is missing is the **adapter row per architecture**: none of these strings is in the loader's family list, so a real file is refused by name rather than run |
+| dots.llm1 / dots3note, Cohere2-MoE (North Mini Code), Gemma 4, GLM-DSA, DeepSeek-3.2 | `dots3note`, `cohere2moe`, `gemma4`, `glm-dsa`, `deepseek32` | **Fused `ffn_gate_up_exps` is implemented** (`qwen3moe-fused-up`, and a mixed-type fused expert stack in `quant_expert_mixed_types`): one tensor, gate block first, two extents per expert record, each carrying its own type. What is missing is the **adapter row** for each of these strings |
 | Qwen3-Next, Qwen3.5-Next, Kimi-Linear | `qwen3next`, `qwen35*`, `kimi-linear` | **gated delta-net** (linear attention with a per-head state). New cache shape, new kernel; the largest single item left |
 | Nemotron-H, Jamba-style hybrids, Falcon-H1, Granite-Hybrid, Plamo2 | `nemotron_h`, `nemotron_h_moe`, `falcon-h1`, `granite-hybrid`, `plamo2` | **recurrent/SSM layers** interleaved with attention (+8 models) |
 | LFM2.5, LFM2-MoE | `lfm2`, `lfm2moe`, `lfm3` | **short convolution** layers before attention |
-| BitNet-b1.58-2B-4T | `bitnet` | **`I2_S` decoder** and the `SUBLN` placement. The ternary family is decoded for PrismML's types; BitNet's own does not overlap |
+| BitNet-b1.58-2B-4T | `bitnet` | **Block done** (`bitnet` fixture + oracle: SUBLN sub-norms on the attention and FFN outputs, optional one-element `*.scale` per projection, tied output). What remains is the **container**: Microsoft's published files store weights as `I2_S`, bitnet.cpp's private type 36, whose element layout cannot be confirmed from a published source — a file carrying it is refused by name. A BitNet-shaped file in a decoded ternary type runs |
 | Command-A, Command-R+ | `command-r`, `cohere2` | **adapter row + verification** (their graph is close to what exists; not yet checked line by line) |
 | Mimo-V2-Flash, MiniMax-01 | `mimo*`, `minimax-01` | **adapter row + verification** (MoE with sinks and its own router normalisation) |
 | Mellum2, Laguna XS.2 / M.1, OpenPangu, Seed-OSS, Nanbeige 4.2, MiniCPM5, GigaChat3, Step-3.5-Flash, Mistral 4, K2-Horizon, Muse-Glimmer, DSpark, LLaMA-4 | `mellum`, `laguna`, `pangu*`, `seed_oss`, `nanbeige`, `minicpm3`/`minicpm5`, `gigachat`, `step35`, `mistral4`, `kimi-k2`?, `muse*`, `dspark`, `llama4` | **not yet assessed line by line in this build.** Each needs its upstream `src/models/*.cpp` read and its tensor set compared with the existing flags before a row is added; several (LLaMA-4, Mistral 4) also need fused `gate_up_exps` or the sinks+clamp pair above |
@@ -89,7 +97,8 @@ path" above mean exactly that: the language model runs, the tower does not.
 2. ~~**Fused `ffn_gate_up_exps`**~~ **done** (`qwen3moe-fused-up`).
 3. ~~**Clamped SwiGLU + router epsilon**~~ **done** (`qwen3moe-clamp`).
    `SITU` and `GEGLU_ERF` are what remains of this group.
-4. ~~**IQ family + MXFP4/NVFP4 decoders**~~ **done**, bit-exact against upstream.
+4. ~~**IQ family + MXFP4/NVFP4 decoders**~~ **done**, matching upstream's own
+   dequantizers to ≤1e-6 relative (26 types, worst absolute 5.0e-06).
    `I2_S` is *not* a llama.cpp type: it is bitnet.cpp's private type 36, and the
    ternary checkpoints llama.cpp reads are `TQ1_0`/`TQ2_0`, which decode here.
    A file carrying type 36 is refused by name with that explanation.

@@ -128,9 +128,19 @@ def load_model(path: Path) -> dict[str, Any]:
         # A file that declares it selects the clamped variant, exactly as the
         # engine does; the mode is never inferred from the architecture name.
         "swiglu_clamp": [float(v) for v in key("swiglu_clamp_exp", [])],
+        # Which of the two upstream clamp forms; mirrors llama-graph.cpp:2449.
+        "swiglu_clamp_fused": arch in ("maple", "deepseek4", "deepseek41",
+                                       "glm5-next", "hy-v4"),
         # Detected from the tensors, exactly as the engine's adapter does:
         # keying this off the architecture name silently skipped glm4's norms.
         "post_norms": "blk.0.attn_post_norm.weight" in tensors,
+        # BitNet's SUBLN: an RMSNorm on the attention output before the output
+        # projection, and one on the gated FFN output before the down
+        # projection. Tensor-presence evidence, like every other structure here.
+        "sub_norms": "blk.0.attn_sub_norm.weight" in tensors,
+        # Optional one-element `*.scale` tensors that multiply a projection's
+        # output; llama.cpp folds them into `build_lora_mm`, before any bias.
+        "proj_scales": "blk.0.attn_q.scale" in tensors,
         "attn_softcap": float(key("attn_logit_softcapping", 0.0)),
         "final_softcap": float(key("final_logit_softcapping", 0.0)),
         "window": int(key("attention.sliding_window", 0)),
@@ -426,10 +436,17 @@ def gated(cfg: dict[str, Any], gate: float, up: float, layer: int) -> float:
     if kind == "silu-clamp":
         per_layer = cfg.get("swiglu_clamp") or []
         bound = per_layer[layer] if layer < len(per_layer) else limit
-        if bound <= 0.0:
+        # 1e-6, not 0: that is upstream's threshold for "clamped at all".
+        if bound <= 1e-6:
             return gate / (1.0 + math.exp(-gate)) * up
+        u = max(-bound, min(bound, up))
+        if cfg.get("swiglu_clamp_fused"):
+            # ggml_swiglu_clamp: the gate is clamped before silu.
+            g = min(gate, bound)
+            return (g / (1.0 + math.exp(-g))) * u
+        # The graph fallback: silu first, then clamp its output.
         g = min(gate / (1.0 + math.exp(-gate)), bound)
-        return g * max(-bound, min(bound, up))
+        return g * u
     if kind == "gelu":
         return gelu(gate) * up
     return gate / (1.0 + math.exp(-gate)) * up
@@ -543,6 +560,15 @@ class Session:
                 q = matvec(self.tensor(p + "attn_q.weight"), h, H, H)
                 k = matvec(self.tensor(p + "attn_k.weight"), h, kv_dim, H)
                 v = matvec(self.tensor(p + "attn_v.weight"), h, kv_dim, H)
+                if cfg["proj_scales"]:
+                    # Before the bias and before RoPE, exactly as build_lora_mm
+                    # folds the scale into the projection.
+                    sq = self.tensor(p + "attn_q.scale")[0]
+                    sk = self.tensor(p + "attn_k.scale")[0]
+                    sv = self.tensor(p + "attn_v.scale")[0]
+                    q = [v * sq for v in q]
+                    k = [v * sk for v in k]
+                    v = [v * sv for v in v]
                 if cfg["qkv_bias"]:
                     bq = self.tensor(p + "attn_q.bias")
                     bk = self.tensor(p + "attn_k.bias")
@@ -598,8 +624,16 @@ class Session:
                 attention[ab:ab + head_v] = acc
             if TRACE is not None:
                 TRACE[f"attn.L{layer}"] = list(attention)
+            if cfg["sub_norms"]:
+                # Inside the block: the head mix is normalised before the output
+                # projection, which is not what a post-norm does.
+                attention = rmsnorm(attention, self.tensor(p + "attn_sub_norm.weight"),
+                                    cfg["eps"], cfg["norm_add_one"])
             attn_out = matvec(self.tensor(p + "attn_output.weight"), attention, H,
                               heads * head_v)
+            if cfg["proj_scales"]:
+                s = self.tensor(p + "attn_output.scale")[0]
+                attn_out = [v * s for v in attn_out]
             if cfg["attn_output_bias"]:
                 bias = self.tensor(p + "attn_output.bias")
                 attn_out = [attn_out[i] + bias[i] for i in range(H)]
@@ -674,11 +708,22 @@ class Session:
                 else:
                     gate = matvec(self.tensor(p + "ffn_gate.weight"), h, cfg["I"], H)
                     up = matvec(self.tensor(p + "ffn_up.weight"), h, cfg["I"], H)
+                if cfg["proj_scales"]:
+                    sg = self.tensor(p + "ffn_gate.scale")[0]
+                    su = self.tensor(p + "ffn_up.scale")[0]
+                    gate = [v * sg for v in gate]
+                    up = [v * su for v in up]
                 if cfg["activation"] == "gelu":
                     act = [gelu(gate[i]) * up[i] for i in range(cfg["I"])]
                 else:
                     act = [gated(cfg, gate[i], up[i], layer) for i in range(cfg["I"])]
+                if cfg["sub_norms"]:
+                    act = rmsnorm(act, self.tensor(p + "ffn_sub_norm.weight"),
+                                  cfg["eps"], cfg["norm_add_one"])
                 down = matvec(self.tensor(p + "ffn_down.weight"), act, H, cfg["I"])
+                if cfg["proj_scales"]:
+                    sd = self.tensor(p + "ffn_down.scale")[0]
+                    down = [v * sd for v in down]
             if cfg["shared_expert"] and layer >= cfg["dense_lead"]:
                 # qwen2moe's shared expert: a dense FFN beside the routed ones,
                 # scaled by sigmoid(dot(gate_inp, h)). The reference writes that

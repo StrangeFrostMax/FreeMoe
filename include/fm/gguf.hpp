@@ -87,6 +87,14 @@ enum class TensorRole : uint32_t {
     ATTN_V_BIAS,
     ATTN_OUTPUT_BIAS,
     // Per-head RMSNorm on q/k, which qwen3 applies before RoPE.
+    // BitNet's SUBLN: RMSNorm applied to the attention output *before* the
+    // output projection, and to the gated FFN output *before* ffn_down.
+    ATTN_SUB_NORM,
+    FFN_SUB_NORM,
+    // bitnet.cpp also writes optional one-element `scale` tensors per
+    // projection (llama.cpp's `TENSOR_NOT_REQUIRED` q/k/v/o/gate/up/down
+    // scales). A file may carry none of them.
+    PROJECTION_SCALE,
     ATTN_Q_NORM,
     ATTN_SINKS,
     ROPE_FREQS,
@@ -128,6 +136,12 @@ enum class TensorRole : uint32_t {
 };
 
 const char *tensor_role_name(TensorRole role);
+
+// True when this build has a forward pass for `arch` (the llama-family block).
+// One list decides it, and `adapter_binding` in the tests requires it to agree
+// with the adapter table both ways, so an architecture cannot be added to one
+// and forgotten in the other.
+bool is_llama_family(const std::string &arch);
 
 struct TensorInfo {
     std::string name;
@@ -248,6 +262,29 @@ struct ModelConfig {
     double activation_alpha = 0.0;
     // Per-layer clamp for `silu-clamp`; empty means "use activation_limit".
     std::vector<double> swiglu_clamp;
+    // The clamp has two upstream forms and they disagree by design:
+    //   fused      silu(min(gate, limit)) * clamp(up, +-limit)
+    //   non-fused  min(silu(gate), limit) * clamp(up, +-limit)
+    // llama.cpp picks per architecture (llama-graph.cpp:2449), so the choice is
+    // a checkpoint-derived fact, not a style. A layer whose bound is <= 1e-6 is
+    // unclamped in both.
+    bool swiglu_clamp_fused = false;
+    // Shared-expert bound, from `swiglu_clamp_shexp`; empty means "same as the
+    // routed experts", which is what most files do.
+    std::vector<double> swiglu_clamp_shexp;
+    // BitNet's SUBLN: RMSNorm over the attention output before the output
+    // projection, and over the gated FFN output before the down projection.
+    // Both are inside the block, not after it, so they cannot be expressed with
+    // the post-norm flag.
+    bool sub_norms = false;
+    // Optional one-element `*.scale` tensors multiply a projection's output.
+    // bitnet.cpp writes them for its ternary weights; a file with none keeps
+    // scale 1.0.
+    bool projection_scales = false;
+    // `hyper_connection.count` (llama.cpp's dsv4_hc_mult). dflash only selects
+    // the fused clamp when it also carries compression connections, so the two
+    // facts have to be kept together.
+    double hyper_connection_count = 0.0;
     // Routed experts store gate and up in one tensor, gate block first.
     bool fused_gate_up_exps = false;
     // gemma2/3 clamp attention scores and/or final logits through tanh.

@@ -68,6 +68,50 @@
         "experts": 2,
         "top_k": 1
       }
+    },
+    "q6_k": {
+      "model": "quant-moe-q6_k.gguf",
+      "model_sha256": "a3c5c9df9be7f87e6aac28e80d53957057acc816d689098c1f50d468eb977f7d",
+      "model_bytes": 655328,
+      "reference": "quant-moe-q6_k-f32ref.gguf",
+      "reference_sha256": "89c2c167ceb9d2dc02551c5a4140b43864d551d92b613bcdabdc68b78310e39b",
+      "reference_bytes": 3160736,
+      "quantised_tensors": 10,
+      "quantised_payload_bytes": 649452,
+      "payload_ratio": 4.858,
+      "config": {
+        "hidden": 256,
+        "intermediate": 256,
+        "layers": 1,
+        "heads": 4,
+        "head_dim": 64,
+        "vocab": 258,
+        "context": 256,
+        "experts": 2,
+        "top_k": 1
+      }
+    },
+    "expert-fused": {
+      "model": "quant-expert-fused.gguf",
+      "reference": "quant-expert-fused-f32ref.gguf",
+      "fused_gate_up_exps": true,
+      "gate_up_type_id": 12,
+      "down_type_id": 14,
+      "quantised_payload_bytes": 476736,
+      "model_bytes": 487264,
+      "model_sha256": "c1bb0e7b3e88e81be91cc17509bf8c590a76a94ebfcaa4359fb70a11ab168725",
+      "reference_sha256": "fd4df3efd5f8fe6806c7cd2c2f85da3b92245ff4a012fce3f7a182afde80aeca"
+    },
+    "expert-separate": {
+      "model": "quant-expert-separate.gguf",
+      "reference": "quant-expert-separate-f32ref.gguf",
+      "fused_gate_up_exps": false,
+      "gate_up_type_id": 12,
+      "down_type_id": 14,
+      "quantised_payload_bytes": 476736,
+      "model_bytes": 487328,
+      "model_sha256": "178e87c60df8b6dbb2e7bfe1a821b61e6560b137e13e3cde0c7ae335ed808f6b",
+      "reference_sha256": "55f5274f91105711259c5dad59441c5101e81883ee25fc474fe5dbd5c11f3a1b"
     }
   },
   "note": "Each -f32ref twin stores exactly the values an *independent Python decoder* (tools/quant_reference.py) produces for the quantised file, so matching greedy tokens and logits prove both the C++ decoder and the execution path."

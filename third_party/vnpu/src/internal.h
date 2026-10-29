@@ -567,7 +567,18 @@ struct vnpu_device {
     std::atomic<uint32_t> tile_m{0};
     std::atomic<uint32_t> tile_k{0};
     std::atomic<uint32_t> tile_n{0};
-    std::vector<std::vector<uint8_t>> local_stores;
+    /* CELL-unit GEMM stages tiles through a 256 KiB scratch buffer per worker.
+     * The buffers are owned by the device because they are large, so a command
+     * must own them exclusively while it dispatches. `scratch_free` is a lease
+     * pool: a command takes a set for the duration of one kernel dispatch and
+     * returns it afterwards. Two streams sharing one device used to stage their
+     * tiles into the *same* buffers, which silently produced wrong results
+     * whenever the two dispatches actually overlapped (observed as an
+     * intermittent `local_cluster` selftest failure on hosts with enough cores
+     * to overlap them). */
+    uint32_t scratch_workers = 1;
+    std::mutex scratch_mutex;
+    std::vector<std::unique_ptr<std::vector<std::vector<uint8_t>>>> scratch_free;
     std::vector<vnpu_stream_t *> streams;
     vnpu_interrupt_cb_t irq_cb = nullptr;
     void *irq_user = nullptr;

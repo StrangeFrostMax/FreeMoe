@@ -129,6 +129,9 @@ const char *tensor_role_name(TensorRole role) {
     case TensorRole::ATTN_K_BIAS: return "ATTN_K_BIAS";
     case TensorRole::ATTN_V_BIAS: return "ATTN_V_BIAS";
     case TensorRole::ATTN_OUTPUT_BIAS: return "ATTN_OUTPUT_BIAS";
+    case TensorRole::ATTN_SUB_NORM: return "ATTN_SUB_NORM";
+    case TensorRole::FFN_SUB_NORM: return "FFN_SUB_NORM";
+    case TensorRole::PROJECTION_SCALE: return "PROJECTION_SCALE";
     case TensorRole::ATTN_Q_NORM: return "ATTN_Q_NORM";
     case TensorRole::ATTN_SINKS: return "ATTN_SINKS";
     case TensorRole::ROPE_FREQS: return "ROPE_FREQS";
@@ -411,6 +414,18 @@ TensorRole role_from_name(const std::string &name, uint32_t &layer) {
         {"attn_k.bias", TensorRole::ATTN_K_BIAS},
         {"attn_v.bias", TensorRole::ATTN_V_BIAS},
         {"attn_output.bias", TensorRole::ATTN_OUTPUT_BIAS},
+        // BitNet: sub-norms and the optional per-projection scalars. `.scale`
+        // names are one-element tensors, so they are matched before the weight
+        // table would reject them.
+        {"attn_sub_norm.weight", TensorRole::ATTN_SUB_NORM},
+        {"ffn_sub_norm.weight", TensorRole::FFN_SUB_NORM},
+        {"attn_q.scale", TensorRole::PROJECTION_SCALE},
+        {"attn_k.scale", TensorRole::PROJECTION_SCALE},
+        {"attn_v.scale", TensorRole::PROJECTION_SCALE},
+        {"attn_output.scale", TensorRole::PROJECTION_SCALE},
+        {"ffn_gate.scale", TensorRole::PROJECTION_SCALE},
+        {"ffn_up.scale", TensorRole::PROJECTION_SCALE},
+        {"ffn_down.scale", TensorRole::PROJECTION_SCALE},
         {"attn_q_norm.weight", TensorRole::ATTN_Q_NORM},
         {"attn_sinks.weight", TensorRole::ATTN_SINKS},
         {"rope_freqs.weight", TensorRole::ROPE_FREQS},
@@ -677,26 +692,26 @@ bool opt_string(const GGUFDocument &doc, const std::set<std::string> &keys, std:
     return false;
 }
 
-// Which architectures this build can map. Everything here shares the same
-// pre-norm block structure and llama.cpp tensor naming; the differences are
-// handled by per-architecture flags below rather than by separate code paths.
-bool is_llama_family(const std::string &arch) {
-    static const std::set<std::string> family = {
-        "llama", "qwen2", "qwen3", "smollm", "smollm2", "tinyllama",
-        "gemma", "gemma2", "gemma3", "phi3", "minicpm", "qwen3moe", "glm4",
-        "qwen2moe", "phi2", "deepseek2", "internlm2", "orion", "exaone", "gptneox",
-        "stablelm", "smollm3",
-    };
-    return family.count(arch) != 0;
-}
-
-
-const MetadataValue &require_metadata(const GGUFDocument &doc, const std::string &key) {
+// Same lookup, returning a pointer instead of a reference.
+//
+// `require_metadata` returns a reference *into `doc`*, but a call with a literal
+// key also constructs a temporary `std::string` for the parameter, and GCC 13's
+// `-Wdangling-reference` (part of `-Wextra`, so fatal under this project's
+// `-Werror`) then assumes the returned reference may point at that temporary and
+// refuses to compile the file. It is a false positive, and it is real: the
+// project did not build on current Ubuntu/Debian toolchains until this became a
+// pointer, which cannot dangle.
+const MetadataValue *require_metadata_ptr(const GGUFDocument &doc, const std::string &key) {
     auto it = doc.metadata.find(key);
     if (it == doc.metadata.end())
         fail(ErrorCode::METADATA_MISMATCH, "missing required metadata key " + key);
-    return it->second;
+    return &it->second;
 }
+
+const MetadataValue &require_metadata(const GGUFDocument &doc, const std::string &key) {
+    return *require_metadata_ptr(doc, key);
+}
+
 
 std::string require_string(const GGUFDocument &doc, const std::string &key) {
     return require_metadata(doc, key).as_string();
@@ -729,6 +744,21 @@ std::string layer_name(uint32_t layer, const std::string &suffix) {
 }
 
 } // namespace
+
+// Which architectures this build can map. Everything here shares the same
+// pre-norm block structure and llama.cpp tensor naming; the differences are
+// handled by per-architecture flags rather than by separate code paths. This
+// lives outside the anonymous namespace because the tests bind it to the adapter
+// table and the probe's table, which are the other two lists that decide it.
+bool is_llama_family(const std::string &arch) {
+    static const std::set<std::string> family = {
+        "llama", "qwen2", "qwen3", "smollm", "smollm2", "tinyllama",
+        "gemma", "gemma2", "gemma3", "phi3", "minicpm", "qwen3moe", "glm4",
+        "qwen2moe", "phi2", "deepseek2", "internlm2", "orion", "exaone", "gptneox",
+        "stablelm", "smollm3", "bitnet",
+    };
+    return family.count(arch) != 0;
+}
 
 // Maps a llama.cpp-family checkpoint onto the engine's canonical tensor names.
 //
@@ -1040,6 +1070,35 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
     // file's. Every fourth layer (1-based) keeps its keys unrotated.
     if (arch == "smollm3") cfg.no_rope_layer_step = 4;
 
+    // BitNet keeps its normalisation inside the block: a second RMSNorm on the
+    // attention output before `attn_output`, and another on the gated FFN output
+    // before `ffn_down` (llama.cpp's models/bitnet.cpp). Its output head is tied
+    // to the token table, which the loader already handles by absence.
+    // Presence is the evidence -- the tensors are what the forward pass reads --
+    // but bitnet *requires* them, and a partially written file is a mapping
+    // error rather than a variant. Checking both keeps a wrong graph from being
+    // run silently either way.
+    const bool has_attn_sub_norm =
+        doc.tensor_by_name.count(layer_name(0, "attn_sub_norm.weight")) != 0;
+    const bool has_ffn_sub_norm =
+        doc.tensor_by_name.count(layer_name(0, "ffn_sub_norm.weight")) != 0;
+    if (has_attn_sub_norm != has_ffn_sub_norm)
+        fail(ErrorCode::MISSING_REQUIRED_TENSOR,
+             "sub-norms must exist on both the attention and the FFN path; this "
+             "file defines only one of them");
+    if (arch == "bitnet" && !has_attn_sub_norm)
+        fail(ErrorCode::MISSING_REQUIRED_TENSOR,
+             "bitnet requires attn_sub_norm.weight and ffn_sub_norm.weight");
+    cfg.sub_norms = has_attn_sub_norm;
+    if (cfg.sub_norms) {
+        for (uint32_t layer = 0; layer < cfg.layers; ++layer)
+            for (const char *suffix : {"attn_sub_norm.weight", "ffn_sub_norm.weight"})
+                if (doc.tensor_by_name.count(layer_name(layer, suffix)) == 0)
+                    fail(ErrorCode::MISSING_REQUIRED_TENSOR,
+                         "sub-norms are present on some layers only: " +
+                             layer_name(layer, suffix));
+    }
+
     // Router renormalisation denominator. llama.cpp clamps it to the smallest F16
     // normal for every architecture except deepseek4.1, which adds 1e-20; keeping
     // the rule here means the two are not conflated.
@@ -1062,11 +1121,28 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
                    clamp_it != doc.metadata.end() && clamp_it->second.is_array()) {
             for (const auto &entry : clamp_it->second.array)
                 cfg.swiglu_clamp.push_back(entry.as_double());
+            if (auto shexp_it = doc.metadata.find(arch + ".swiglu_clamp_shexp");
+                shexp_it != doc.metadata.end() && shexp_it->second.is_array()) {
+                for (const auto &entry : shexp_it->second.array)
+                    cfg.swiglu_clamp_shexp.push_back(entry.as_double());
+            }
+            // Any bound above upstream's 1e-6 threshold selects the clamped
+            // variant; the per-layer decision is then made at compute time.
             const double worst =
                 *std::max_element(cfg.swiglu_clamp.begin(), cfg.swiglu_clamp.end());
             if (worst > 1e-6) {
                 cfg.activation = "silu-clamp";
                 cfg.activation_limit = worst;
+                // Which of the two upstream forms this architecture uses
+                // (llama-graph.cpp:2449). DFLASH only takes the fused branch when
+                // it carries a dsv4 compression factor; without one it is
+                // unfused like everything else.
+                static const std::set<std::string> fused_clamp = {
+                    "maple", "deepseek4", "deepseek41", "glm5-next", "hy-v4",
+                };
+                cfg.swiglu_clamp_fused = fused_clamp.count(arch) != 0;
+                if (arch == "dflash" && cfg.hyper_connection_count > 0.0)
+                    cfg.swiglu_clamp_fused = true;
             }
         }
     }
@@ -1104,6 +1180,8 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
                      " here; refusing rather than guessing its activation");
         cfg.activation = it->second;
     }
+    if (opt_double(doc, keys("hyper_connection.count"), &number))
+        cfg.hyper_connection_count = number;
     if (opt_double(doc, keys("rope.freq_base"), &number)) cfg.rope_theta = number;
     else if (opt_double(doc, keys("rope_theta"), &number)) cfg.rope_theta = number;
     else cfg.rope_theta = 10000.0;
@@ -1280,6 +1358,25 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
     // gate in `ffn_gate_inp` while the reference adapter calls it `ffn_router`.
     std::set<std::string> expected;
     auto expect = [&](const std::string &name) { expected.insert(name); };
+    // BitNet's optional projection scales: one element each, multiplied into the
+    // projection output. They are claimed here rather than in the per-layer list
+    // because a file may carry any subset of them, and an unclaimed tensor would
+    // be reported as an adapter gap.
+    cfg.projection_scales = false;
+    for (const char *suffix : {"attn_q.scale", "attn_k.scale", "attn_v.scale",
+                               "attn_output.scale", "ffn_gate.scale", "ffn_up.scale",
+                               "ffn_down.scale"}) {
+        for (uint32_t l = 0; l < cfg.layers; ++l) {
+            const std::string name = layer_name(l, suffix);
+            if (!m.tensor(name)) continue;
+            const TensorInfo *scale = m.tensor(name);
+            if (scale->element_count() != 1)
+                fail(ErrorCode::SHAPE_MISMATCH,
+                     name + " must hold exactly one element");
+            expect(name);
+            cfg.projection_scales = true;
+        }
+    }
     expect("token_embd.weight");
     expect("output_norm.weight");
     // A checkpoint without `output.weight` ties the output projection to the
@@ -1335,6 +1432,9 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
             for (const char *suffix : {"attn_post_norm.weight", "ffn_post_norm.weight"})
                 expect(layer_name(l, suffix));
         if (cfg.attn_sinks) expect(layer_name(l, "attn_sinks.weight"));
+        if (cfg.sub_norms)
+            for (const char *suffix : {"attn_sub_norm.weight", "ffn_sub_norm.weight"})
+                expect(layer_name(l, suffix));
         if (cfg.rope_freqs) expect(layer_name(l, "rope_freqs.weight"));
         // The leading `dense_lead` blocks carry a plain FFN even in an MoE
         // model, so the branch is chosen per layer rather than per model.
@@ -1731,26 +1831,27 @@ ModelManifest build_manifest(const GGUFDocument &doc, const std::string &source_
         cfg.eos_id >= cfg.vocab)
         fail(ErrorCode::SHAPE_MISMATCH, "model dimension exceeds adapter safety bounds");
 
-    const MetadataValue &tokens = require_metadata(doc, "tokenizer.ggml.tokens");
-    if (!tokens.is_array() || tokens.array.size() != cfg.vocab ||
-        tokens.element_type != GGUFValueType::STRING)
+    const MetadataValue *tokens = require_metadata_ptr(doc, "tokenizer.ggml.tokens");
+    if (!tokens->is_array() || tokens->array.size() != cfg.vocab ||
+        tokens->element_type != GGUFValueType::STRING)
         fail(ErrorCode::INVALID_TOKENIZER, "tokenizer token table has wrong shape");
-    for (const auto &token : tokens.array) {
+    for (const auto &token : tokens->array) {
         if (!token.is_string()) fail(ErrorCode::INVALID_TOKENIZER, "non-string tokenizer token");
         m.tokenizer_tokens.push_back(token.s);
     }
 
-    const MetadataValue &checksums = require_metadata(doc, "freemoe.expert_checksums");
-    if (!checksums.is_array() || checksums.element_type != GGUFValueType::UINT64)
+    const MetadataValue *checksums = require_metadata_ptr(doc, "freemoe.expert_checksums");
+    if (!checksums->is_array() || checksums->element_type != GGUFValueType::UINT64)
         fail(ErrorCode::METADATA_MISMATCH, "expert checksum array has wrong type");
 
     bool moe = cfg.model_kind == "moe";
-    if (!moe && (cfg.expert_count != 0 || cfg.expert_top_k != 0 || !checksums.array.empty() || cfg.expert_layout != "none"))
+    if (!moe && (cfg.expert_count != 0 || cfg.expert_top_k != 0 || !checksums->array.empty() ||
+                 cfg.expert_layout != "none"))
         fail(ErrorCode::METADATA_MISMATCH, "dense model declares MoE metadata");
     if (moe && (cfg.expert_count == 0 || cfg.expert_top_k == 0 ||
                 cfg.expert_top_k > cfg.expert_count || cfg.expert_layout != "stacked-f32"))
         fail(ErrorCode::METADATA_MISMATCH, "MoE model has inconsistent expert metadata");
-    if (moe && checksums.array.size() != static_cast<size_t>(cfg.layers) * cfg.expert_count)
+    if (moe && checksums->array.size() != static_cast<size_t>(cfg.layers) * cfg.expert_count)
         fail(ErrorCode::METADATA_MISMATCH, "expert checksum count mismatch");
 
     std::set<std::string> expected = {"token_embd.weight", "output.weight", "output_norm.weight"};
@@ -1859,7 +1960,7 @@ ModelManifest build_manifest(const GGUFDocument &doc, const std::string &source_
                 rec.expert = e;
                 rec.payload_bytes = checked_mul(3, expert_stride, "expert payload");
                 size_t checksum_index = static_cast<size_t>(l) * cfg.expert_count + e;
-                rec.checksum = checksums.array[checksum_index].as_u64();
+                rec.checksum = checksums->array[checksum_index].as_u64();
                 rec.checksum_known = true;
                 for (int r = 0; r < 3; ++r) {
                     const TensorInfo &tensor = t(layer_name(l, extent_suffixes[r]));

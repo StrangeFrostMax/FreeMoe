@@ -38,6 +38,17 @@ Virtual NPU was patched at pinned upstream commit
    contradictory AVX-512 feature bits.
 5. Suppressed a GCC 12 false-positive warning from AVX-512 intrinsic headers
    so the vendored source builds under `-Wall -Wextra -Werror`.
+6. Fixed a data race the upstream runtime had on the CELL GEMM path: its
+   256 KiB staging buffers were owned by the device and indexed only by worker
+   id, so two streams dispatching on the same device staged tiles into the same
+   memory. The buffers are now leased per dispatch (`ScratchLease` in
+   `src/core/scheduler.cpp`, pool in `vnpu_device::scratch_free`), which is both
+   correct and allocation-free in steady state. Upstream code and the earlier
+   tests only ever compared one dispatch at a time, so the defect first showed
+   up as an *intermittent* `local_cluster` selftest failure on a 4-core CI
+   runner; `stream_concurrency` now forces the overlap with a barrier and fails
+   deterministically on the shared-buffer version (measured: stream 0 element
+   1928 read `-4.103` where the reference is `-1.634`).
 
 ## Zen 3 detection fallback
 

@@ -824,9 +824,9 @@ VNPU_API vnpu_status_t VNPU_CALL vnpu_device_create(const vnpu_config_t *config,
         threads = std::min<uint32_t>(threads, std::max<uint32_t>(1, device->cpu.logical_cpus));
         device->pool = std::make_unique<vnpu::ThreadPool>(
             threads, (cfg.flags & VNPU_CONFIG_PIN_THREADS) != 0);
-        device->local_stores.resize(threads);
-        for (auto &store : device->local_stores)
-            store.resize(VNPU_LOCAL_STORE_BYTES + VNPU_CACHELINE_BYTES);
+        /* Staging buffers are leased per dispatch by the scheduler, so the
+         * device only records how many workers need one. */
+        device->scratch_workers = threads;
 
         uint32_t tm = cfg.tile_m, tk = cfg.tile_k, tn = cfg.tile_n;
         if (!tm || !tk || !tn) {

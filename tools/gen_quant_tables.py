@@ -10,7 +10,8 @@ of hand-copied.
 
 Usage:
     python3 tools/gen_quant_tables.py --upstream /path/to/llama.cpp
-    python3 tools/gen_quant_tables.py --upstream ... --check   # verify committed file
+    python3 tools/gen_quant_tables.py --upstream ... --check   # byte-exact verify
+    python3 tools/gen_quant_tables.py --check                  # structural verify only
 
 Only tables that a decoder in `src/quant.cpp` actually indexes are emitted.
 """
@@ -102,11 +103,82 @@ def render(tables: dict[str, list[int]]) -> str:
     return "".join(parts)
 
 
+# Element domains, so a truncated or mistyped transcription is caught by the
+# committed file alone. Upstream need not be present for this check.
+DOMAINS = {
+    "uint8_t": (0, 0xFF),
+    "int8_t": (-128, 127),
+    "uint32_t": (0, 0xFFFFFFFF),
+    "uint64_t": (0, 0xFFFFFFFFFFFFFFFF),
+}
+
+_EMITTED = re.compile(
+    r"const\s+(?P<type>uint8_t|int8_t|uint32_t|uint64_t)\s+(?P<name>\w+)\s*"
+    r"\[(?P<count>\d+)\]\s*=\s*\{(?P<body>.*?)\};",
+    re.S,
+)
+
+
+def check_structural(path: Path = OUT) -> list[str]:
+    """Verify the committed tables without a llama.cpp checkout.
+
+    Everything here is a property of the file that the generator promises: every
+    declared table is present exactly once with the declared element count, every
+    value fits its C type, `kvalues_iq4nl` stays strictly increasing (the decoder
+    binary-searches it), and `kmask_iq2xs` is the powers-of-two mask table. The
+    byte-for-byte comparison against upstream is `--upstream ... --check`; this
+    is the part that can run in CI without a second checkout.
+    """
+    problems: list[str] = []
+    if not path.exists():
+        return [f"{path.relative_to(ROOT)} is missing"]
+    text = path.read_text()
+    seen: dict[str, list[int]] = {}
+    for match in _EMITTED.finditer(text):
+        name = match.group("name")
+        seen[name] = [int(token, 0) for token in
+                      re.split(r"[,\s]+", match.group("body").strip()) if token]
+        declared = int(match.group("count"))
+        if declared != len(seen[name]):
+            problems.append(f"{name}: declares {declared} entries, holds {len(seen[name])}")
+    for name, ctype, count in TABLES:
+        if name not in seen:
+            problems.append(f"{name}: missing from the committed header")
+            continue
+        values = seen[name]
+        if len(values) != count:
+            problems.append(f"{name}: {len(values)} entries, expected {count}")
+        lo, hi = DOMAINS[ctype]
+        bad = [v for v in values if v < lo or v > hi]
+        if bad:
+            problems.append(f"{name}: {len(bad)} value(s) outside {ctype}, first {bad[0]}")
+        if len(set(values)) < 2 and count > 2:
+            problems.append(f"{name}: every entry is {values[0] if values else 'missing'}")
+    iq4 = seen.get("kvalues_iq4nl", [])
+    if any(iq4[i] >= iq4[i + 1] for i in range(len(iq4) - 1)):
+        problems.append("kvalues_iq4nl: not strictly increasing")
+    if seen.get("kmask_iq2xs") != [1 << i for i in range(8)]:
+        problems.append("kmask_iq2xs: not the powers-of-two mask table")
+    return problems
+
+
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--upstream", required=True, help="path to a llama.cpp checkout")
+    parser.add_argument("--upstream", help="path to a llama.cpp checkout")
     parser.add_argument("--check", action="store_true", help="compare instead of writing")
     args = parser.parse_args(argv)
+
+    if args.check and not args.upstream:
+        problems = check_structural()
+        for problem in problems:
+            print(problem, file=sys.stderr)
+        if problems:
+            return 1
+        print(f"{OUT.relative_to(ROOT)} passes the structural check "
+              f"({len(TABLES)} tables, upstream not present)")
+        return 0
+    if not args.upstream:
+        parser.error("--upstream is required unless --check is used for the structural check")
 
     header = Path(args.upstream) / "ggml" / "src" / "ggml-common.h"
     if not header.exists():

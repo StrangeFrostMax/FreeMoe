@@ -1,0 +1,77 @@
+name: test
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  build-and-test:
+    # The kernels are compiled for the baseline ISA; AVX2/FMA paths are selected
+    # at runtime, so a stock hosted runner exercises the same code this project
+    # ships. `make zen3-fallback` is the separate Zen 3 evidence target and runs
+    # on the real machine, not here.
+    runs-on: ubuntu-latest
+    env:
+      # Makes a Unicode-version mismatch a failure instead of a `SKIP`, so the
+      # regeneration gate really verifies the committed table here.
+      FREEMOE_REQUIRE_UNICODE: "15.1.0"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      # The generated Unicode class table comes from a versioned database, so
+      # the interpreter that verifies it must carry the same version the table
+      # was generated from (see tools/gen_unicode_tables.py). `unicodedata2`
+      # pins that version independently of the runner image's Python, and a
+      # venv keeps it out of the system interpreter.
+      - name: Configure
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq build-essential python3 python3-venv
+          python3 -m venv .ci-venv
+          .ci-venv/bin/pip install --quiet --disable-pip-version-check "unicodedata2==15.1.0"
+          echo "$PWD/.ci-venv/bin" >> "$GITHUB_PATH"
+          g++ --version | head -1
+          python3 --version
+      - name: Build
+        run: |
+          set -o pipefail
+          make -j"$(nproc)" all build/tests build/vnpu-selftest build/fuzz_gguf 2>&1 | tee build.log
+      # A failing build on a hosted runner is only diagnosable if the error text
+      # is reachable without downloading the raw log. Annotating the first few
+      # errors puts them on the check run itself, in the PR.
+      - name: Report build errors
+        if: failure()
+        run: |
+          grep -nE "error:|Error [0-9]+|No rule to make target" build.log | head -20 |
+            while IFS= read -r line; do echo "::error title=build::$line"; done
+          exit 1
+      # The test suite's ISA-dependent assertions need to know what they ran on,
+      # and the raw log is not reachable from everywhere, so record it here.
+      - name: Host info
+        run: |
+          nproc
+          grep -m1 "model name" /proc/cpuinfo || true
+          grep -oE "avx512f|avx2|fma" /proc/cpuinfo | sort -u | tr '\n' ' '; echo
+      - name: Unit and architecture tests
+        run: |
+          set -o pipefail
+          make test 2>&1 | tee test.log
+      # Same reasoning as the build step: without this, a failing test surfaces
+      # only as "exit code 1" on the check run, because the raw log is behind a
+      # short-lived blob URL. Annotate the failing lines and the tail.
+      - name: Report test failures
+        if: failure()
+        run: |
+          grep -nE "^FAIL:|^\[FAIL\]|FAILED|Traceback|Error [0-9]+|error:|checks," test.log | head -30 |
+            while IFS= read -r line; do echo "::error title=tests::$line"; done
+          exit 1
+      - name: Fixture and table regeneration checks
+        run: |
+          python3 tools/gen_quant_tables.py --check
+          python3 tools/quant_reference.py --check
+          python3 tools/make_arch_fixtures.py --check
+          python3 tools/gen_unicode_tables.py --check
+          python3 scripts/check_architecture.py
+          python3 scripts/check_dependencies.py

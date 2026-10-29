@@ -1,3 +1,4 @@
+#include "fm/activation.hpp"
 #include "fm/engine.hpp"
 #include "fm/kernels.hpp"
 #include "fm/quant.hpp"
@@ -6,6 +7,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <set>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -245,6 +247,34 @@ const float *Engine::bias_weights(const std::string &name) const {
 
 bool Engine::has_bias(const std::string &name) const {
     return decoded_biases_.find(name) != decoded_biases_.end();
+}
+
+std::optional<float> Engine::scalar_weight(const std::string &name) const {
+    std::string resolved = name;
+    auto alias = manifest_.alias.find(name);
+    if (alias != manifest_.alias.end()) resolved = alias->second;
+    // A one-element vector that arrived in a block format was decoded at load
+    // time (it is 1-D and not a bias), so both stores have to be consulted.
+    auto decoded = decoded_norms_.find(resolved);
+    if (decoded != decoded_norms_.end()) {
+        if (decoded->second.empty())
+            fail(ErrorCode::SHAPE_MISMATCH, "scalar tensor is empty: " + name);
+        return decoded->second.front();
+    }
+    auto it = weight_offsets_.find(resolved);
+    if (it == weight_offsets_.end()) return std::nullopt;
+    return *reinterpret_cast<const float *>(
+        static_cast<const uint8_t *>(weights_buffer_->data) + it->second);
+}
+
+bool Engine::apply_projection_scale(std::vector<float> &vec, const std::string &name,
+                                    const std::string &op) {
+    const std::optional<float> scale = scalar_weight(name);
+    if (!scale) return false;
+    const float s = *scale;
+    for (float &v : vec) v *= s;
+    backend_->record_control(op, vec.size() * sizeof(float), vec.size() * sizeof(float));
+    return true;
 }
 
 const float *Engine::norm_weights(const std::string &name) const {
@@ -605,58 +635,22 @@ std::vector<float> Engine::forward_token(int32_t token, uint64_t position,
         if (c.layer_norm) return layernorm(x, norm_weights(w), bias_weights(b), label);
         return rmsnorm(x, norm_weights(w), label);
     };
-    auto silu = [](float x) {
-        return static_cast<float>(static_cast<double>(x) / (1.0 + std::exp(-static_cast<double>(x))));
-    };
-    // ggml's GELU is the tanh approximation, not the erf form.
-    auto gelu = [](float x) {
-        const double v = static_cast<double>(x);
-        const double inner = 0.7978845608028654 * (v + 0.044715 * v * v * v);
-        return static_cast<float>(0.5 * v * (1.0 + std::tanh(inner)));
-    };
     // The activation is a per-family fact read from the checkpoint: llama's
-    // SwiGLU, gpt-neox's GELU, gemma's GeGLU. Keeping one switch here is what
-    // lets architectures differ only in data rather than in code.
-    if (c.activation != "silu" && c.activation != "gelu" && c.activation != "gelu_erf" &&
-        c.activation != "relu" && c.activation != "relu_sq" && c.activation != "softplus" &&
-        c.activation != "swiglu-oai" && c.activation != "silu-clamp")
-        fail(ErrorCode::NOT_IMPLEMENTED, "unsupported activation '" + c.activation + "'");
-    const std::string activation_name = c.activation;
-    auto activate = [&](float x) -> float {
-        const double v = static_cast<double>(x);
-        if (activation_name == "gelu") return gelu(x);
-        if (activation_name == "gelu_erf")
-            return static_cast<float>(0.5 * v * (1.0 + std::erf(v / std::sqrt(2.0))));
-        if (activation_name == "relu") return static_cast<float>(std::max(0.0, v));
-        if (activation_name == "relu_sq") return static_cast<float>(std::max(0.0, v) * std::max(0.0, v));
-        if (activation_name == "softplus") return static_cast<float>(std::log1p(std::exp(v)));
-        return silu(x);
+    // SwiGLU, gpt-neox's GELU, gemma's GeGLU. Both the gated and the gate-free
+    // form live in include/fm/activation.hpp, so there is one implementation of
+    // each and the clamp variants are testable in isolation.
+    static const std::set<std::string> known_activations = {
+        "silu", "gelu", "gelu_erf", "relu", "relu_sq", "softplus",
+        "swiglu-oai", "silu-clamp",
     };
-    // The gated activation, including the two clamped variants. Both clamp the
-    // gate from above and the up branch symmetrically; they differ in what the
-    // gate produces and whether one is added to the up branch (gpt-oss's
-    // `swiglu_oai` is `silu(alpha*gate) * (up + 1)`).
+    if (known_activations.count(c.activation) == 0)
+        fail(ErrorCode::NOT_IMPLEMENTED, "unsupported activation '" + c.activation + "'");
+    auto activate = [&](float x) -> float { return pointwise_activation(c, x); };
+    // The gated activation lives in include/fm/activation.hpp so the two clamp
+    // forms can be tested against hand-computed values instead of only through
+    // a whole-checkpoint logit comparison.
     auto gated = [&](float gate, float up, uint32_t layer) -> float {
-        const double limit = c.activation_limit;
-        if (c.activation == "swiglu-oai") {
-            const double x = std::min(static_cast<double>(gate), limit);
-            const double y = std::clamp(static_cast<double>(up), -limit, limit);
-            return static_cast<float>((x / (1.0 + std::exp(-c.activation_alpha * x))) * (y + 1.0));
-        }
-        if (c.activation == "silu-clamp") {
-            // deepseek4/4.1 store one bound per layer. A present entry is used
-            // verbatim -- including 0.0, which means "this layer is not clamped"
-            // and is common in those checkpoints. The scalar is only a fallback
-            // for files that carry no per-layer array.
-            const double layer_limit =
-                layer < c.swiglu_clamp.size() ? c.swiglu_clamp[layer] : limit;
-            const double g = silu(gate);
-            if (layer_limit <= 0.0) return static_cast<float>(g * up);
-            const double g_clamped = std::min(g, layer_limit);
-            const double u_clamped = std::clamp(static_cast<double>(up), -layer_limit, layer_limit);
-            return static_cast<float>(g_clamped * u_clamped);
-        }
-        return activate(gate) * up;
+        return gated_activation(c, gate, up, layer);
     };
     auto residual_add = [&](std::vector<float> &x, const std::vector<float> &delta, const std::string &name) {
         for (size_t i = 0; i < x.size(); ++i) x[i] += delta[i];
@@ -833,6 +827,15 @@ std::vector<float> Engine::forward_token(int32_t token, uint64_t position,
                             "attn_k.L" + std::to_string(layer));
             v = matvec_view(tensor_view(prefix + "attn_v.weight"), h, kv_dim, c.hidden,
                             "attn_v.L" + std::to_string(layer));
+            // BitNet's ternary projections carry a one-element scale that
+            // multiplies the projection output. llama.cpp folds it into
+            // `build_lora_mm`, so it lands before the bias and before RoPE.
+            if (c.projection_scales) {
+                const std::string lp = "L" + std::to_string(layer);
+                apply_projection_scale(q, prefix + "attn_q.scale", "attn_q_scale." + lp);
+                apply_projection_scale(k, prefix + "attn_k.scale", "attn_k_scale." + lp);
+                apply_projection_scale(v, prefix + "attn_v.scale", "attn_v_scale." + lp);
+            }
         }
         if (c.attn_qkv_bias && !c.fused_qkv) {
             // qwen2-style: bias is added to the projection output, before RoPE.
@@ -938,9 +941,18 @@ std::vector<float> Engine::forward_token(int32_t token, uint64_t position,
         backend_->record_control("attention.L" + std::to_string(layer),
                                  (position + 1) * kv_stride * sizeof(float),
                                  attention.size() * sizeof(float));
+        // BitNet's SUBLN: the attention output is normalised *inside* the block,
+        // after the head mix and before the output projection. It cannot be
+        // expressed as a post-norm, which would run after the projection.
+        if (c.sub_norms)
+            attention = rmsnorm(attention, norm_weights(prefix + "attn_sub_norm.weight"),
+                                "rmsnorm.attn_sub.L" + std::to_string(layer));
         std::vector<float> attn_out =
             matvec_view(tensor_view(prefix + "attn_output.weight"), attention, c.hidden,
                         attn_out_dim, "attn_output.L" + std::to_string(layer));
+        if (c.projection_scales)
+            apply_projection_scale(attn_out, prefix + "attn_output.scale",
+                                   "attn_output_scale.L" + std::to_string(layer));
         if (c.attn_output_bias) {
             const float *b = bias_weights(prefix + "attn_output.bias");
             for (uint32_t i = 0; i < c.hidden; ++i) attn_out[i] += b[i];
@@ -972,7 +984,7 @@ std::vector<float> Engine::forward_token(int32_t token, uint64_t position,
                                          act.size() * sizeof(float), 0);
             }
             for (float &v : act) v = activate(v);
-            backend_->record_control(activation_name + ".L" + std::to_string(layer),
+            backend_->record_control(c.activation + ".L" + std::to_string(layer),
                                      act.size() * sizeof(float), act.size() * sizeof(float));
             ffn = matvec_view(tensor_view(prefix + "ffn_down.weight"), act, c.hidden,
                               c.intermediate, "ffn_down.L" + std::to_string(layer));
@@ -998,13 +1010,28 @@ std::vector<float> Engine::forward_token(int32_t token, uint64_t position,
                 up = matvec_view(tensor_view(prefix + "ffn_up.weight"), h, c.intermediate,
                                  c.hidden, "ffn_up.L" + std::to_string(layer));
             }
+            if (c.projection_scales) {
+                // Applied to the projection outputs, before the gate product
+                // (`build_ffn` multiplies `up`/`gate` by their scales first).
+                const std::string lp = "L" + std::to_string(layer);
+                apply_projection_scale(gate, prefix + "ffn_gate.scale", "ffn_gate_scale." + lp);
+                apply_projection_scale(up, prefix + "ffn_up.scale", "ffn_up_scale." + lp);
+            }
             std::vector<float> act(c.intermediate);
             for (uint32_t i = 0; i < c.intermediate; ++i) act[i] = gated(gate[i], up[i], layer);
             backend_->record_control("swiglu.L" + std::to_string(layer),
                                      (gate.size() + up.size()) * sizeof(float),
                                      act.size() * sizeof(float));
+            // BitNet's second SUBLN sits on the gated FFN output, before the
+            // down projection.
+            if (c.sub_norms)
+                act = rmsnorm(act, norm_weights(prefix + "ffn_sub_norm.weight"),
+                              "rmsnorm.ffn_sub.L" + std::to_string(layer));
             ffn = matvec_view(tensor_view(prefix + "ffn_down.weight"), act, c.hidden,
                               c.intermediate, "ffn_down.L" + std::to_string(layer));
+            if (c.projection_scales)
+                apply_projection_scale(ffn, prefix + "ffn_down.scale",
+                                       "ffn_down_scale.L" + std::to_string(layer));
         } else {
             std::vector<float> scores =
                 matvec_view(tensor_view(prefix + "ffn_router.weight"), h, c.expert_count, c.hidden,
