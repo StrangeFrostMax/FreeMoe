@@ -50,6 +50,10 @@ const AdapterRow kRows[] = {
      "deepseek4 graph with the renormalised router"},
     {"mistral3", "LLM_ARCH_MISTRAL3", "llama_model_mistral3::build_arch_graph",
      "llama block, optional MLP biases, gelu_erf adaptive norm, attention temperature"},
+    {"bloom", "LLM_ARCH_BLOOM", "llama_model_bloom::build_arch_graph",
+     "ALiBi attention, biased LayerNorm, embedding norm"},
+    {"jais", "LLM_ARCH_JAIS", "llama_model_jais::build_arch_graph",
+     "ALiBi attention, no rotary, biased LayerNorm"},
     {"codeshell", "LLM_ARCH_CODESHELL", "llama_model_codeshell::build_arch_graph",
      "llama block with its own metadata"},
     {"cohere2", "LLM_ARCH_COHERE2", "llama_model_cohere2::build_arch_graph",
@@ -126,6 +130,8 @@ const char *adapter_tensor_op(TensorRole role) {
     case TensorRole::TOKEN_EMBD: return "get_rows";
     case TensorRole::OUTPUT: return "matmul";
     case TensorRole::OUTPUT_NORM:
+    case TensorRole::TOKEN_EMBD_NORM:
+    case TensorRole::TOKEN_EMBD_NORM_BIAS:
     case TensorRole::ATTN_NORM:
     case TensorRole::FFN_NORM:
     case TensorRole::ATTN_POST_NORM:

@@ -314,7 +314,14 @@ def load_model(path: Path) -> dict[str, Any]:
                           and has("ffn_up.weight") and not cfg["fused_gate_up"])
     # jamba applies no rotation at all: upstream's block never calls the rope, so
     # a file of that architecture is not rotated at head width by default.
-    cfg["rope_disabled"] = arch == "jamba"
+    cfg["rope_disabled"] = arch in ("jamba", "jais")
+    # ALiBi: `attention.max_alibi_bias`. bloom hardcodes 8.0 upstream, jais reads
+    # the key, and everything with no bias keeps 0.0.
+    cfg["alibi_max_bias"] = (8.0 if arch == "bloom"
+                             else float(key("attention.max_alibi_bias", 0.0)))
+    # bloom normalises the embedding once before block 0. The tensor has no
+    # `blk.N.` prefix, so `has()` (which prefixes) cannot see it.
+    cfg["token_embd_norm"] = "token_embd_norm.weight" in tensors
     if cfg["ffn_no_gate"]:
         # A gate-free FFN cannot say which activation it means, so the
         # architecture has to. Read from llama.cpp's model files: both phi2 and
@@ -324,7 +331,7 @@ def load_model(path: Path) -> dict[str, Any]:
         # four named below.
         seq_activation = {"phi2": "gelu", "gptneox": "gelu",
                           "codeshell": "gelu", "starcoder2": "gelu",
-                          "pockettts": "gelu",
+                          "pockettts": "gelu", "bloom": "gelu",
                           "arcee": "relu_sq", "nemotron": "relu_sq",
                           "jais2": "relu_sq", "plm": "relu_sq"}
         if arch not in seq_activation:
@@ -830,6 +837,10 @@ class Session:
                 return layernorm(vec, w, bias, cfg["eps"])
             return rmsnorm(vec, w, cfg["eps"], cfg["norm_add_one"])
 
+        if cfg["token_embd_norm"]:
+            # bloom's pre-block embedding norm (models/bloom.cpp).
+            x = norm_of(x, "token_embd_norm")
+
         for layer in range(cfg["L"]):
             p = f"blk.{layer}."
             h = norm_of(x, p + "attn_norm")
@@ -942,6 +953,14 @@ class Session:
                 self.cache[layer].append((k, v))
 
                 head_v = cfg["head_v"] if cfg["mla"] else hd
+                # ALiBi slopes, as ggml derives them inside soft_max_ext.
+                slopes = []
+                if cfg["alibi_max_bias"] > 0.0:
+                    log2_heads = 1 << int(math.floor(math.log2(heads)))
+                    m0 = 2.0 ** (-cfg["alibi_max_bias"] / log2_heads)
+                    m1 = 2.0 ** (-(cfg["alibi_max_bias"] / 2.0) / log2_heads)
+                    slopes = [m0 ** (h + 1) if h < log2_heads
+                              else m1 ** (2 * (h - log2_heads) + 1) for h in range(heads)]
                 attention = [0.0] * (heads * head_v)
                 scale = 1.0 / math.sqrt(hd)
                 for head in range(heads):
@@ -960,6 +979,10 @@ class Session:
                         dot = sum(q[qb + j] * kt[kvb + j] for j in range(hd)) * scale
                         if cfg["attn_softcap"] > 0.0:
                             dot = cfg["attn_softcap"] * math.tanh(dot / cfg["attn_softcap"])
+                        if slopes:
+                            # The mask value upstream writes is -(query - key), and
+                            # soft_max_ext multiplies it by the head's slope.
+                            dot += slopes[head] * -(self.pos - t_index)
                         scores.append(dot)
                     if cfg["attn_sinks"]:
                         # Append the sink logit, then ignore its probability.

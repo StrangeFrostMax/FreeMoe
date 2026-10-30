@@ -2900,7 +2900,8 @@ void test_architecture_parity() {
                                            "deci", "nanbeige", "xverse", "maincoder",
                                            "qwen", "codeshell", "starcoder2", "pockettts",
                                            "cohere2", "paddleocr", "hunyuan-dense",
-                                           "llama-embed", "gemma2-renamed"};
+                                           "llama-embed", "gemma2-renamed",
+                                           "bloom", "jais"};
     for (const std::string &slug : slugs) {
         const std::string model = "tests/fixtures/" + slug + "-shape.gguf";
         ArchGolden golden = read_arch_golden("tests/golden/" + slug + "_reference.txt");
