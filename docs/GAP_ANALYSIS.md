@@ -268,7 +268,7 @@ test against a real vocabulary.
 > takes that path whenever `supports_batched_prefill()` accepts the block, and
 > `--prefill sequential` (`BackendConfig::batched_prefill = false`) keeps the
 > token-at-a-time path for comparison. Both paths are pinned against each other
-> by `batched_prefill` (57 checks) — identical tokenisation, logits and greedy
+> by `batched_prefill` (62 checks) — identical tokenisation, logits and greedy
 > ids — and the seven block features the batch path does not model yet are
 > pinned by name, so a family cannot silently take a path that ignores its
 > detail.
