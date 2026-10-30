@@ -788,9 +788,14 @@ void test_dense_cpu_reference_and_operation_log() {
               "dense max absolute difference is inside declared tolerance");
         check_released(engine, "dense CPU");
     }
+    // Two prefill strategies, two accounting shapes, both pinned. The
+    // sequential path emits one projection per token; the batched path emits one
+    // per projection for the whole prompt, which is the entire reason it exists.
+    uint64_t sequential_ops = 0;
     {
         auto cfg = make_engine_config("tests/fixtures/dense-fm.gguf", BackendKind::ScalarCPU,
                                       ReaderMode::Buffered, 0, false);
+        cfg.backend.batched_prefill = false;
         Engine engine(cfg);
         engine.initialize();
         auto result = engine.run_prompt(first_prompt(), 0);
@@ -801,7 +806,35 @@ void test_dense_cpu_reference_and_operation_log() {
         bool all_named = true;
         for (const auto &op : ops) all_named = all_named && !op.name.empty() && !op.backend.empty();
         CHECK(all_named, "every operation records name and actual backend");
+        sequential_ops = ops.size();
         check_released(engine, "operation log");
+    }
+    {
+        auto cfg = make_engine_config("tests/fixtures/dense-fm.gguf", BackendKind::ScalarCPU,
+                                      ReaderMode::Buffered, 0, false);
+        cfg.backend.batched_prefill = true;
+        Engine engine(cfg);
+        engine.initialize();
+        CHECK(engine.supports_batched_prefill(), "a dense llama block takes the batched path");
+        auto result = engine.run_prompt(first_prompt(), 0);
+        auto ops = engine.backend().operations();
+        bool saw_batched = false;
+        bool all_named = true;
+        uint64_t batched_ops = 0;
+        for (const auto &op : ops) {
+            all_named = all_named && !op.name.empty() && !op.backend.empty();
+            if (op.name == "prefill_batched") saw_batched = true;
+            if (op.backend == "cpu-batched") ++batched_ops;
+        }
+        CHECK(saw_batched, "prefill runs as one batched pass");
+        CHECK(batched_ops > 0, "the batched path records which operations it batched");
+        CHECK(all_named, "the batched path still names every operation and its backend");
+        // A prompt longer than one token must cost strictly fewer entries: batching
+        // removes the per-token repetition of every projection.
+        CHECK(ops.size() < sequential_ops,
+              "batching emits fewer operations than one pass per token (" +
+                  std::to_string(ops.size()) + " vs " + std::to_string(sequential_ops) + ")");
+        check_released(engine, "batched prefill");
     }
 }
 
@@ -4353,6 +4386,75 @@ void test_soak_sessions() {
     }
 }
 
+// Batched prefill is an optimisation, so the only acceptable definition of
+// correct is "the same logits the token-by-token path produces". This compares
+// the two paths directly, independently of the goldens, and pins which
+// checkpoints may take the fast path at all.
+void test_batched_prefill() {
+    const std::vector<std::string> batched = {"llama-gqa", "qwen3-qknorm", "qwen2-bias",
+                                              "gemma2", "bloom", "cohere2", "jais"};
+    for (const std::string &slug : batched) {
+        const std::string model = "tests/fixtures/" + slug + "-shape.gguf";
+        auto run = [&](bool use_batch) {
+            RunConfig cfg = make_engine_config(model, BackendKind::ScalarCPU,
+                                               ReaderMode::Buffered, 0, false);
+            cfg.backend.batched_prefill = use_batch;
+            Engine engine(cfg);
+            engine.initialize();
+            const bool supported = engine.supports_batched_prefill();
+            PromptResult result = engine.run_prompt("the cat", 8);
+            engine.release_runtime();
+            return std::make_pair(supported, result);
+        };
+        const auto sequential = run(false);
+        const auto fast = run(true);
+        CHECK(fast.first, "this checkpoint can be prefilled in one batch: " + slug);
+        CHECK(sequential.second.prefill_logits.size() == fast.second.prefill_logits.size(),
+              "both prefill paths produce one logit per vocabulary entry: " + slug);
+        double worst_abs = 0.0;
+        double magnitude = 0.0;
+        for (float v : sequential.second.prefill_logits)
+            magnitude = std::max(magnitude, std::fabs(static_cast<double>(v)));
+        const size_t n = std::min(sequential.second.prefill_logits.size(),
+                                  fast.second.prefill_logits.size());
+        for (size_t i = 0; i < n; ++i) {
+            worst_abs = std::max(worst_abs,
+                                 std::fabs(static_cast<double>(sequential.second.prefill_logits[i]) -
+                                           static_cast<double>(fast.second.prefill_logits[i])));
+        }
+        // Both paths run the same float arithmetic for a token, so the only
+        // difference is summation order inside the kernel.
+        CHECK(worst_abs <= 1e-4 + 1e-4 * magnitude,
+              "batched prefill reproduces the sequential logits: " + slug + " (worst abs " +
+                  std::to_string(worst_abs) + ")");
+        CHECK(fast.second.generated_ids == sequential.second.generated_ids,
+              "batched prefill decodes the same ids: " + slug);
+        CHECK(fast.second.input_ids == sequential.second.input_ids,
+              "batched prefill tokenizes identically: " + slug);
+    }
+    // Checkpoints whose block differs structurally keep the sequential path, and
+    // saying so here is what stops a future refactor from quietly routing them
+    // through a path that does not model them.
+    const std::vector<std::pair<std::string, std::string>> fallback = {
+        {"qwen3moe", "routed experts"},
+        {"deepseek2-mla", "MLA"},
+        {"mamba", "recurrent layers"},
+        {"bitnet", "sub-norms"},
+        {"gpt-oss", "post-norm FFN input"},
+        {"phi2-layernorm", "parallel residual"},
+        {"mistral3", "adaptive norm"},
+    };
+    for (const auto &entry : fallback) {
+        RunConfig cfg = make_engine_config("tests/fixtures/" + entry.first + "-shape.gguf",
+                                           BackendKind::ScalarCPU, ReaderMode::Buffered, 0, false);
+        Engine engine(cfg);
+        engine.initialize();
+        CHECK(!engine.supports_batched_prefill(),
+              entry.first + " keeps the sequential path (" + entry.second + ")");
+        engine.release_runtime();
+    }
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
@@ -4397,6 +4499,7 @@ int main(int argc, char **argv) {
     maybe_run("adapter_tags", test_adapter_tags);
     maybe_run("attention_sinks", test_attention_sinks);
     maybe_run("architecture_parity", test_architecture_parity);
+    maybe_run("batched_prefill", test_batched_prefill);
     maybe_run("bitnet_sub_norms", test_bitnet_sub_norms);
     maybe_run("refusal_paths", test_refusal_paths);
     maybe_run("adapter_binding", test_adapter_binding);

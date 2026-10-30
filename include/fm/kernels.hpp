@@ -58,6 +58,16 @@ void gemv_isa(KernelIsa isa, const float *weights, const float *x, float *y,
 void gemv(const KernelConfig &config, const float *weights, const float *x, float *y,
           uint32_t out_dim, uint32_t in_dim);
 
+// Batched (multi-token) form of the same product: y[t*out_dim + o] =
+// dot(W[o], x[t]) for every token t. Row-major over the weights, so each weight
+// row is fetched once and reused across the batch instead of once per token --
+// that is the whole point of batching a memory-bound product. `x` is
+// tokens*in_dim, `y` is tokens*out_dim. Quantised rows are dequantised once into
+// a per-thread scratch row and then dotted against every token, which is the
+// same reuse.
+void gemm_quant(const KernelConfig &config, uint32_t type_id, const uint8_t *weights,
+                const float *x, float *y, uint32_t tokens, uint32_t out_dim, uint32_t in_dim);
+
 // Dot product of two F32 rows using the best available ISA. Exposed so the
 // quantised path can dequantise into a scratch row and reuse the vector units.
 float dot_isa(KernelIsa isa, const float *a, const float *b, uint32_t n);

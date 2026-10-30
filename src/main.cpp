@@ -116,6 +116,7 @@ void print_usage() {
         "  inspect --tags       # adapter tags per tensor, plus the branch tags\n"
         "  adapters [--json]    # every implemented adapter row and its llama.cpp enum\n"
         "  --kernels auto|scalar|avx2|zen3|avx512 --threads N   # CPU kernel dispatch\n"
+        "  --prefill batched|sequential                        # prompt evaluation\n"
         "      auto never picks AVX-512: the target is Zen 3, which has none\n"
         "  --temperature X --top-k N --top-p X --seed N    # sampling (run only)\n"
         "  --allow-cpu-fallback                    --force-direct-fallback\n"
@@ -148,6 +149,15 @@ fm::RunConfig build_run_config(const Args &args) {
     cfg.backend.vnpu_isa = args.get("vnpu-isa", "avx2_dual");
     cfg.backend.vnpu_threads = args.get_u32("vnpu-threads", 0);
     cfg.backend.kernel_isa = fm::parse_kernel_isa(args.get("kernels", "auto"));
+    {
+        const std::string mode = args.get("prefill", "batched");
+        if (mode == "batched") cfg.backend.batched_prefill = true;
+        else if (mode == "sequential") cfg.backend.batched_prefill = false;
+        else {
+            fm::fail(fm::ErrorCode::INVALID_ARGUMENT,
+                     "--prefill expects 'batched' or 'sequential', not '" + mode + "'");
+        }
+    }
     cfg.backend.kernel_threads = args.get_u32("threads", 0);
     cfg.reader_mode = fm::parse_reader_mode(args.get("reader", "buffered"));
     cfg.cache_slots = args.get_u32("cache-slots", 0);

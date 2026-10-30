@@ -2,6 +2,7 @@
 
 #include "fm/backend.hpp"
 #include "fm/quant.hpp"
+#include "fm/gguf.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -273,6 +274,74 @@ void gemv_isa(KernelIsa isa, const float *weights, const float *x, float *y,
 #endif
     (void)isa;
     gemv_scalar(weights, x, y, out_dim, in_dim);
+}
+
+// ---------------------------------------------------------------------------
+// Batched product (prefill)
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// One output row against every token in the batch. The row is dequantised (or
+// reinterpreted, for F32) once and then dotted with each token's input: that
+// reuse is the reason a batch costs less than a loop over tokens, because the
+// product is memory-bound on the weight bytes.
+void gemm_rows(KernelIsa isa, uint32_t type_id, const uint8_t *weights, const float *x,
+               float *y, uint32_t tokens, uint32_t out_dim, uint32_t begin, uint32_t end,
+               uint32_t in_dim) {
+    const QuantGeometry &geo = quant_geometry(type_id);
+    const bool plain = type_id == 0;
+    const uint64_t row_bytes = plain
+        ? static_cast<uint64_t>(in_dim) * sizeof(float)
+        : static_cast<uint64_t>(in_dim / geo.block_size) * geo.block_bytes;
+    std::vector<float> scratch(plain ? 0 : in_dim);
+    for (uint32_t o = begin; o < end; ++o) {
+        const uint8_t *row = weights + static_cast<uint64_t>(o) * row_bytes;
+        const float *rowf = nullptr;
+        if (plain) {
+            rowf = reinterpret_cast<const float *>(row);
+        } else {
+            dequantize_row(type_id, row, scratch.data(), in_dim);
+            rowf = scratch.data();
+        }
+        for (uint32_t t = 0; t < tokens; ++t) {
+            const float *xt = x + static_cast<size_t>(t) * in_dim;
+            y[static_cast<size_t>(t) * out_dim + o] = dot_isa(isa, rowf, xt, in_dim);
+        }
+    }
+}
+
+} // namespace
+
+void gemm_quant(const KernelConfig &config, uint32_t type_id, const uint8_t *weights,
+                const float *x, float *y, uint32_t tokens, uint32_t out_dim, uint32_t in_dim) {
+    if (tokens == 0 || out_dim == 0 || in_dim == 0) return;
+    if (!weights || !x || !y)
+        fail(ErrorCode::INVALID_ARGUMENT, "invalid batched product arguments");
+    if (!kernel_supports_type(type_id))
+        fail(ErrorCode::UNSUPPORTED_QUANTISATION,
+             "no kernel for tensor type " + std::to_string(type_id));
+    const QuantGeometry &geo = quant_geometry(type_id);
+    if (in_dim % geo.block_size != 0)
+        fail(ErrorCode::SHAPE_MISMATCH,
+             "quantised row length is not a whole number of blocks");
+    const KernelIsa isa = resolved_isa(config);
+    const uint32_t threads = resolved_threads(config);
+    // The work is the product's own multiply-adds; the batch multiplies it, so
+    // the threading threshold is applied to the batched total rather than to a
+    // single token's.
+    const uint64_t work = static_cast<uint64_t>(out_dim) * in_dim * tokens;
+    if (kernel_trace_enabled())
+        std::fprintf(stderr, "gemm tokens=%u out=%u in=%u work=%llu threads=%u isa=%s\n", tokens,
+                     out_dim, in_dim, static_cast<unsigned long long>(work), threads,
+                     kernel_isa_name(isa));
+    if (threads <= 1 || work < threading_min_work(threads)) {
+        gemm_rows(isa, type_id, weights, x, y, tokens, out_dim, 0, out_dim, in_dim);
+        return;
+    }
+    WorkerPool::instance().parallel_for(out_dim, threads, [&](uint32_t begin, uint32_t end) {
+        gemm_rows(isa, type_id, weights, x, y, tokens, out_dim, begin, end, in_dim);
+    });
 }
 
 // ---------------------------------------------------------------------------
