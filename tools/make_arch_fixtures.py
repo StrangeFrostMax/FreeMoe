@@ -720,6 +720,21 @@ SPECS: list[dict[str, Any]] = [
         "weightless_norm": True,
     },
     {
+        # phimoe (llama.cpp src/models/phimoe.cpp + models.h: the graph *is*
+        # phi3's) - fused qkv with a bias, biased LayerNorm on both block norms,
+        # a bias on the attention output and on the logits, and routed experts.
+        "slug": "phimoe",
+        "arch": "phimoe",
+        "name": "FreeMoe synthetic phimoe: phi3's block with routed experts",
+        "layernorm": True,
+        "fused_qkv": True,
+        "qkv_bias": True,
+        "attn_output_bias": True,
+        "logit_bias": True,
+        "experts": 4,
+        "expert_top_k": 2,
+    },
+    {
         # bloom (llama.cpp src/models/bloom.cpp): bias-carrying LayerNorm on the
         # embedding, on both block norms and on the final norm; one fused qkv
         # with its bias; a gate-free GELU MLP; and ALiBi instead of any rotation.

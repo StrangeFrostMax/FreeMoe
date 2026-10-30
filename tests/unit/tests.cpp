@@ -2936,7 +2936,7 @@ void test_architecture_parity() {
                                            "llama-embed", "gemma2-renamed",
                                            "bloom", "jais",
                                            "gpt2", "starcoder", "falcon", "mpt",
-                                           "seed-oss", "plamo", "smallthinker", "command-r", "olmo"};
+                                           "seed-oss", "plamo", "smallthinker", "command-r", "olmo", "phimoe"};
     for (const std::string &slug : slugs) {
         const std::string model = "tests/fixtures/" + slug + "-shape.gguf";
         ArchGolden golden = read_arch_golden("tests/golden/" + slug + "_reference.txt");

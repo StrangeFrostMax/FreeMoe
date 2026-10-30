@@ -122,6 +122,7 @@ const std::map<std::string, ArchFacts> &known_architectures() {
         {"smallthinker", {true, false}},
         {"command-r", {true, false}},
         {"olmo", {true, false}},
+        {"phimoe", {true, false}},
         {"bloom", {true, false}},
         {"jais", {true, false}},
         {"codeshell", {true, false}},

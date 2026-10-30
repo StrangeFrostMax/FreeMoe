@@ -68,6 +68,8 @@ const AdapterRow kRows[] = {
      "per-head q/k LayerNorm, logit scale"},
     {"olmo", "LLM_ARCH_OLMO", "llama_model_olmo::build_arch_graph",
      "weightless norms"},
+    {"phimoe", "LLM_ARCH_PHIMOE", "llama_model_phi3::graph",
+     "phi3's block with routed experts"},
 
     {"bloom", "LLM_ARCH_BLOOM", "llama_model_bloom::build_arch_graph",
      "ALiBi attention, biased LayerNorm, embedding norm"},

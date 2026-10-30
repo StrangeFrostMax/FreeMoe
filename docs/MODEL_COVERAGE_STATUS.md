@@ -23,7 +23,7 @@ what the work is: the 50 model names reduce to about eight capabilities.
 | Linear + YaRN context extension, `rope_freqs` divisors | `rope_scaling` checks, 4 fixtures |
 | Attention sinks, NoPE layers | `attention_sinks`, `rope_scaling`, fixtures |
 | MLA (DeepSeek-V2/V3 style), sigmoid/softmax/sqrt-softplus gating, group-limited routing, selection bias, shared expert | `deepseek2-mla` fixture + oracle |
-| GQA/MQA, per-head qk-norm, partial rotary, fused qkv, fused gate-up, post-norms (both the old and the current llama.cpp tensor names), sliding window (model-wide and per layer), tanh softcap, LayerNorm variants (with and without bias), silu/gelu/relu²/gelu_erf/swiglu_oai, gate-free FFN, an absolute learned position table instead of any rotation, a second pre-attention norm, weightless norms, a per-head LayerNorm q/k norm, an output-logit scale | 65 architecture fixtures (`architecture_parity`) |
+| GQA/MQA, per-head qk-norm, partial rotary, fused qkv, fused gate-up, post-norms (both the old and the current llama.cpp tensor names), sliding window (model-wide and per layer), tanh softcap, LayerNorm variants (with and without bias), silu/gelu/relu²/gelu_erf/swiglu_oai, gate-free FFN, an absolute learned position table instead of any rotation, a second pre-attention norm, weightless norms, a per-head LayerNorm q/k norm, an output-logit scale | 66 architecture fixtures (`architecture_parity`) |
 | 36 quantisation types incl. ternary `TQ1_0`/`TQ2_0`/`Q1_0`/`Q2_0`/`PQ2_0`, the whole IQ family (IQ1_S/M, IQ2_XXS/XS/S, IQ3_XXS/S, IQ4_XS/NL) and FP4 (MXFP4, NVFP4) | `quant_reference_decode`, `quant_model_parity` (Q8_0/Q4_0/Q4_K/Q6_K end to end); **matches llama.cpp's own dequantizers to ≤1e-6 relative** of block magnitude via `tools/quant_upstream_check.py` (26 types, 0 failures; worst absolute 5.0e-06 on IQ4_NL, MXFP4/NVFP4 exact). Not claimed bit-exact — see `docs/GAP_ANALYSIS.md` |
 | Fused `ffn_gate_up_exps`, clamped SwiGLU (`swiglu-oai`, per-layer `swiglu_clamp`), router renormalisation floor | `ffn_variants`, `activation_clamp_forms` (13 checks), `qwen3moe-fused-up` and `qwen3moe-clamp` fixtures |
 | Mixed-precision expert stacks: per-projection types inside one expert record (Q4_K gate/up + Q6_K down), fused and separate | `quant_expert_mixed_types` (32 checks), `quant-expert-{fused,separate}.gguf` + F32 twins |
@@ -45,11 +45,11 @@ Supported architecture strings today (each has a fixture unless noted):
 `qwen3vlmoe`, `mamba`, `mamba2`, `deci`, `nanbeige`, `xverse`, `maincoder`,
 `qwen`, `codeshell`, `starcoder2`, `pockettts`, `cohere2`, `paddleocr`,
 `hunyuan-dense`, `llama-embed`, `bloom`, `jais`, `gpt2`, `starcoder`, `falcon`,
-`mpt`, `seed-oss`, `plamo`, `smallthinker`, `command-r`, `olmo`,
+`mpt`, `seed-oss`, `plamo`, `smallthinker`, `command-r`, `olmo`, `phimoe`,
 plus the native `freemoe-tiny`. `smollm`/`smollm2`/`tinyllama` are the same llama
 block. The three lists that decide this — the adapter table, the loader's family
 list and the probe's known-architecture table — are bound to each other by the
-`adapter_binding` test (539 checks), which is what caught `smollm3` and `bitnet`
+`adapter_binding` test (548 checks), which is what caught `smollm3` and `bitnet`
 missing from the probe's table while their adapters existed.
 
 ## The requested list
@@ -74,6 +74,7 @@ missing from the probe's table while their adapters existed.
 | GPT-2, StarCoder 1 | `gpt2`, `starcoder` | **WORKS**: biased LayerNorm, one fused qkv with its bias, a gate-free GELU FFN with biases on both projections, and a learned position table added to the embedding — **no rotary at all**, which is why the table is the whole position encoding. Dropping the table fails the golden (`gpt2`, `starcoder`) |
 | Falcon 7B / 40B | `falcon` | **WORKS**: falcon-40b's second pre-attention norm (`attn_norm_2`) feeds the qkv projection while the FFN and the residual keep reading `attn_norm`; a file without the tensor (falcon-7b) uses the first norm for both. Ignoring the second norm's bias fails the golden |
 | GPT-NeoX-independent Llama-shaped variants: seed-oss, plamo | `seed-oss`, `plamo` | **WORKS**: seed-oss normalises after the attention residual and feeds *that* to the FFN (`attn_post_norm`); plamo has no `ffn_norm` at all — the FFN reads the attention's own normalised input and both branches are added to the residual separately |
+| phimoe | `phimoe` | **WORKS**: upstream declares `using graph = llama_model_phi3::graph`, so it is phi3's block (fused qkv with a bias, biased LayerNorm, biased attention output and logits) with routed experts. The row exists because a file must be loadable, and its golden is phi3's arithmetic with a router |
 | olmo | `olmo` | **WORKS**: every norm is `build_norm(x, NULL, NULL, ...)`, so the file carries no norm scale at all. The runtime normalises and does not scale. Defining the weightless norm away fails olmo's greedy decode |
 | smallthinker | `smallthinker` | **WORKS**: routed experts whose activation is a plain ReLU (`build_moe_ffn(..., LLM_FFN_RELU, ...)`) and whose expert weights are renormalised after top-k — both are constants in upstream's graph, so the architecture name is the evidence. Substituting silu fails the golden by 0.455; dropping the weight normalisation by 0.328 |
 | Command R / R+ | `command-r` | **WORKS**: a LayerNorm block whose q/k norm is one LayerNorm row per head (`{head_dim, heads}`) and whose logits are multiplied by `command-r.logit_scale`. Reading the per-head rows as one shared row fails by 0.132; not applying the scale fails by 1.769 |

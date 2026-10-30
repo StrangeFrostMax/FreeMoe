@@ -161,9 +161,9 @@ intersected with what this engine implements.
 
 | Bucket | Count | Meaning |
 | --- | --- | --- |
-| Adapter today | **59** | `freemoe adapters` is the authoritative list; `docs/MODEL_COVERAGE_STATUS.md` groups them by capability. This census row is from the original audit and its named subset (`llama qwen2 qwen3 gemma gemma2 gemma3 phi3 minicpm qwen3moe glm4 qwen2moe phi2 internlm2 orion exaone gptneox stablelm deepseek2`) is where the table started |
+| Adapter today | **60** | `freemoe adapters` is the authoritative list; `docs/MODEL_COVERAGE_STATUS.md` groups them by capability. This census row is from the original audit and its named subset (`llama qwen2 qwen3 gemma gemma2 gemma3 phi3 minicpm qwen3moe glm4 qwen2moe phi2 internlm2 orion exaone gptneox stablelm deepseek2`) is where the table started |
 | Not a causal text decoder | **24** | BERT/Nomic/Jina/EuroBERT/ModernBERT/NeoBERT encoders, `llama-embed`, `gemma-embedding*`, `t5`/`t5encoder`, `clip`, `pockettts`, `qwen3tts`, `wavtokenizer-dec`, `paddleocr`, `llada`, `llada-moe`, `rnd1`, `dream`, `dflash`, `vllm-decision2` — no-causal-mask attention and pooling, or diffusion/audio/vision |
-| **Needs only an adapter row** | **47** | Every primitive already exists: stacked-expert MoE, shared experts with/without a scalar gate, group-limited routing, per-head q/k norm, post-norms, sliding window, partial RoPE, fused q/k/v, LayerNorm, silu/gelu/relu/relu², MLA. `baichuan bloom chatglm starcoder2 olmoe phimoe dbrx arctic grok minimax-01 minimax-m2 qwen mistral4 command-r cohere2 …` (`gpt2`, `starcoder`, `falcon` and `mpt` moved to mapped in this change) |
+| **Needs only an adapter row** | **41** | Every primitive already exists: stacked-expert MoE, shared experts with/without a scalar gate, group-limited routing, per-head q/k norm, post-norms, sliding window, partial RoPE, fused q/k/v, LayerNorm, silu/gelu/relu/relu², MLA. `baichuan bloom chatglm starcoder2 olmoe phimoe dbrx arctic grok minimax-01 minimax-m2 qwen mistral4 command-r cohere2 …` (`gpt2`, `starcoder`, `falcon` and `mpt` moved to mapped in this change) |
 | Needs one more primitive | 71 | below |
 
 ### What one capability unlocks

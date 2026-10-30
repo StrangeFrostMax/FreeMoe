@@ -884,6 +884,7 @@ bool is_llama_family(const std::string &arch) {
         "smallthinker",
         "command-r",
         "olmo",
+        "phimoe",
         "cohere2",
         "deci",
         "hunyuan-dense",
