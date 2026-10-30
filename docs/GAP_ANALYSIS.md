@@ -161,9 +161,9 @@ intersected with what this engine implements.
 
 | Bucket | Count | Meaning |
 | --- | --- | --- |
-| Adapter today | **54** | `freemoe adapters` is the authoritative list; `docs/MODEL_COVERAGE_STATUS.md` groups them by capability. This census row is from the original audit and its named subset (`llama qwen2 qwen3 gemma gemma2 gemma3 phi3 minicpm qwen3moe glm4 qwen2moe phi2 internlm2 orion exaone gptneox stablelm deepseek2`) is where the table started |
+| Adapter today | **59** | `freemoe adapters` is the authoritative list; `docs/MODEL_COVERAGE_STATUS.md` groups them by capability. This census row is from the original audit and its named subset (`llama qwen2 qwen3 gemma gemma2 gemma3 phi3 minicpm qwen3moe glm4 qwen2moe phi2 internlm2 orion exaone gptneox stablelm deepseek2`) is where the table started |
 | Not a causal text decoder | **24** | BERT/Nomic/Jina/EuroBERT/ModernBERT/NeoBERT encoders, `llama-embed`, `gemma-embedding*`, `t5`/`t5encoder`, `clip`, `pockettts`, `qwen3tts`, `wavtokenizer-dec`, `paddleocr`, `llada`, `llada-moe`, `rnd1`, `dream`, `dflash`, `vllm-decision2` — no-causal-mask attention and pooling, or diffusion/audio/vision |
-| **Needs only an adapter row** | **52** | Every primitive already exists: stacked-expert MoE, shared experts with/without a scalar gate, group-limited routing, per-head q/k norm, post-norms, sliding window, partial RoPE, fused q/k/v, LayerNorm, silu/gelu/relu/relu², MLA. `baichuan bloom chatglm starcoder2 olmoe phimoe dbrx arctic grok minimax-01 minimax-m2 qwen mistral4 command-r cohere2 …` (`gpt2`, `starcoder`, `falcon` and `mpt` moved to mapped in this change) |
+| **Needs only an adapter row** | **47** | Every primitive already exists: stacked-expert MoE, shared experts with/without a scalar gate, group-limited routing, per-head q/k norm, post-norms, sliding window, partial RoPE, fused q/k/v, LayerNorm, silu/gelu/relu/relu², MLA. `baichuan bloom chatglm starcoder2 olmoe phimoe dbrx arctic grok minimax-01 minimax-m2 qwen mistral4 command-r cohere2 …` (`gpt2`, `starcoder`, `falcon` and `mpt` moved to mapped in this change) |
 | Needs one more primitive | 71 | below |
 
 ### What one capability unlocks
@@ -388,6 +388,9 @@ other candidates are blocked on, in the terms of the file that blocks them:
 | No kv cache at all (diffusion / embedding decoders) | `dream`, `llada`, `eurobert` | A caching policy, not a tensor |
 | Encoder-only with `cls.*`/`token_types`/pooling | `modern-bert`, `neo-bert`, `jina-bert-v2/v3`, `nomic-bert*`, `gemma-embedding*` | A pooling head and a segment embedding |
 | ALiBi instead of rotary | ~~`bloom`, `jais`~~ **implemented**; ~~`falcon`, `mpt`~~ **now mapped** — `falcon` landed with `attn_norm_2`, and `mpt`/`gpt2`/`starcoder` with the position table | Their tensor sets, not the bias. What `mpt` still skips is the optional AWQ `ffn.act` scale tensor and the optional full-width q/k LayerNorm, both absent from the fixture and from stock checkpoints |
+| ~~Weightless norms~~ **implemented** | ~~`olmo`, `talkie`'s layer norms~~ **mapped for olmo** | `build_norm(x, NULL, NULL, ...)`: no scale tensor at all. talkie still needs its residual-skip stream |
+| ~~Per-head LayerNorm q/k norm~~ **implemented** | ~~`command-r`, `chameleon`~~ **mapped for command-r** | one row per head, mean-centred, with the file's own epsilon. chameleon additionally switches its residual structure (`swin_norm`) and suppresses image-token logits, neither of which is modelled |
+| ~~Output logit scale~~ **implemented** | ~~`command-r`~~ **mapped** | granite records the same key and never applies it, so the application is per architecture |
 | ~~Absolute position embeddings~~ **implemented** | ~~`gpt2`, `starcoder`, `mpt` (`position_embd`)~~ **mapped**: tensor role `POSITION_EMBD`, one row lookup added to the embedding, no rotation. Dropping the lookup fails `gpt2`/`starcoder`/`mpt` greedies | Done |
 | A second pre-attention norm (`attn_norm_2`) | ~~`falcon`~~ **mapped**; the same shape is what falcon-7B omits (falls back to `attn_norm`) | Done; the bias of the second norm is decoded like every other norm bias |
 | T5 encoder/decoder with relative-position buckets | `t5` | Two graphs and a bucket bias |

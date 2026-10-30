@@ -167,6 +167,21 @@ def load_model(path: Path) -> dict[str, Any]:
         "eos": int(md.get("tokenizer.ggml.eos_token_id", 2)),
         # Presence of the per-head q/k scales is the evidence qwen3 uses them.
         "qk_norm": has("attn_q_norm.weight"),
+        # One row per head ({head_dim, heads}) instead of a single shared vector
+        # (command-r, chameleon), and an optional bias on the same layout.
+        "qk_norm_matrix": (has("attn_q_norm.weight") and
+                           len(tensors[blk("attn_q_norm.weight")][0]) == 2),
+        # The norm's *mode* is not in the file: metadata says a tensor of
+        # head_dim entries exists and nothing else. Same three facts the engine
+        # reads from the architecture, quoted from llama.cpp's model files.
+        "qk_norm_layernorm": arch == "command-r",
+        "qk_norm_after_rope": arch == "talkie",
+        "qk_norm_eps": None,  # None -> the file's own epsilon
+        # A block that normalises without scaling carries no norm tensor at all.
+        "weightless_norm": not has("attn_norm.weight"),
+        # `*.logit_scale` is applied only where the graph applies it: command-r
+        # multiplies the logits, granite records the key and never uses it.
+        "logit_scale": (key("logit_scale", 0.0) if arch == "command-r" else 0.0),
         # phi3 fuses q/k/v into one projection (and one optional bias).
         "fused_qkv": has("attn_qkv.weight"),
         # glm4 keeps gate and up in one tensor: gate first, then up. The width is
@@ -184,7 +199,10 @@ def load_model(path: Path) -> dict[str, Any]:
         # A block with neither an FFN norm nor a post-attention norm reuses the
         # attention's normalised input (phi2). gpt-oss has the post-attention
         # norm, so it is an ordinary pre-norm block.
-        "parallel_residual": (not has("ffn_norm.weight")
+        # A weightless block (olmo, talkie) has no ffn_norm *tensor* but still has
+        # a feed-forward norm, so it is not phi2's shared residual.
+        "parallel_residual": (has("attn_norm.weight")
+                              and not has("ffn_norm.weight")
                               and not has("attn_post_norm.weight")
                               # a recurrent layer has no FFN to normalise
                               and not has_ssm),
@@ -304,7 +322,9 @@ def load_model(path: Path) -> dict[str, Any]:
                               for l in range(n_layer)),
         "expert_groups": int(key("expert_group_count", 0)),
         "groups_used": int(key("expert_group_used_count", 0)),
-        "expert_norm": bool(key("expert_weights_norm", False)),
+        # smallthinker passes both as constants to build_moe_ffn(..., LLM_FFN_RELU,
+        # /*norm_w=*/true, ...), so neither is in the file.
+        "expert_norm": bool(key("expert_weights_norm", False)) or arch == "smallthinker",
         "expert_scale": float(key("expert_weights_scale", 1.0)),
     }
     # A block with up/down but no gate has no gated activation. GGUF cannot say
@@ -345,6 +365,11 @@ def load_model(path: Path) -> dict[str, Any]:
         if arch not in seq_activation:
             raise ReferenceError("gate-free feed-forward is only defined for phi2 and gptneox")
         cfg["activation"] = seq_activation[arch]
+    if arch == "smallthinker":
+        # build_moe_ffn(..., LLM_FFN_RELU, /*norm_w=*/true, ...): a plain ReLU on
+        # the gate, and the expert weights renormalised after top-k.
+        cfg["activation"] = "relu"
+        cfg["expert_norm"] = True
     # llama.cpp reads the section split as a required key for these families.
     # On a single text sequence every axis carries the same position, so the
     # split does not change a number here; what it does change is that a file
@@ -835,6 +860,11 @@ class Session:
 
         def norm_of(vec: list[float], prefix: str) -> list[float]:
             """The one place both norm types are chosen, mirroring the engine."""
+            if cfg["weightless_norm"]:
+                # upstream's build_norm(x, NULL, NULL, ...): normalise, do not scale
+                if cfg["layer_norm"]:
+                    return layernorm(vec, [1.0] * len(vec), [0.0] * len(vec), cfg["eps"])
+                return rmsnorm(vec, [1.0] * len(vec), cfg["eps"], cfg["norm_add_one"])
             w = self.tensor(prefix + ".weight")
             if cfg["layer_norm"]:
                 # Upstream passes the bias pointer straight through, so a file
@@ -946,10 +976,25 @@ class Session:
                         q = [q[i] + bq[i] for i in range(H)]
                         k = [k[i] + bk[i] for i in range(kv_dim)]
                         v = [v[i] + bv[i] for i in range(kv_dim)]
+                def qk_head_norm(vec: list[float], n_heads: int, prefix: str) -> list[float]:
+                    """Per-head normalisation: shared or per-head row, RMS or LN."""
+                    weight = self.tensor(prefix + ".weight")
+                    eps = cfg["qk_norm_eps"] or cfg["eps"]
+                    out = list(vec)
+                    for h in range(n_heads):
+                        base = h * hd
+                        row = (weight[h * hd:(h + 1) * hd] if cfg["qk_norm_matrix"] else weight)
+                        if cfg["qk_norm_layernorm"]:
+                            head = layernorm(vec[base:base + hd], row, [0.0] * hd, eps)
+                        else:
+                            head = rmsnorm(vec[base:base + hd], row, eps, 0.0)
+                        out[base:base + hd] = head
+                    return out
+
                 if not cfg["mla"]:
-                    if cfg["qk_norm"]:
-                        q = head_rmsnorm(q, heads, self.tensor(p + "attn_q_norm.weight"), cfg["eps"])
-                        k = head_rmsnorm(k, kv_heads, self.tensor(p + "attn_k_norm.weight"), cfg["eps"])
+                    if cfg["qk_norm"] and not cfg["qk_norm_after_rope"]:
+                        q = qk_head_norm(q, heads, p + "attn_q_norm")
+                        k = qk_head_norm(k, kv_heads, p + "attn_k_norm")
                     step = cfg["no_rope_step"]
                     # jamba rotates nothing at all: upstream's attention layer
                     # never calls the rope.
@@ -958,6 +1003,10 @@ class Session:
                                   cfg["rope_scale"], cfg["rope_freqs"])
                         rope_half(k, hd, kv_heads, self.pos, cfg["rope_dim"], cfg["theta"],
                                   cfg["rope_scale"], cfg["rope_freqs"])
+                    # talkie normalises q and k after the rotation.
+                    if cfg["qk_norm"] and cfg["qk_norm_after_rope"]:
+                        q = qk_head_norm(q, heads, p + "attn_q_norm")
+                        k = qk_head_norm(k, kv_heads, p + "attn_k_norm")
                 if cfg["attn_temp_scale"] != 0.0:
                     # llama.cpp's per-position attention temperature: a multiplier on
                     # every query component, applied after the rotation.
@@ -1184,6 +1233,8 @@ class Session:
         if cfg["logit_bias"]:
             bias = self.tensor("output.bias")
             logits = [logits[i] + bias[i] for i in range(cfg["V"])]
+        if cfg["logit_scale"]:
+            logits = [v * cfg["logit_scale"] for v in logits]
         if cfg["final_softcap"] > 0.0:
             cap = cfg["final_softcap"]
             logits = [cap * math.tanh(v / cap) for v in logits]
