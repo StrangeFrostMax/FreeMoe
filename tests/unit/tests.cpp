@@ -2934,7 +2934,8 @@ void test_architecture_parity() {
                                            "qwen", "codeshell", "starcoder2", "pockettts",
                                            "cohere2", "paddleocr", "hunyuan-dense",
                                            "llama-embed", "gemma2-renamed",
-                                           "bloom", "jais"};
+                                           "bloom", "jais",
+                                           "gpt2", "starcoder", "falcon", "mpt"};
     for (const std::string &slug : slugs) {
         const std::string model = "tests/fixtures/" + slug + "-shape.gguf";
         ArchGolden golden = read_arch_golden("tests/golden/" + slug + "_reference.txt");
@@ -4392,7 +4393,8 @@ void test_soak_sessions() {
 // checkpoints may take the fast path at all.
 void test_batched_prefill() {
     const std::vector<std::string> batched = {"llama-gqa", "qwen3-qknorm", "qwen2-bias",
-                                              "gemma2", "bloom", "cohere2", "jais"};
+                                              "gemma2", "bloom", "cohere2", "jais",
+                                              "gpt2", "starcoder", "falcon", "mpt"};
     for (const std::string &slug : batched) {
         const std::string model = "tests/fixtures/" + slug + "-shape.gguf";
         auto run = [&](bool use_batch) {

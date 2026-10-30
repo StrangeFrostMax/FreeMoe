@@ -136,6 +136,9 @@ const char *tensor_role_name(TensorRole role) {
     case TensorRole::ATTN_SINKS: return "ATTN_SINKS";
     case TensorRole::ROPE_FREQS: return "ROPE_FREQS";
     case TensorRole::ATTN_K_NORM: return "ATTN_K_NORM";
+    case TensorRole::POSITION_EMBD: return "POSITION_EMBD";
+    case TensorRole::ATTN_NORM_2: return "ATTN_NORM_2";
+    case TensorRole::ATTN_NORM_2_BIAS: return "ATTN_NORM_2_BIAS";
     case TensorRole::TOKEN_EMBD_NORM: return "TOKEN_EMBD_NORM";
     case TensorRole::TOKEN_EMBD_NORM_BIAS: return "TOKEN_EMBD_NORM_BIAS";
     case TensorRole::ATTN_POST_NORM: return "ATTN_POST_NORM";
@@ -439,6 +442,7 @@ TensorRole role_from_name(const std::string &name, uint32_t &layer) {
     if (name == "token_embd.weight") return TensorRole::TOKEN_EMBD;
     if (name == "output.weight") return TensorRole::OUTPUT;
     if (name == "output.bias") return TensorRole::OUTPUT_BIAS;
+    if (name == "position_embd.weight") return TensorRole::POSITION_EMBD;
     if (name == "token_embd_norm.weight") return TensorRole::TOKEN_EMBD_NORM;
     if (name == "token_embd_norm.bias") return TensorRole::TOKEN_EMBD_NORM_BIAS;
     if (name == "output_norm.weight") return TensorRole::OUTPUT_NORM;
@@ -489,6 +493,8 @@ TensorRole role_from_name(const std::string &name, uint32_t &layer) {
         {"ffn_up_shexp.weight", TensorRole::FFN_UP_SHEXP},
         {"ffn_down_shexp.weight", TensorRole::FFN_DOWN_SHEXP},
         {"attn_norm.bias", TensorRole::ATTN_NORM_BIAS},
+        {"attn_norm_2.weight", TensorRole::ATTN_NORM_2},
+        {"attn_norm_2.bias", TensorRole::ATTN_NORM_2_BIAS},
         {"ffn_norm.bias", TensorRole::FFN_NORM_BIAS},
         {"ffn_up.bias", TensorRole::FFN_UP_BIAS},
         {"ffn_down.bias", TensorRole::FFN_DOWN_BIAS},
@@ -869,6 +875,10 @@ bool is_llama_family(const std::string &arch) {
         "codeshell",
         "bloom",
         "jais",
+        "gpt2",
+        "starcoder",
+        "falcon",
+        "mpt",
         "cohere2",
         "deci",
         "hunyuan-dense",
@@ -1228,6 +1238,8 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
     // jais (JAIS-1) rotates nothing at all: its block calls the rope for no
     // layer, and the file carries no rotary keys either.
     if (arch == "jais") cfg.rope_disabled = true;
+    // gpt2 and starcoder carry a learned position table and rotate nothing.
+    if (arch == "gpt2" || arch == "starcoder" || arch == "mpt") cfg.rope_disabled = true;
     uint64_t vocab = 0;
     if (!opt_u64(doc, keys("vocab_size"), &vocab)) {
         MetadataValue tokens;
@@ -1468,6 +1480,17 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
             fail(ErrorCode::MISSING_REQUIRED_TENSOR,
                  "token_embd_norm needs both its weight and its bias");
         cfg.token_embd_norm = tok_norm_w;
+        // An absolute position table is a single global tensor; upstream requires
+        // it for the two architectures that have no rotary position at all.
+        cfg.position_embd = doc.tensor_by_name.count("position_embd.weight") != 0;
+        // falcon's second pre-attention norm: optional upstream, but its two
+        // halves travel together.
+        const bool an2_w = doc.tensor_by_name.count(layer_name(probe, "attn_norm_2.weight")) != 0;
+        const bool an2_b = doc.tensor_by_name.count(layer_name(probe, "attn_norm_2.bias")) != 0;
+        if (an2_w != an2_b)
+            fail(ErrorCode::MISSING_REQUIRED_TENSOR,
+                 "attn_norm_2 needs both its weight and its bias");
+        cfg.attn_norm_2 = an2_w;
         const bool up_b = doc.tensor_by_name.count(layer_name(probe, "ffn_up.bias")) != 0;
         const bool down_b = doc.tensor_by_name.count(layer_name(probe, "ffn_down.bias")) != 0;
         if (up_b != down_b)
@@ -1680,6 +1703,10 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
             {"starcoder2", "gelu"}, // src/models/starcoder2.cpp: LLM_FFN_GELU, SEQ
             {"pockettts", "gelu"},  // src/models/pockettts.cpp: LLM_FFN_GELU, SEQ
             {"bloom", "gelu"},      // src/models/bloom.cpp: LLM_FFN_GELU, SEQ
+            {"gpt2", "gelu"},       // src/models/gpt2.cpp: LLM_FFN_GELU, SEQ
+            {"starcoder", "gelu"},  // src/models/starcoder.cpp: LLM_FFN_GELU, SEQ
+            {"falcon", "gelu"},     // src/models/falcon.cpp: LLM_FFN_GELU, SEQ
+            {"mpt", "gelu"},        // src/models/mpt.cpp: LLM_FFN_GELU, SEQ
         };
         auto it = seq_activation.find(arch);
         if (it == seq_activation.end())
@@ -1926,6 +1953,7 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
         expect("token_embd_norm.weight");
         expect("token_embd_norm.bias");
     }
+    if (cfg.position_embd) expect("position_embd.weight");
     expect("output_norm.weight");
     // A checkpoint without `output.weight` ties the output projection to the
     // token table. That is a supported layout, not a missing tensor: the maths
@@ -1940,6 +1968,11 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
         // follows it, so this is claimed before the two mixer branches split.
         expect(layer_name(l, "attn_norm.weight"));
         if (cfg.norm_bias) expect(layer_name(l, "attn_norm.bias"));
+        // falcon-40b's second pre-attention norm, when the file carries one.
+        if (cfg.attn_norm_2) {
+            expect(layer_name(l, "attn_norm_2.weight"));
+            if (cfg.norm_bias) expect(layer_name(l, "attn_norm_2.bias"));
+        }
         if (cfg.layer_is_recurrent(l)) {
             // The recurrent block, in llama.cpp's tensor names. There is no
             // attention projection and no rotary on such a layer.

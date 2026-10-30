@@ -161,9 +161,9 @@ intersected with what this engine implements.
 
 | Bucket | Count | Meaning |
 | --- | --- | --- |
-| Adapter today | **18** | `llama qwen2 qwen3 gemma gemma2 gemma3 phi3 minicpm qwen3moe glm4 qwen2moe phi2 internlm2 orion exaone gptneox stablelm deepseek2` (`smollm`, `smollm2`, `tinyllama` are the same `llama` block) |
+| Adapter today | **54** | `freemoe adapters` is the authoritative list; `docs/MODEL_COVERAGE_STATUS.md` groups them by capability. This census row is from the original audit and its named subset (`llama qwen2 qwen3 gemma gemma2 gemma3 phi3 minicpm qwen3moe glm4 qwen2moe phi2 internlm2 orion exaone gptneox stablelm deepseek2`) is where the table started |
 | Not a causal text decoder | **24** | BERT/Nomic/Jina/EuroBERT/ModernBERT/NeoBERT encoders, `llama-embed`, `gemma-embedding*`, `t5`/`t5encoder`, `clip`, `pockettts`, `qwen3tts`, `wavtokenizer-dec`, `paddleocr`, `llada`, `llada-moe`, `rnd1`, `dream`, `dflash`, `vllm-decision2` — no-causal-mask attention and pooling, or diffusion/audio/vision |
-| **Needs only an adapter row** | **56** | Every primitive already exists: stacked-expert MoE, shared experts with/without a scalar gate, group-limited routing, per-head q/k norm, post-norms, sliding window, partial RoPE, fused q/k/v, LayerNorm, silu/gelu/relu/relu², MLA. `baichuan bloom chatglm gpt2 starcoder2 falcon mpt olmo olmoe phimoe dbrx arctic grok minimax-01 minimax-m2 qwen mistral4 command-r cohere2 …` |
+| **Needs only an adapter row** | **52** | Every primitive already exists: stacked-expert MoE, shared experts with/without a scalar gate, group-limited routing, per-head q/k norm, post-norms, sliding window, partial RoPE, fused q/k/v, LayerNorm, silu/gelu/relu/relu², MLA. `baichuan bloom chatglm starcoder2 olmoe phimoe dbrx arctic grok minimax-01 minimax-m2 qwen mistral4 command-r cohere2 …` (`gpt2`, `starcoder`, `falcon` and `mpt` moved to mapped in this change) |
 | Needs one more primitive | 71 | below |
 
 ### What one capability unlocks
@@ -259,11 +259,31 @@ Fix: GPT-2 pre-tokenisation regex (`'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?
 lowest-rank merge loop, byte-level `Ġ` remapping on decode, then a reference
 test against a real vocabulary.
 
-### C2. Prefill is sequential
+### C2. ~~Prefill is sequential~~ — **FIXED; measured**
 
-`run_prompt` feeds prompt tokens one at a time (`src/engine.cpp:1146`). Correct,
-but it costs N forward passes instead of one GEMM-heavy pass, and it makes the
-§10.2 prefill metrics meaningless (see §A).
+> **FIXED.** `Engine::prefill_batch` evaluates the whole prompt in one
+> layer-major pass: each projection becomes a `gemm_quant` call over all prompt
+> rows (`include/fm/kernels.hpp`), the KV cache is filled for the batch before
+> attention runs, and logits are computed for the last row only. `run_prompt`
+> takes that path whenever `supports_batched_prefill()` accepts the block, and
+> `--prefill sequential` (`BackendConfig::batched_prefill = false`) keeps the
+> token-at-a-time path for comparison. Both paths are pinned against each other
+> by `batched_prefill` (57 checks) — identical tokenisation, logits and greedy
+> ids — and the seven block features the batch path does not model yet are
+> pinned by name, so a family cannot silently take a path that ignores its
+> detail.
+>
+> Measured here (`tools/bench_prefill.py`, synthetic dense llama, hidden 512 /
+> intermediate 2048 / 8 layers, 2-core host, `--prefill` toggled, median of 2):
+>
+> | prompt | sequential | batched | speedup |
+> | --- | --- | --- | --- |
+> | 185 tokens (x4) | 1443.1 ms | 491.4 ms | **2.94x** |
+> | 369 tokens (x8) | 3765.5 ms | 1382.2 ms | **2.72x** |
+>
+> The original finding follows. `run_prompt` fed prompt tokens one at a time.
+> Correct, but it cost N forward passes instead of one GEMM-heavy pass, and it
+> made the §10.2 prefill metrics meaningless (see §A).
 
 ### C3. Sliding-window models reserve and keep the full cache
 
@@ -367,8 +387,9 @@ other candidates are blocked on, in the terms of the file that blocks them:
 | Dual dense+MoE FFN in one layer (both branches summed) | `arctic`, `ernie4_5`, `granite-moe` | A block that runs both, as `arctic` does |
 | No kv cache at all (diffusion / embedding decoders) | `dream`, `llada`, `eurobert` | A caching policy, not a tensor |
 | Encoder-only with `cls.*`/`token_types`/pooling | `modern-bert`, `neo-bert`, `jina-bert-v2/v3`, `nomic-bert*`, `gemma-embedding*` | A pooling head and a segment embedding |
-| ALiBi instead of rotary | ~~`bloom`, `jais`~~ **implemented** this branch; `falcon`, `mpt` | Their tensor sets, not the bias: `falcon` needs `attn_norm_2` (a second pre-attention norm), `mpt` needs `position_embd` and `ffn.act` |
-| Absolute position embeddings | `gpt2`, `starcoder`, `mpt` (`position_embd`) | A position-embedding tensor role: one lookup added to the embedding |
+| ALiBi instead of rotary | ~~`bloom`, `jais`~~ **implemented**; ~~`falcon`, `mpt`~~ **now mapped** — `falcon` landed with `attn_norm_2`, and `mpt`/`gpt2`/`starcoder` with the position table | Their tensor sets, not the bias. What `mpt` still skips is the optional AWQ `ffn.act` scale tensor and the optional full-width q/k LayerNorm, both absent from the fixture and from stock checkpoints |
+| ~~Absolute position embeddings~~ **implemented** | ~~`gpt2`, `starcoder`, `mpt` (`position_embd`)~~ **mapped**: tensor role `POSITION_EMBD`, one row lookup added to the embedding, no rotation. Dropping the lookup fails `gpt2`/`starcoder`/`mpt` greedies | Done |
+| A second pre-attention norm (`attn_norm_2`) | ~~`falcon`~~ **mapped**; the same shape is what falcon-7B omits (falls back to `attn_norm`) | Done; the bias of the second norm is decoded like every other norm bias |
 | T5 encoder/decoder with relative-position buckets | `t5` | Two graphs and a bucket bias |
 
 **Fixed alongside:** llama.cpp renamed the sandwich-norm tensors
@@ -451,7 +472,7 @@ fabricating a capability.
 | 3 | **YaRN / `rope_freqs`** (C4) | +14 models, one rotary change, already isolated behind `rope_dim` | S |
 | 4 | **CPU ISA override + AVX2-only re-benchmark** (C10) | Today's only performance evidence is from an ISA the target lacks | S |
 | 5 | **Eviction-exercising benchmark config** (§A Phase 5/6) | Without it the cache-policy and prefetch gates cannot be evaluated at all | S |
-| 6 | **Batched prefill** (C2) | Largest throughput win at prompt length > 32; makes §10.2 metrics honest | L |
+| 6 | ~~**Batched prefill** (C2)~~ **done** (2.72-2.94x measured) | Largest throughput win at prompt length > 32; makes §10.2 metrics honest | L |
 | 7 | ~~**IQ1–IQ4 / MXFP4 decoders** (C7)~~ **done** | Unlocks quantised checkpoints of MoE families that are already supported | M |
 | 8 | ~~**GEGLU_ERF**~~ **done**; **SITU** (C9 remainder) | `gelu_erf` is reachable through `mistral3`; `SITU` is unimplemented upstream too (`GGML_ABORT`), so no file can be checked against it | S |
 | 9 | ~~**mamba/mamba2**~~ **done**; **gated delta-net** | The mamba scan, its state layout and the `dt_b_c_rms` norms now run with fixtures and goldens. Delta-net is a different scan (per-head matrix state) and is what `qwen35`, `qwen3next` and `kimi-linear` still need | L |

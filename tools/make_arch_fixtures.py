@@ -100,6 +100,13 @@ def arch_tensors(spec: dict[str, Any]) -> list[TensorSpec]:
     kv_heads = spec.get("kv_heads", heads)
     kv_dim = kv_heads * hd
     out = [tensor("token_embd.weight", [h, V], 0.35)]
+    if spec.get("position_embd"):
+        # One learned row per context position (gpt2/starcoder). Deliberately not
+        # constant across positions: a runtime that ignores the table, or adds
+        # row 0 for every token, cannot match the golden.
+        rows = spec["context"]
+        out += [tensor("position_embd.weight", [h, rows], 0.0,
+                       values=[0.25 * ((i % 7) - 3) for i in range(h * rows)])]
     if spec.get("token_embd_norm"):
         # bloom normalises the embedding once before block 0; both halves are
         # required, as upstream's `create_tensor` calls demand.
@@ -162,6 +169,12 @@ def arch_tensors(spec: dict[str, Any]) -> list[TensorSpec]:
             continue
         if spec.get("layernorm") and spec.get("norm_bias", True):
             out += [tensor(p + "attn_norm.bias", [h], 0.05)]
+        if spec.get("attn_norm_2"):
+            # falcon-40b's second pre-attention norm: its own weight, plus a bias
+            # when the file's norms carry one.
+            out += [tensor(p + "attn_norm_2.weight", [h], 0.0, norm=True)]
+            if spec.get("norm_bias", True):
+                out += [tensor(p + "attn_norm_2.bias", [h], 0.05)]
         if spec.get("parallel_residual"):
             # No ffn_norm at all: the FFN consumes the attention norm.
             pass
@@ -386,7 +399,8 @@ def arch_metadata(spec: dict[str, Any]) -> dict[str, tuple[Any, ...]]:
         # jamba rotates nothing: upstream's attention layer never calls the rope,
         # so the file carries no rotary keys at all.
         **({} if spec.get("ssm") and not spec.get("hybrid") else
-           ({} if spec.get("no_rope") or spec.get("alibi_only") else {
+           ({} if spec.get("no_rope") or spec.get("alibi_only")
+              or spec.get("position_embd") else {
                f"{arch}.rope.dimension_count": ("u32", spec["rope_dim"]),
                f"{arch}.rope.freq_base": ("f32", 10000.0),
            })),
@@ -574,6 +588,66 @@ SPECS: list[dict[str, Any]] = [
         "ssm_dt_rank": 3,
         "ssm_flag_only": True,
         "layers": 2,
+    },
+    {
+        # gpt2 (llama.cpp src/models/gpt2.cpp): biased LayerNorm, one fused qkv
+        # with its bias, a gate-free GELU FFN with biases on both projections,
+        # and a learned position table added to the embedding. No rotary at all.
+        "slug": "gpt2",
+        "arch": "gpt2",
+        "name": "FreeMoe synthetic gpt2 with absolute position embeddings",
+        "layernorm": True,
+        "position_embd": True,
+        "no_rope": True,
+        "fused_qkv": True,
+        "qkv_bias": True,
+        "ffn_no_gate": True,
+        "ffn_bias": True,
+        "attn_output_bias": True,
+    },
+    {
+        # starcoder (llama.cpp src/models/starcoder.cpp): the same block as gpt2,
+        # with its own position table and a tied output head left out.
+        "slug": "starcoder",
+        "arch": "starcoder",
+        "name": "FreeMoe synthetic starcoder with absolute position embeddings",
+        "layernorm": True,
+        "position_embd": True,
+        "no_rope": True,
+        "fused_qkv": True,
+        "qkv_bias": True,
+        "ffn_no_gate": True,
+        "ffn_bias": True,
+        "attn_output_bias": True,
+    },
+    {
+        # falcon-40b (llama.cpp src/models/falcon.cpp): a second pre-attention
+        # norm feeding the qkv projection, while the FFN keeps reading the first.
+        # Rotary for the attention, biased LayerNorm, a gate-free GELU FFN.
+        "slug": "falcon",
+        "arch": "falcon",
+        "name": "FreeMoe synthetic falcon-40b with a second pre-attention norm",
+        "layernorm": True,
+        "attn_norm_2": True,
+        "fused_qkv": True,
+        "ffn_no_gate": True,
+    },
+    {
+        # mpt (llama.cpp src/models/mpt.cpp): biased LayerNorm on both block norms,
+        # a fused qkv with its bias, a gate-free GELU FFN with biases on both
+        # projections, and an *optional* learned position table added to the
+        # embedding. No rotary anywhere.
+        "slug": "mpt",
+        "arch": "mpt",
+        "name": "FreeMoe synthetic mpt with an absolute position table",
+        "layernorm": True,
+        "position_embd": True,
+        "no_rope": True,
+        "fused_qkv": True,
+        "qkv_bias": True,
+        "ffn_no_gate": True,
+        "ffn_bias": True,
+        "attn_output_bias": True,
     },
     {
         # bloom (llama.cpp src/models/bloom.cpp): bias-carrying LayerNorm on the

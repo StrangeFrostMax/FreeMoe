@@ -230,6 +230,7 @@ void Engine::load_fixed_weights() {
                              tensor.role == TensorRole::ATTN_OUTPUT_BIAS ||
                              tensor.role == TensorRole::ATTN_QKV_BIAS ||
                              tensor.role == TensorRole::ATTN_NORM_BIAS ||
+                             tensor.role == TensorRole::ATTN_NORM_2_BIAS ||
                              tensor.role == TensorRole::FFN_NORM_BIAS ||
                              tensor.role == TensorRole::OUTPUT_NORM_BIAS ||
                              tensor.role == TensorRole::TOKEN_EMBD_NORM_BIAS ||
@@ -741,6 +742,28 @@ std::vector<float> Engine::forward_token(int32_t token, uint64_t position,
             x = layernorm(x, norm_weights("token_embd_norm.weight"),
                           bias_weights("token_embd_norm.bias"), "layernorm.inp");
         }
+        if (c.position_embd) {
+            // gpt2 / starcoder: the position is a learned vector added to the
+            // token embedding (`pos = get_rows(pos_embd, inp_pos)`), which is the
+            // only place either architecture encodes position at all.
+            const TensorInfo *table = manifest_.tensor("position_embd.weight");
+            if (table == nullptr || table->dims.size() < 2)
+                fail(ErrorCode::INTERNAL_ERROR, "position_embd.weight is not a table");
+            const uint64_t rows = table->dims[1];
+            if (position >= rows)
+                fail(ErrorCode::METADATA_MISMATCH,
+                     "position " + std::to_string(position) +
+                         " is outside the checkpoint's position table (" +
+                         std::to_string(rows) + " rows)");
+            const TensorView view = tensor_view("position_embd.weight");
+            if (view.type_id != 0)
+                fail(ErrorCode::UNSUPPORTED_QUANTISATION,
+                     "a quantised position table is not supported");
+            const float *row = reinterpret_cast<const float *>(view.data) +
+                               static_cast<size_t>(position) * c.hidden;
+            for (uint32_t i = 0; i < c.hidden; ++i) x[i] += row[i];
+            backend_->record_control("position_embd", x.size() * sizeof(float), 0);
+        }
     }
 
     // Where the two halves of the cache region begin. A pure attention model has
@@ -968,6 +991,14 @@ std::vector<float> Engine::forward_token(int32_t token, uint64_t position,
         const uint32_t attn_out_dim = c.heads * c.head_v_dim();
         const uint32_t kv_stride = kv_dim + v_dim;
         const uint32_t group = c.heads / c.kv_heads;
+        // falcon-40b normalises the block input a second time for the attention
+        // projections, while the FFN's residual still runs off `attn_norm`.
+        std::vector<float> h_attn;
+        const std::vector<float> *attn_input = &h;
+        if (c.attn_norm_2) {
+            h_attn = norm(x, prefix + "attn_norm_2", "attn_norm_2.L" + std::to_string(layer));
+            attn_input = &h_attn;
+        }
         std::vector<float> q, k, v;
         if (c.mla) {
             // Multi-head latent attention. The file stores no keys or values: a
@@ -979,7 +1010,7 @@ std::vector<float> Engine::forward_token(int32_t token, uint64_t position,
             // architecture. Reported as `mla_expand` in the operation log.
             std::vector<float> qflat;
             if (c.q_lora_rank != 0) {
-                std::vector<float> qa = matvec_view(tensor_view(prefix + "attn_q_a.weight"), h,
+                std::vector<float> qa = matvec_view(tensor_view(prefix + "attn_q_a.weight"), *attn_input,
                                                     c.q_lora_rank, c.hidden,
                                                     "attn_q_a.L" + std::to_string(layer));
                 qa = rmsnorm(qa, norm_weights(prefix + "attn_q_a_norm.weight"),
@@ -988,13 +1019,13 @@ std::vector<float> Engine::forward_token(int32_t token, uint64_t position,
                                     c.heads * c.head_dim, c.q_lora_rank,
                                     "attn_q_b.L" + std::to_string(layer));
             } else {
-                qflat = matvec_view(tensor_view(prefix + "attn_q.weight"), h,
+                qflat = matvec_view(tensor_view(prefix + "attn_q.weight"), *attn_input,
                                     c.heads * c.head_dim, c.hidden,
                                     "attn_q.L" + std::to_string(layer));
             }
             const uint32_t latent = c.kv_lora_rank;
             std::vector<float> kvpe =
-                matvec_view(tensor_view(prefix + "attn_kv_a_mqa.weight"), h, latent + c.rope_dim,
+                matvec_view(tensor_view(prefix + "attn_kv_a_mqa.weight"), *attn_input, latent + c.rope_dim,
                             c.hidden, "attn_kv_a_mqa.L" + std::to_string(layer));
             std::vector<float> ckv(kvpe.begin(), kvpe.begin() + latent);
             std::vector<float> kpe(kvpe.begin() + latent, kvpe.end());
@@ -1072,7 +1103,7 @@ std::vector<float> Engine::forward_token(int32_t token, uint64_t position,
         } else if (c.fused_qkv) {
             // phi3: one projection produces q, k and v back to back.
             std::vector<float> qkv =
-                matvec_view(tensor_view(prefix + "attn_qkv.weight"), h, c.hidden + 2 * kv_dim,
+                matvec_view(tensor_view(prefix + "attn_qkv.weight"), *attn_input, c.hidden + 2 * kv_dim,
                             c.hidden, "attn_qkv.L" + std::to_string(layer));
             if (c.attn_qkv_bias) {
                 const float *b = bias_weights(prefix + "attn_qkv.bias");
@@ -1084,11 +1115,11 @@ std::vector<float> Engine::forward_token(int32_t token, uint64_t position,
             k.assign(qkv.begin() + c.hidden, qkv.begin() + c.hidden + kv_dim);
             v.assign(qkv.begin() + c.hidden + kv_dim, qkv.end());
         } else {
-            q = matvec_view(tensor_view(prefix + "attn_q.weight"), h, c.hidden, c.hidden,
+            q = matvec_view(tensor_view(prefix + "attn_q.weight"), *attn_input, c.hidden, c.hidden,
                             "attn_q.L" + std::to_string(layer));
-            k = matvec_view(tensor_view(prefix + "attn_k.weight"), h, kv_dim, c.hidden,
+            k = matvec_view(tensor_view(prefix + "attn_k.weight"), *attn_input, kv_dim, c.hidden,
                             "attn_k.L" + std::to_string(layer));
-            v = matvec_view(tensor_view(prefix + "attn_v.weight"), h, kv_dim, c.hidden,
+            v = matvec_view(tensor_view(prefix + "attn_v.weight"), *attn_input, kv_dim, c.hidden,
                             "attn_v.L" + std::to_string(layer));
             // BitNet's ternary projections carry a one-element scale that
             // multiplies the projection output. llama.cpp folds it into
@@ -1743,6 +1774,26 @@ std::vector<float> Engine::prefill_batch(const std::vector<int32_t> &tokens,
             norm_row(row, H, "token_embd_norm", normed.data(), "layernorm.inp", batch);
             std::memcpy(row, normed.data(), static_cast<size_t>(H) * sizeof(float));
         }
+        if (c.position_embd) {
+            // The learned position table, one row per absolute position.
+            const TensorInfo *table = manifest_.tensor("position_embd.weight");
+            if (table == nullptr || table->dims.size() < 2)
+                fail(ErrorCode::INTERNAL_ERROR, "position_embd.weight is not a table");
+            const uint64_t rows = table->dims[1];
+            const uint64_t position = start_position + t;
+            if (position >= rows)
+                fail(ErrorCode::METADATA_MISMATCH,
+                     "position " + std::to_string(position) +
+                         " is outside the checkpoint's position table (" +
+                         std::to_string(rows) + " rows)");
+            const TensorView view = tensor_view("position_embd.weight");
+            if (view.type_id != 0)
+                fail(ErrorCode::UNSUPPORTED_QUANTISATION,
+                     "a quantised position table is not supported");
+            const float *row_pos = reinterpret_cast<const float *>(view.data) +
+                                   static_cast<size_t>(position) * H;
+            for (uint32_t i = 0; i < H; ++i) row[i] += row_pos[i];
+        }
         Json fields = Json::object();
         fields.set("position", start_position + t);
         fields.set("token", static_cast<int64_t>(token));
@@ -1783,13 +1834,20 @@ std::vector<float> Engine::prefill_batch(const std::vector<int32_t> &tokens,
         // --- attention ------------------------------------------------------
         const std::vector<float> h = norm_batch(x, H, prefix + "attn_norm",
                                                "rmsnorm.attn." + lp);
+        // falcon's second pre-attention norm, as in the sequential path.
+        std::vector<float> h_attn;
+        const std::vector<float> *attn_h = &h;
+        if (c.attn_norm_2) {
+            h_attn = norm_batch(x, H, prefix + "attn_norm_2", "rmsnorm.attn2." + lp);
+            attn_h = &h_attn;
+        }
         std::vector<float> qflat(static_cast<size_t>(batch) * attn_out_dim, 0.0f);
         std::vector<float> kflat(static_cast<size_t>(batch) * kv_dim, 0.0f);
         std::vector<float> vflat(static_cast<size_t>(batch) * kv_dim, 0.0f);
         if (c.fused_qkv) {
             const uint32_t fused_out = H + 2 * kv_dim;
             const std::vector<float> both =
-                project(prefix + "attn_qkv.weight", h, H, fused_out, "attn_qkv." + lp);
+                project(prefix + "attn_qkv.weight", *attn_h, H, fused_out, "attn_qkv." + lp);
             for (uint32_t t = 0; t < batch; ++t) {
                 const float *src = both.data() + static_cast<size_t>(t) * fused_out;
                 std::memcpy(qflat.data() + static_cast<size_t>(t) * attn_out_dim, src,
@@ -1800,9 +1858,9 @@ std::vector<float> Engine::prefill_batch(const std::vector<int32_t> &tokens,
                             static_cast<size_t>(kv_dim) * sizeof(float));
             }
         } else {
-            qflat = project(prefix + "attn_q.weight", h, H, attn_out_dim, "attn_q." + lp);
-            kflat = project(prefix + "attn_k.weight", h, H, kv_dim, "attn_k." + lp);
-            vflat = project(prefix + "attn_v.weight", h, H, kv_dim, "attn_v." + lp);
+            qflat = project(prefix + "attn_q.weight", *attn_h, H, attn_out_dim, "attn_q." + lp);
+            kflat = project(prefix + "attn_k.weight", *attn_h, H, kv_dim, "attn_k." + lp);
+            vflat = project(prefix + "attn_v.weight", *attn_h, H, kv_dim, "attn_v." + lp);
         }
         for (uint32_t t = 0; t < batch; ++t) {
             float *q = qflat.data() + static_cast<size_t>(t) * attn_out_dim;
