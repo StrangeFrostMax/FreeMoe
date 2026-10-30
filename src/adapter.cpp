@@ -50,6 +50,14 @@ const AdapterRow kRows[] = {
      "deepseek4 graph with the renormalised router"},
     {"mistral3", "LLM_ARCH_MISTRAL3", "llama_model_mistral3::build_arch_graph",
      "llama block, optional MLP biases, gelu_erf adaptive norm, attention temperature"},
+    {"gpt2", "LLM_ARCH_GPT2", "llama_model_gpt2::build_arch_graph",
+     "absolute position table, gate-free GELU, no rotary"},
+    {"starcoder", "LLM_ARCH_STARCODER", "llama_model_starcoder::build_arch_graph",
+     "absolute position table, gate-free GELU, no rotary"},
+    {"falcon", "LLM_ARCH_FALCON", "llama_model_falcon::build_arch_graph",
+     "second pre-attention norm (falcon-40b)"},
+    {"mpt", "LLM_ARCH_MPT", "llama_model_mpt::build_arch_graph",
+     "optional absolute position table, gate-free GELU, no rotary"},
     {"bloom", "LLM_ARCH_BLOOM", "llama_model_bloom::build_arch_graph",
      "ALiBi attention, biased LayerNorm, embedding norm"},
     {"jais", "LLM_ARCH_JAIS", "llama_model_jais::build_arch_graph",
@@ -128,10 +136,14 @@ const char *adapter_tensor_tag(TensorRole role) {
 const char *adapter_tensor_op(TensorRole role) {
     switch (role) {
     case TensorRole::TOKEN_EMBD: return "get_rows";
+    // The absolute position table is read a row at a time, like the token table.
+    case TensorRole::POSITION_EMBD: return "get_rows";
     case TensorRole::OUTPUT: return "matmul";
     case TensorRole::OUTPUT_NORM:
     case TensorRole::TOKEN_EMBD_NORM:
     case TensorRole::TOKEN_EMBD_NORM_BIAS:
+    case TensorRole::ATTN_NORM_2:
+    case TensorRole::ATTN_NORM_2_BIAS:
     case TensorRole::ATTN_NORM:
     case TensorRole::FFN_NORM:
     case TensorRole::ATTN_POST_NORM:

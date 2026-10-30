@@ -230,6 +230,7 @@ void Engine::load_fixed_weights() {
                              tensor.role == TensorRole::ATTN_OUTPUT_BIAS ||
                              tensor.role == TensorRole::ATTN_QKV_BIAS ||
                              tensor.role == TensorRole::ATTN_NORM_BIAS ||
+                             tensor.role == TensorRole::ATTN_NORM_2_BIAS ||
                              tensor.role == TensorRole::FFN_NORM_BIAS ||
                              tensor.role == TensorRole::OUTPUT_NORM_BIAS ||
                              tensor.role == TensorRole::TOKEN_EMBD_NORM_BIAS ||
@@ -741,6 +742,28 @@ std::vector<float> Engine::forward_token(int32_t token, uint64_t position,
             x = layernorm(x, norm_weights("token_embd_norm.weight"),
                           bias_weights("token_embd_norm.bias"), "layernorm.inp");
         }
+        if (c.position_embd) {
+            // gpt2 / starcoder: the position is a learned vector added to the
+            // token embedding (`pos = get_rows(pos_embd, inp_pos)`), which is the
+            // only place either architecture encodes position at all.
+            const TensorInfo *table = manifest_.tensor("position_embd.weight");
+            if (table == nullptr || table->dims.size() < 2)
+                fail(ErrorCode::INTERNAL_ERROR, "position_embd.weight is not a table");
+            const uint64_t rows = table->dims[1];
+            if (position >= rows)
+                fail(ErrorCode::METADATA_MISMATCH,
+                     "position " + std::to_string(position) +
+                         " is outside the checkpoint's position table (" +
+                         std::to_string(rows) + " rows)");
+            const TensorView view = tensor_view("position_embd.weight");
+            if (view.type_id != 0)
+                fail(ErrorCode::UNSUPPORTED_QUANTISATION,
+                     "a quantised position table is not supported");
+            const float *row = reinterpret_cast<const float *>(view.data) +
+                               static_cast<size_t>(position) * c.hidden;
+            for (uint32_t i = 0; i < c.hidden; ++i) x[i] += row[i];
+            backend_->record_control("position_embd", x.size() * sizeof(float), 0);
+        }
     }
 
     // Where the two halves of the cache region begin. A pure attention model has
@@ -968,6 +991,14 @@ std::vector<float> Engine::forward_token(int32_t token, uint64_t position,
         const uint32_t attn_out_dim = c.heads * c.head_v_dim();
         const uint32_t kv_stride = kv_dim + v_dim;
         const uint32_t group = c.heads / c.kv_heads;
+        // falcon-40b normalises the block input a second time for the attention
+        // projections, while the FFN's residual still runs off `attn_norm`.
+        std::vector<float> h_attn;
+        const std::vector<float> *attn_input = &h;
+        if (c.attn_norm_2) {
+            h_attn = norm(x, prefix + "attn_norm_2", "attn_norm_2.L" + std::to_string(layer));
+            attn_input = &h_attn;
+        }
         std::vector<float> q, k, v;
         if (c.mla) {
             // Multi-head latent attention. The file stores no keys or values: a
@@ -979,7 +1010,7 @@ std::vector<float> Engine::forward_token(int32_t token, uint64_t position,
             // architecture. Reported as `mla_expand` in the operation log.
             std::vector<float> qflat;
             if (c.q_lora_rank != 0) {
-                std::vector<float> qa = matvec_view(tensor_view(prefix + "attn_q_a.weight"), h,
+                std::vector<float> qa = matvec_view(tensor_view(prefix + "attn_q_a.weight"), *attn_input,
                                                     c.q_lora_rank, c.hidden,
                                                     "attn_q_a.L" + std::to_string(layer));
                 qa = rmsnorm(qa, norm_weights(prefix + "attn_q_a_norm.weight"),
@@ -988,13 +1019,13 @@ std::vector<float> Engine::forward_token(int32_t token, uint64_t position,
                                     c.heads * c.head_dim, c.q_lora_rank,
                                     "attn_q_b.L" + std::to_string(layer));
             } else {
-                qflat = matvec_view(tensor_view(prefix + "attn_q.weight"), h,
+                qflat = matvec_view(tensor_view(prefix + "attn_q.weight"), *attn_input,
                                     c.heads * c.head_dim, c.hidden,
                                     "attn_q.L" + std::to_string(layer));
             }
             const uint32_t latent = c.kv_lora_rank;
             std::vector<float> kvpe =
-                matvec_view(tensor_view(prefix + "attn_kv_a_mqa.weight"), h, latent + c.rope_dim,
+                matvec_view(tensor_view(prefix + "attn_kv_a_mqa.weight"), *attn_input, latent + c.rope_dim,
                             c.hidden, "attn_kv_a_mqa.L" + std::to_string(layer));
             std::vector<float> ckv(kvpe.begin(), kvpe.begin() + latent);
             std::vector<float> kpe(kvpe.begin() + latent, kvpe.end());
@@ -1072,7 +1103,7 @@ std::vector<float> Engine::forward_token(int32_t token, uint64_t position,
         } else if (c.fused_qkv) {
             // phi3: one projection produces q, k and v back to back.
             std::vector<float> qkv =
-                matvec_view(tensor_view(prefix + "attn_qkv.weight"), h, c.hidden + 2 * kv_dim,
+                matvec_view(tensor_view(prefix + "attn_qkv.weight"), *attn_input, c.hidden + 2 * kv_dim,
                             c.hidden, "attn_qkv.L" + std::to_string(layer));
             if (c.attn_qkv_bias) {
                 const float *b = bias_weights(prefix + "attn_qkv.bias");
@@ -1084,11 +1115,11 @@ std::vector<float> Engine::forward_token(int32_t token, uint64_t position,
             k.assign(qkv.begin() + c.hidden, qkv.begin() + c.hidden + kv_dim);
             v.assign(qkv.begin() + c.hidden + kv_dim, qkv.end());
         } else {
-            q = matvec_view(tensor_view(prefix + "attn_q.weight"), h, c.hidden, c.hidden,
+            q = matvec_view(tensor_view(prefix + "attn_q.weight"), *attn_input, c.hidden, c.hidden,
                             "attn_q.L" + std::to_string(layer));
-            k = matvec_view(tensor_view(prefix + "attn_k.weight"), h, kv_dim, c.hidden,
+            k = matvec_view(tensor_view(prefix + "attn_k.weight"), *attn_input, kv_dim, c.hidden,
                             "attn_k.L" + std::to_string(layer));
-            v = matvec_view(tensor_view(prefix + "attn_v.weight"), h, kv_dim, c.hidden,
+            v = matvec_view(tensor_view(prefix + "attn_v.weight"), *attn_input, kv_dim, c.hidden,
                             "attn_v.L" + std::to_string(layer));
             // BitNet's ternary projections carry a one-element scale that
             // multiplies the projection output. llama.cpp folds it into
@@ -1634,6 +1665,483 @@ std::vector<float> Engine::forward_token(int32_t token, uint64_t position,
     return logits;
 }
 
+bool Engine::supports_batched_prefill() const {
+    const ModelConfig &c = manifest_.config;
+    // Every rejection below is a structural difference in the block, not a
+    // performance preference: MLA keeps a latent instead of keys and values,
+    // a recurrent layer carries a rolling state instead of a cache, routed
+    // experts choose per token, BitNet normalises inside the attention branch,
+    // phi2 has no ffn_norm to share, gpt-oss feeds the FFN from a post-norm and
+    // mistral3 scales its norm with an MLP. Batching those would mean writing a
+    // second implementation of each; they keep the sequential path.
+    if (c.mla) return false;
+    if (!c.ssm_kind.empty()) return false;
+    if (c.expert_count > 0) return false;
+    if (c.sub_norms) return false;
+    if (c.parallel_residual) return false;
+    if (c.ffn_norm_is_post) return false;
+    if (c.ffn_norm_ada) return false;
+    if (!c.has_ffn) return false;
+    return true;
+}
+
+std::vector<float> Engine::prefill_batch(const std::vector<int32_t> &tokens,
+                                         uint64_t start_position) {
+    const ModelConfig &c = manifest_.config;
+    if (!supports_batched_prefill())
+        fail(ErrorCode::INTERNAL_ERROR, "this checkpoint cannot take the batched prefill path");
+    const uint32_t batch = static_cast<uint32_t>(tokens.size());
+    if (batch == 0) fail(ErrorCode::INVALID_ARGUMENT, "empty prefill batch");
+    if (start_position + batch > c.context)
+        fail(ErrorCode::INVALID_ARGUMENT, "KV context exhausted");
+    residency_->poll_prefetches();
+
+    const uint32_t H = c.hidden;
+    const double norm_bias = c.norm_add_one ? 1.0 : 0.0;
+    // `x` is the batch: batch rows of `hidden` floats.
+    std::vector<float> x(static_cast<size_t>(batch) * H, 0.0f);
+
+    const TensorView emb = tensor_view("token_embd.weight");
+    const QuantGeometry &emb_geo = quant_geometry(emb.type_id);
+    const uint64_t emb_row = emb.type_id == 0
+        ? static_cast<uint64_t>(H) * sizeof(float)
+        : static_cast<uint64_t>(H / emb_geo.block_size) * emb_geo.block_bytes;
+    if (emb.type_id != 0 && H % emb_geo.block_size != 0)
+        fail(ErrorCode::SHAPE_MISMATCH, "embedding row is not whole quantisation blocks");
+    // One row of a norm, in place. Same two rules as `forward_token`: the type is
+    // the checkpoint's, and a LayerNorm whose bias tensor is absent is biased by
+    // nothing rather than refused.
+    auto norm_row = [&](const float *in, uint32_t width, const std::string &prefix,
+                        float *out, const std::string &label, uint32_t rows) {
+        const float *w = norm_weights(prefix + ".weight");
+        if (c.layer_norm) {
+            const std::string bias_name = prefix + ".bias";
+            const float *b = has_bias(bias_name) ? bias_weights(bias_name) : nullptr;
+            double mean = 0.0;
+            for (uint32_t i = 0; i < width; ++i) mean += in[i];
+            mean /= width;
+            double var = 0.0;
+            for (uint32_t i = 0; i < width; ++i) {
+                const double d = static_cast<double>(in[i]) - mean;
+                var += d * d;
+            }
+            var /= width;
+            const double scale = 1.0 / std::sqrt(var + c.rms_eps);
+            for (uint32_t i = 0; i < width; ++i)
+                out[i] = static_cast<float>((static_cast<double>(in[i]) - mean) * scale * w[i] +
+                                            (b == nullptr ? 0.0 : static_cast<double>(b[i])));
+        } else {
+            double ss = 0.0;
+            for (uint32_t i = 0; i < width; ++i) ss += static_cast<double>(in[i]) * in[i];
+            const double scale = 1.0 / std::sqrt(ss / static_cast<double>(width) + c.rms_eps);
+            for (uint32_t i = 0; i < width; ++i)
+                out[i] = static_cast<float>(in[i] * scale *
+                                            static_cast<float>(norm_bias + w[i]));
+        }
+        backend_->record_control(label, static_cast<uint64_t>(width) * rows * sizeof(float) * 2,
+                                 static_cast<uint64_t>(width) * rows * sizeof(float));
+    };
+    auto norm_batch = [&](const std::vector<float> &in, uint32_t width,
+                          const std::string &prefix, const std::string &label) {
+        std::vector<float> out(in.size(), 0.0f);
+        for (uint32_t t = 0; t < batch; ++t)
+            norm_row(in.data() + static_cast<size_t>(t) * width, width, prefix,
+                     out.data() + static_cast<size_t>(t) * width, label, batch);
+        return out;
+    };
+    for (uint32_t t = 0; t < batch; ++t) {
+        const int32_t token = tokens[t];
+        if (token < 0 || static_cast<uint32_t>(token) >= c.vocab)
+            fail(ErrorCode::INVALID_ARGUMENT, "token id out of range");
+        float *row = x.data() + static_cast<size_t>(t) * H;
+        if (emb.type_id == 0) {
+            std::memcpy(row, reinterpret_cast<const float *>(emb.data) +
+                                 static_cast<size_t>(token) * H,
+                        static_cast<size_t>(H) * sizeof(float));
+        } else {
+            const uint8_t *src = emb.data + static_cast<uint64_t>(token) * emb_row;
+            for (uint32_t k = 0; k < H; k += emb_geo.block_size)
+                dequantize_block(emb.type_id, src + (k / emb_geo.block_size) * emb_geo.block_bytes,
+                                 row + k);
+        }
+        if (c.embedding_scale != 1.0) {
+            const float scale = static_cast<float>(c.embedding_scale);
+            for (uint32_t i = 0; i < H; ++i) row[i] *= scale;
+        }
+        if (c.token_embd_norm) {
+            // bloom's pre-block embedding norm, on every row of the batch.
+            std::vector<float> normed(H, 0.0f);
+            norm_row(row, H, "token_embd_norm", normed.data(), "layernorm.inp", batch);
+            std::memcpy(row, normed.data(), static_cast<size_t>(H) * sizeof(float));
+        }
+        if (c.position_embd) {
+            // The learned position table, one row per absolute position.
+            const TensorInfo *table = manifest_.tensor("position_embd.weight");
+            if (table == nullptr || table->dims.size() < 2)
+                fail(ErrorCode::INTERNAL_ERROR, "position_embd.weight is not a table");
+            const uint64_t rows = table->dims[1];
+            const uint64_t position = start_position + t;
+            if (position >= rows)
+                fail(ErrorCode::METADATA_MISMATCH,
+                     "position " + std::to_string(position) +
+                         " is outside the checkpoint's position table (" +
+                         std::to_string(rows) + " rows)");
+            const TensorView view = tensor_view("position_embd.weight");
+            if (view.type_id != 0)
+                fail(ErrorCode::UNSUPPORTED_QUANTISATION,
+                     "a quantised position table is not supported");
+            const float *row_pos = reinterpret_cast<const float *>(view.data) +
+                                   static_cast<size_t>(position) * H;
+            for (uint32_t i = 0; i < H; ++i) row[i] += row_pos[i];
+        }
+        Json fields = Json::object();
+        fields.set("position", start_position + t);
+        fields.set("token", static_cast<int64_t>(token));
+        fields.set("phase", std::string("prefill"));
+        fields.set("batch", static_cast<uint64_t>(batch));
+        trace_->event("token", std::move(fields));
+    }
+
+    // Batched projection: one weight row, every token.
+    auto project = [&](const std::string &name, const std::vector<float> &in,
+                       uint32_t in_dim, uint32_t out_dim, const std::string &op) {
+        const TensorView view = tensor_view(name);
+        std::vector<float> out(static_cast<size_t>(batch) * out_dim, 0.0f);
+        KernelConfig kernels;
+        kernels.requested = config_.backend.kernel_isa;
+        kernels.threads = config_.backend.kernel_threads;
+        // Stride the input at `in_dim`, which is the projection's own width: a
+        // shared batch buffer can be wider than the projection it feeds.
+        gemm_quant(kernels, view.type_id, view.data, in.data(), out.data(), batch, out_dim, in_dim);
+        backend_->record_control(op + ".batch",
+                                 static_cast<uint64_t>(out_dim) * in_dim * batch *
+                                     (view.type_id == 0 ? 4 : quant_geometry(view.type_id).block_bytes /
+                                                              quant_geometry(view.type_id).block_size),
+                                 static_cast<uint64_t>(out_dim) * batch * sizeof(float),
+                                 "cpu-batched");
+        return out;
+    };
+
+    const uint32_t kv_dim = c.kv_heads * c.head_dim;
+    const uint32_t v_dim = c.v_dim();
+    const uint32_t attn_out_dim = c.heads * c.head_v_dim();
+    const uint32_t kv_stride = kv_dim + v_dim;
+    const uint32_t group = c.heads / c.kv_heads;
+
+    for (uint32_t layer = 0; layer < c.layers; ++layer) {
+        const std::string prefix = "blk." + std::to_string(layer) + ".";
+        const std::string lp = "L" + std::to_string(layer);
+        // --- attention ------------------------------------------------------
+        const std::vector<float> h = norm_batch(x, H, prefix + "attn_norm",
+                                               "rmsnorm.attn." + lp);
+        // falcon's second pre-attention norm, as in the sequential path.
+        std::vector<float> h_attn;
+        const std::vector<float> *attn_h = &h;
+        if (c.attn_norm_2) {
+            h_attn = norm_batch(x, H, prefix + "attn_norm_2", "rmsnorm.attn2." + lp);
+            attn_h = &h_attn;
+        }
+        std::vector<float> qflat(static_cast<size_t>(batch) * attn_out_dim, 0.0f);
+        std::vector<float> kflat(static_cast<size_t>(batch) * kv_dim, 0.0f);
+        std::vector<float> vflat(static_cast<size_t>(batch) * kv_dim, 0.0f);
+        if (c.fused_qkv) {
+            const uint32_t fused_out = H + 2 * kv_dim;
+            const std::vector<float> both =
+                project(prefix + "attn_qkv.weight", *attn_h, H, fused_out, "attn_qkv." + lp);
+            for (uint32_t t = 0; t < batch; ++t) {
+                const float *src = both.data() + static_cast<size_t>(t) * fused_out;
+                std::memcpy(qflat.data() + static_cast<size_t>(t) * attn_out_dim, src,
+                            static_cast<size_t>(H) * sizeof(float));
+                std::memcpy(kflat.data() + static_cast<size_t>(t) * kv_dim, src + H,
+                            static_cast<size_t>(kv_dim) * sizeof(float));
+                std::memcpy(vflat.data() + static_cast<size_t>(t) * kv_dim, src + H + kv_dim,
+                            static_cast<size_t>(kv_dim) * sizeof(float));
+            }
+        } else {
+            qflat = project(prefix + "attn_q.weight", *attn_h, H, attn_out_dim, "attn_q." + lp);
+            kflat = project(prefix + "attn_k.weight", *attn_h, H, kv_dim, "attn_k." + lp);
+            vflat = project(prefix + "attn_v.weight", *attn_h, H, kv_dim, "attn_v." + lp);
+        }
+        for (uint32_t t = 0; t < batch; ++t) {
+            float *q = qflat.data() + static_cast<size_t>(t) * attn_out_dim;
+            float *k = kflat.data() + static_cast<size_t>(t) * kv_dim;
+            float *v = vflat.data() + static_cast<size_t>(t) * kv_dim;
+            if (c.projection_scales) {
+                std::vector<float> qv(q, q + attn_out_dim);
+                std::vector<float> kv_(k, k + kv_dim);
+                std::vector<float> vv(v, v + kv_dim);
+                apply_projection_scale(qv, prefix + "attn_q.scale", "attn_q_scale." + lp);
+                apply_projection_scale(kv_, prefix + "attn_k.scale", "attn_k_scale." + lp);
+                apply_projection_scale(vv, prefix + "attn_v.scale", "attn_v_scale." + lp);
+                std::memcpy(q, qv.data(), qv.size() * sizeof(float));
+                std::memcpy(k, kv_.data(), kv_.size() * sizeof(float));
+                std::memcpy(v, vv.data(), vv.size() * sizeof(float));
+            }
+            if (c.attn_qkv_bias) {
+                if (c.fused_qkv) {
+                    const float *b = bias_weights(prefix + "attn_qkv.bias");
+                    for (uint32_t i = 0; i < attn_out_dim; ++i) q[i] += b[i];
+                    for (uint32_t i = 0; i < kv_dim; ++i) {
+                        k[i] += b[attn_out_dim + i];
+                        v[i] += b[attn_out_dim + kv_dim + i];
+                    }
+                } else {
+                    const float *bq = bias_weights(prefix + "attn_q.bias");
+                    const float *bk = bias_weights(prefix + "attn_k.bias");
+                    const float *bv = bias_weights(prefix + "attn_v.bias");
+                    for (uint32_t i = 0; i < attn_out_dim; ++i) q[i] += bq[i];
+                    for (uint32_t i = 0; i < kv_dim; ++i) {
+                        k[i] += bk[i];
+                        v[i] += bv[i];
+                    }
+                }
+            }
+            if (c.qk_norm) {
+                const float *qs = norm_weights(prefix + "attn_q_norm.weight");
+                const float *ks = norm_weights(prefix + "attn_k_norm.weight");
+                auto head_norm = [&](float *vec, uint32_t heads, const float *scale) {
+                    for (uint32_t hh = 0; hh < heads; ++hh) {
+                        float *base = vec + static_cast<size_t>(hh) * c.head_dim;
+                        double ss = 0.0;
+                        for (uint32_t j = 0; j < c.head_dim; ++j)
+                            ss += static_cast<double>(base[j]) * base[j];
+                        const double s = 1.0 / std::sqrt(ss / c.head_dim + c.rms_eps);
+                        for (uint32_t j = 0; j < c.head_dim; ++j)
+                            base[j] = static_cast<float>(base[j] * s * scale[j]);
+                    }
+                };
+                head_norm(q, c.heads, qs);
+                head_norm(k, c.kv_heads, ks);
+                backend_->record_control("qk_norm." + lp,
+                                         static_cast<uint64_t>(attn_out_dim + kv_dim) * sizeof(float),
+                                         0);
+            }
+        }
+        const uint64_t position0 = start_position;
+        // Rotary, then the per-position temperature, then the cache write: the
+        // same order `forward_token` uses, and the cache is complete before any
+        // attention is read so a token sees its own key.
+        const bool rotate = !c.rope_disabled &&
+                            (c.no_rope_layer_step == 0 ||
+                             (layer + 1) % c.no_rope_layer_step != 0);
+        const size_t cache_slot = static_cast<size_t>(c.attention_slot(layer));
+        for (uint32_t t = 0; t < batch; ++t) {
+            std::vector<float> q(qflat.begin() + static_cast<size_t>(t) * attn_out_dim,
+                                 qflat.begin() + static_cast<size_t>(t + 1) * attn_out_dim);
+            std::vector<float> k(kflat.begin() + static_cast<size_t>(t) * kv_dim,
+                                 kflat.begin() + static_cast<size_t>(t + 1) * kv_dim);
+            const uint64_t position = position0 + t;
+            if (rotate) rope_half(q, c.heads, k, c.kv_heads, position);
+            if (c.attn_temp_scale != 0.0) {
+                const double temperature =
+                    std::log(std::floor(static_cast<double>(position) / c.attn_temp_floor) + 1.0) *
+                        c.attn_temp_scale +
+                    1.0;
+                for (float &value : q) value = static_cast<float>(value * temperature);
+            }
+            std::memcpy(qflat.data() + static_cast<size_t>(t) * attn_out_dim, q.data(),
+                        q.size() * sizeof(float));
+            std::memcpy(kflat.data() + static_cast<size_t>(t) * kv_dim, k.data(),
+                        k.size() * sizeof(float));
+            const size_t base =
+                (cache_slot * c.context + position) * kv_stride;
+            std::memcpy(kv_ + base, k.data(), static_cast<size_t>(kv_dim) * sizeof(float));
+            std::memcpy(kv_ + base + kv_dim,
+                        vflat.data() + static_cast<size_t>(t) * kv_dim,
+                        static_cast<size_t>(v_dim) * sizeof(float));
+        }
+        // Attention per token, against the cache that now holds the whole batch.
+        std::vector<float> attention(static_cast<size_t>(batch) * attn_out_dim, 0.0f);
+        std::vector<double> alibi_slopes;
+        if (c.alibi_max_bias > 0.0 && c.heads > 0) {
+            uint32_t n_head_log2 = 1;
+            while (n_head_log2 * 2 <= c.heads) n_head_log2 *= 2;
+            const double m0 = std::pow(2.0, -(c.alibi_max_bias) / n_head_log2);
+            const double m1 = std::pow(2.0, -(c.alibi_max_bias / 2.0) / n_head_log2);
+            alibi_slopes.resize(c.heads);
+            for (uint32_t hh = 0; hh < c.heads; ++hh)
+                alibi_slopes[hh] =
+                    hh < n_head_log2
+                        ? std::pow(m0, static_cast<double>(hh) + 1.0)
+                        : std::pow(m1, 2.0 * static_cast<double>(hh - n_head_log2) + 1.0);
+        }
+        for (uint32_t t = 0; t < batch; ++t) {
+            const uint64_t position = position0 + t;
+            const float *q = qflat.data() + static_cast<size_t>(t) * attn_out_dim;
+            const bool windowed = c.layer_uses_window(layer);
+            const uint64_t first_visible =
+                !windowed || position < c.sliding_window ? 0 : position + 1 - c.sliding_window;
+            std::vector<float> attn_row(attn_out_dim, 0.0f);
+            double scale = 1.0 / std::sqrt(static_cast<double>(c.head_dim));
+            for (uint32_t head = 0; head < c.heads; ++head) {
+                const size_t hb = static_cast<size_t>(head) * c.head_dim;
+                const size_t kvb = static_cast<size_t>(head / group) * c.head_dim;
+                std::vector<float> score_floats;
+                score_floats.reserve(position + 1 - first_visible);
+                for (uint64_t tt = first_visible; tt <= position; ++tt) {
+                    const size_t sbase = (cache_slot * c.context + tt) * kv_stride;
+                    const float *kt = kv_ + sbase + kvb;
+                    double dot = 0.0;
+                    for (uint32_t j = 0; j < c.head_dim; ++j)
+                        dot += static_cast<double>(q[hb + j]) * kt[j];
+                    double value = dot * scale;
+                    if (c.attn_logit_softcap > 0.0)
+                        value = c.attn_logit_softcap * std::tanh(value / c.attn_logit_softcap);
+                    if (!alibi_slopes.empty())
+                        value += alibi_slopes[head] * -static_cast<double>(position - tt);
+                    score_floats.push_back(static_cast<float>(value));
+                }
+                if (c.attn_sinks) {
+                    const float *sinks = norm_weights(prefix + "attn_sinks.weight");
+                    score_floats.push_back(sinks[head]);
+                }
+                const std::vector<float> probs = softmax(score_floats);
+                std::vector<double> acc(c.head_v_dim(), 0.0);
+                const size_t vb = static_cast<size_t>(head / group) * c.head_v_dim();
+                for (uint64_t tt = first_visible; tt <= position; ++tt) {
+                    const size_t sbase = (cache_slot * c.context + tt) * kv_stride;
+                    const float *vt = kv_ + sbase + kv_dim + vb;
+                    const double p = probs[tt - first_visible];
+                    for (uint32_t j = 0; j < c.head_v_dim(); ++j) acc[j] += p * vt[j];
+                }
+                const size_t ab = static_cast<size_t>(head) * c.head_v_dim();
+                for (uint32_t j = 0; j < c.head_v_dim(); ++j)
+                    attn_row[ab + j] = static_cast<float>(acc[j]);
+            }
+            std::memcpy(attention.data() + static_cast<size_t>(t) * attn_out_dim, attn_row.data(),
+                        attn_row.size() * sizeof(float));
+        }
+        backend_->record_control("attention." + lp, kv_stride * batch * sizeof(float),
+                                 attention.size() * sizeof(float));
+        std::vector<float> attn_out =
+            project(prefix + "attn_output.weight", attention, attn_out_dim, H, "attn_output." + lp);
+        for (uint32_t t = 0; t < batch; ++t) {
+            std::vector<float> row(attn_out.begin() + static_cast<size_t>(t) * H,
+                                   attn_out.begin() + static_cast<size_t>(t + 1) * H);
+            if (c.projection_scales)
+                apply_projection_scale(row, prefix + "attn_output.scale", "attn_output_scale." + lp);
+            if (c.attn_output_bias) {
+                const float *b = bias_weights(prefix + "attn_output.bias");
+                for (uint32_t i = 0; i < H; ++i) row[i] += b[i];
+            }
+            if (c.post_norms) {
+                std::vector<float> normed(H, 0.0f);
+                norm_row(row.data(), H, prefix + "attn_post_norm", normed.data(),
+                         "rmsnorm.attn_post." + lp, batch);
+                row.swap(normed);
+            }
+            float *xt = x.data() + static_cast<size_t>(t) * H;
+            for (uint32_t i = 0; i < H; ++i) xt[i] += row[i];
+        }
+        if (!c.layer_has_ffn(layer)) continue;
+        // --- feed-forward ---------------------------------------------------
+        const std::vector<float> h2 = norm_batch(x, H, prefix + "ffn_norm",
+                                                "rmsnorm.ffn." + lp);
+        std::vector<float> down;
+        if (c.ffn_no_gate) {
+            std::vector<float> up = project(prefix + "ffn_up.weight", h2, H, c.intermediate,
+                                            "ffn_up." + lp);
+            for (uint32_t t = 0; t < batch; ++t) {
+                float *row = up.data() + static_cast<size_t>(t) * c.intermediate;
+                if (c.ffn_bias) {
+                    const float *b = bias_weights(prefix + "ffn_up.bias");
+                    for (uint32_t i = 0; i < c.intermediate; ++i) row[i] += b[i];
+                }
+                for (uint32_t i = 0; i < c.intermediate; ++i) row[i] = pointwise_activation(c, row[i]);
+            }
+            backend_->record_control(c.activation + "." + lp,
+                                     static_cast<uint64_t>(c.intermediate) * batch * sizeof(float), 0);
+            down = project(prefix + "ffn_down.weight", up, c.intermediate, H, "ffn_down." + lp);
+        } else {
+            std::vector<float> gate;
+            std::vector<float> up;
+            if (c.fused_gate_up) {
+                const std::vector<float> both =
+                    project(prefix + "ffn_up.weight", h2, H, 2 * c.intermediate, "ffn_gate_up." + lp);
+                gate.resize(static_cast<size_t>(batch) * c.intermediate);
+                up.resize(static_cast<size_t>(batch) * c.intermediate);
+                for (uint32_t t = 0; t < batch; ++t) {
+                    const float *src = both.data() + static_cast<size_t>(t) * 2 * c.intermediate;
+                    std::memcpy(gate.data() + static_cast<size_t>(t) * c.intermediate, src,
+                                static_cast<size_t>(c.intermediate) * sizeof(float));
+                    std::memcpy(up.data() + static_cast<size_t>(t) * c.intermediate,
+                                src + c.intermediate,
+                                static_cast<size_t>(c.intermediate) * sizeof(float));
+                }
+            } else {
+                gate = project(prefix + "ffn_gate.weight", h2, H, c.intermediate, "ffn_gate." + lp);
+                up = project(prefix + "ffn_up.weight", h2, H, c.intermediate, "ffn_up." + lp);
+            }
+            std::vector<float> act(static_cast<size_t>(batch) * c.intermediate, 0.0f);
+            for (uint32_t t = 0; t < batch; ++t) {
+                float *g = gate.data() + static_cast<size_t>(t) * c.intermediate;
+                float *u = up.data() + static_cast<size_t>(t) * c.intermediate;
+                float *a = act.data() + static_cast<size_t>(t) * c.intermediate;
+                if (c.ffn_gate_bias) {
+                    const float *b = bias_weights(prefix + "ffn_gate.bias");
+                    for (uint32_t i = 0; i < c.intermediate; ++i) g[i] += b[i];
+                }
+                if (c.ffn_bias) {
+                    const float *b = bias_weights(prefix + "ffn_up.bias");
+                    for (uint32_t i = 0; i < c.intermediate; ++i) u[i] += b[i];
+                }
+                if (c.projection_scales) {
+                    std::vector<float> gv(g, g + c.intermediate);
+                    std::vector<float> uv(u, u + c.intermediate);
+                    apply_projection_scale(gv, prefix + "ffn_gate.scale", "ffn_gate_scale." + lp);
+                    apply_projection_scale(uv, prefix + "ffn_up.scale", "ffn_up_scale." + lp);
+                    std::memcpy(g, gv.data(), gv.size() * sizeof(float));
+                    std::memcpy(u, uv.data(), uv.size() * sizeof(float));
+                }
+                for (uint32_t i = 0; i < c.intermediate; ++i)
+                    a[i] = gated_activation(c, g[i], u[i], layer);
+            }
+            backend_->record_control("swiglu." + lp,
+                                     static_cast<uint64_t>(c.intermediate) * batch * sizeof(float) * 2,
+                                     static_cast<uint64_t>(c.intermediate) * batch * sizeof(float));
+            down = project(prefix + "ffn_down.weight", act, c.intermediate, H, "ffn_down." + lp);
+        }
+        for (uint32_t t = 0; t < batch; ++t) {
+            float *row = down.data() + static_cast<size_t>(t) * H;
+            if (c.ffn_bias) {
+                const float *b = bias_weights(prefix + "ffn_down.bias");
+                for (uint32_t i = 0; i < H; ++i) row[i] += b[i];
+            }
+            if (c.projection_scales) {
+                std::vector<float> rv(row, row + H);
+                apply_projection_scale(rv, prefix + "ffn_down.scale", "ffn_down_scale." + lp);
+                std::memcpy(row, rv.data(), rv.size() * sizeof(float));
+            }
+            if (c.post_norms) {
+                std::vector<float> normed(H, 0.0f);
+                norm_row(row, H, prefix + "ffn_post_norm", normed.data(),
+                         "rmsnorm.ffn_post." + lp, batch);
+                std::memcpy(row, normed.data(), static_cast<size_t>(H) * sizeof(float));
+            }
+            float *xt = x.data() + static_cast<size_t>(t) * H;
+            for (uint32_t i = 0; i < H; ++i) xt[i] += row[i];
+        }
+    }
+
+    // Only the last token's logits are needed, and every earlier position's
+    // head would be discarded.
+    const float *last = x.data() + static_cast<size_t>(batch - 1) * H;
+    std::vector<float> final_norm(H, 0.0f);
+    norm_row(last, H, "output_norm", final_norm.data(), "output_norm.final", 1);
+    std::vector<float> logits = matvec_view(tensor_view("output.weight"), final_norm, c.vocab,
+                                            H, "output_head");
+    if (c.logit_bias) {
+        const float *b = bias_weights("output.bias");
+        for (uint32_t i = 0; i < c.vocab; ++i) logits[i] += b[i];
+    }
+    if (c.final_logit_softcap > 0.0) {
+        for (float &value : logits)
+            value = static_cast<float>(c.final_logit_softcap *
+                                       std::tanh(static_cast<double>(value) / c.final_logit_softcap));
+    }
+    return logits;
+}
+
 PromptResult Engine::run_prompt(const std::string &prompt, uint32_t generated_tokens) {
     if (!initialized_) fail(ErrorCode::INTERNAL_ERROR, "engine is not initialized");
     PromptResult result;
@@ -1646,9 +2154,20 @@ PromptResult Engine::run_prompt(const std::string &prompt, uint32_t generated_to
     Timer prefill_timer;
     std::vector<float> logits;
     uint64_t position = 0;
-    for (int32_t token : result.input_ids) {
-        logits = forward_token(token, position, "prefill", &result.routing);
-        ++position;
+    if (config_.backend.batched_prefill && supports_batched_prefill()) {
+        // One pass over the whole prompt: every weight row is fetched once
+        // rather than once per token. The result is the same arithmetic in the
+        // same order per token, which is what the parity goldens check.
+        const std::vector<int32_t> prompt_ids(result.input_ids.begin(), result.input_ids.end());
+        logits = prefill_batch(prompt_ids, 0);
+        position = prompt_ids.size();
+        backend_->record_control("prefill_batched", prompt_ids.size() * sizeof(int32_t),
+                                 logits.size() * sizeof(float), "cpu-batched");
+    } else {
+        for (int32_t token : result.input_ids) {
+            logits = forward_token(token, position, "prefill", &result.routing);
+            ++position;
+        }
     }
     result.prefill_logits = logits;
     result.prefill_ms = prefill_timer.elapsed_ms();

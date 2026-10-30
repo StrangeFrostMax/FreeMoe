@@ -136,6 +136,10 @@ struct BackendConfig {
     // Test-only: forces the detection branch on non-Zen-3 CI hosts.
     // Never set by the CLI or normal engine configuration.
     bool test_simulate_zen3 = false;
+    // Prefill in one batched pass instead of one token at a time. On by
+    // default; `--prefill sequential` pins the old path, which is also what a
+    // checkpoint with a different block (MLA, recurrent, MoE) still uses.
+    bool batched_prefill = true;
 };
 
 class Backend {

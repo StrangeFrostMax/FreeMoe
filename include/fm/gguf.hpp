@@ -99,6 +99,9 @@ enum class TensorRole : uint32_t {
     ATTN_SINKS,
     ROPE_FREQS,
     ATTN_K_NORM,
+    POSITION_EMBD,
+    ATTN_NORM_2,
+    ATTN_NORM_2_BIAS,
     TOKEN_EMBD_NORM,
     TOKEN_EMBD_NORM_BIAS,
     ATTN_POST_NORM,
@@ -294,6 +297,14 @@ struct ModelConfig {
     // `load_arch_hparams`; jais reads the key. 0 means "no bias", which is every
     // other family.
     double alibi_max_bias = 0.0;
+    // Absolute learned position embeddings (`position_embd.weight`, one row per
+    // context position) added to the token embedding. gpt2 and starcoder have no
+    // rotary position at all: the position is a vector in the residual stream.
+    bool position_embd = false;
+    // falcon-40b normalises the block input twice: `attn_norm_2` feeds the
+    // attention projections. When the tensor is absent (falcon-7b) the attention
+    // reads `attn_norm` like every other block.
+    bool attn_norm_2 = false;
     // bloom normalises the token embedding once, before the first block
     // (`blk`-less `token_embd_norm`), which no other mapped family does.
     bool token_embd_norm = false;

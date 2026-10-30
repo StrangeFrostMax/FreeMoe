@@ -322,6 +322,13 @@ def load_model(path: Path) -> dict[str, Any]:
     # bloom normalises the embedding once before block 0. The tensor has no
     # `blk.N.` prefix, so `has()` (which prefixes) cannot see it.
     cfg["token_embd_norm"] = "token_embd_norm.weight" in tensors
+    # An absolute learned position table (gpt2, starcoder): the position is a
+    # vector added to the token embedding, and neither rotates anything.
+    cfg["position_embd"] = "position_embd.weight" in tensors
+    # falcon-40b's second pre-attention norm.
+    cfg["attn_norm_2"] = "blk.%d.attn_norm_2.weight" % probe in tensors
+    if cfg["position_embd"]:
+        cfg["rope_disabled"] = True
     if cfg["ffn_no_gate"]:
         # A gate-free FFN cannot say which activation it means, so the
         # architecture has to. Read from llama.cpp's model files: both phi2 and
@@ -332,6 +339,7 @@ def load_model(path: Path) -> dict[str, Any]:
         seq_activation = {"phi2": "gelu", "gptneox": "gelu",
                           "codeshell": "gelu", "starcoder2": "gelu",
                           "pockettts": "gelu", "bloom": "gelu",
+                          "gpt2": "gelu", "starcoder": "gelu", "falcon": "gelu", "mpt": "gelu",
                           "arcee": "relu_sq", "nemotron": "relu_sq",
                           "jais2": "relu_sq", "plm": "relu_sq"}
         if arch not in seq_activation:
@@ -840,10 +848,21 @@ class Session:
         if cfg["token_embd_norm"]:
             # bloom's pre-block embedding norm (models/bloom.cpp).
             x = norm_of(x, "token_embd_norm")
+        if cfg["position_embd"]:
+            table = self.tensor("position_embd.weight")
+            if self.pos >= len(table) // H:
+                raise ReferenceError("position outside the checkpoint's position table")
+            base = self.pos * H
+            x = [x[i] + table[base + i] for i in range(H)]
 
         for layer in range(cfg["L"]):
             p = f"blk.{layer}."
             h = norm_of(x, p + "attn_norm")
+            # falcon-40b normalises the attention input a second time; the FFN
+            # and the residual keep reading `attn_norm`.
+            attn_h = (norm_of(x, p + "attn_norm_2") if (cfg["attn_norm_2"] and
+                                                       p + "attn_norm_2.weight" in self.tensors)
+                      else h)
             if TRACE is not None:
                 TRACE[f"h.L{layer}"] = list(h)
             attn_normed = list(h) if cfg["parallel_residual"] else None
@@ -864,13 +883,13 @@ class Session:
                     nope = hd - cfg["rope_dim"]
                     head_v = cfg["head_v"]
                     if cfg["q_lora_rank"]:
-                        qa = matvec(self.tensor(p + "attn_q_a.weight"), h, cfg["q_lora_rank"], H)
+                        qa = matvec(self.tensor(p + "attn_q_a.weight"), attn_h, cfg["q_lora_rank"], H)
                         qa = rmsnorm(qa, self.tensor(p + "attn_q_a_norm.weight"), cfg["eps"])
                         q = matvec(self.tensor(p + "attn_q_b.weight"), qa, heads * hd,
                                    cfg["q_lora_rank"])
                     else:
-                        q = matvec(self.tensor(p + "attn_q.weight"), h, heads * hd, H)
-                    kvpe = matvec(self.tensor(p + "attn_kv_a_mqa.weight"), h,
+                        q = matvec(self.tensor(p + "attn_q.weight"), attn_h, heads * hd, H)
+                    kvpe = matvec(self.tensor(p + "attn_kv_a_mqa.weight"), attn_h,
                                   latent + cfg["rope_dim"], H)
                     ckv = rmsnorm(kvpe[:latent], self.tensor(p + "attn_kv_a_norm.weight"), cfg["eps"])
                     kpe = kvpe[latent:]
@@ -900,7 +919,7 @@ class Session:
                     k = k_vec
                     v = v_vec
                 elif cfg["fused_qkv"]:
-                    fused = matvec(self.tensor(p + "attn_qkv.weight"), h, H + 2 * kv_dim, H)
+                    fused = matvec(self.tensor(p + "attn_qkv.weight"), attn_h, H + 2 * kv_dim, H)
                     if cfg["qkv_bias"]:
                         bias = self.tensor(p + "attn_qkv.bias")
                         fused = [fused[i] + bias[i] for i in range(H + 2 * kv_dim)]
@@ -908,9 +927,9 @@ class Session:
                     k = fused[H:H + kv_dim]
                     v = fused[H + kv_dim:]
                 else:
-                    q = matvec(self.tensor(p + "attn_q.weight"), h, H, H)
-                    k = matvec(self.tensor(p + "attn_k.weight"), h, kv_dim, H)
-                    v = matvec(self.tensor(p + "attn_v.weight"), h, kv_dim, H)
+                    q = matvec(self.tensor(p + "attn_q.weight"), attn_h, H, H)
+                    k = matvec(self.tensor(p + "attn_k.weight"), attn_h, kv_dim, H)
+                    v = matvec(self.tensor(p + "attn_v.weight"), attn_h, kv_dim, H)
                     if cfg["proj_scales"]:
                         # Before the bias and before RoPE, exactly as build_lora_mm
                         # folds the scale into the projection.

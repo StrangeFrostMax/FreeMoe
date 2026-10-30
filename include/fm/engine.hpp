@@ -163,6 +163,15 @@ public:
     // the checkpoint nor the built-in table provides a template.
     ChatRender render_chat(const std::vector<ChatMessage> &messages, bool add_generation_prompt,
                            const std::string &template_override) const;
+    // Batched prefill. `forward_token` evaluates one token at a time, which
+    // re-reads every weight row once per prompt token; `prefill_batch` runs the
+    // same block arithmetic for the whole prompt at once so each row is fetched
+    // once. It covers the dense families and declines everything whose block
+    // differs structurally (MLA, recurrent layers, routed experts, BitNet's
+    // sub-norms, phi2's parallel residual, gpt-oss's post-norm FFN input,
+    // mistral3's adaptive norm); `run_prompt` falls back per checkpoint.
+    bool supports_batched_prefill() const;
+    std::vector<float> prefill_batch(const std::vector<int32_t> &tokens, uint64_t start_position);
     const ModelManifest &manifest() const { return manifest_; }
     const GGUFDocument &document() const { return doc_; }
     Backend &backend() { return *backend_; }
