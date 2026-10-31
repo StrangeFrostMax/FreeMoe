@@ -1,5 +1,5 @@
 {
- "adapter_rows": 75,
+ "adapter_rows": 79,
  "blocked_by_capability": {
   "C-ALTUP": [
    "gemma3n"
@@ -72,9 +72,9 @@
  },
  "counts": {
   "blocked": 36,
-  "mapped": 69,
+  "mapped": 73,
   "mapped-caveat": 2,
-  "unclassified": 64
+  "unclassified": 60
  },
  "files": 171,
  "method": "graph-marker scan; a verdict is not evidence a family runs",
@@ -696,13 +696,8 @@
     "router-bias",
     "shared-expert"
    ],
-   "nearest": {
-    "arch": "openai-moe",
-    "extra": [],
-    "similarity": 0.929
-   },
    "tolerated": [],
-   "verdict": "unclassified"
+   "verdict": "mapped"
   },
   {
    "arch": "exaone",
@@ -771,13 +766,8 @@
     "shared-expert",
     "sinks"
    ],
-   "nearest": {
-    "arch": "openai-moe",
-    "extra": [],
-    "similarity": 0.929
-   },
    "tolerated": [],
-   "verdict": "unclassified"
+   "verdict": "mapped"
   },
   {
    "arch": "gemma-embedding",
@@ -1164,13 +1154,8 @@
     "qk-norm",
     "shared-expert"
    ],
-   "nearest": {
-    "arch": "ernie4-5-moe",
-    "extra": [],
-    "similarity": 1.0
-   },
    "tolerated": [],
-   "verdict": "unclassified"
+   "verdict": "mapped"
   },
   {
    "arch": "hunyuan-vl",
@@ -1379,11 +1364,11 @@
     "shared-expert"
    ],
    "nearest": {
-    "arch": "openai-moe",
+    "arch": "flint",
     "extra": [
      "ggml_argsort_top_k"
     ],
-    "similarity": 0.812
+    "similarity": 0.875
    },
    "tolerated": [],
    "verdict": "unclassified"
@@ -1579,9 +1564,9 @@
     "qk-norm"
    ],
    "nearest": {
-    "arch": "openai-moe",
+    "arch": "flint",
     "extra": [],
-    "similarity": 0.929
+    "similarity": 1.0
    },
    "tolerated": [],
    "verdict": "unclassified"
@@ -1637,13 +1622,8 @@
     "moe",
     "qk-norm"
    ],
-   "nearest": {
-    "arch": "openai-moe",
-    "extra": [],
-    "similarity": 1.0
-   },
    "tolerated": [],
-   "verdict": "unclassified"
+   "verdict": "mapped"
   },
   {
    "arch": "mellum",
