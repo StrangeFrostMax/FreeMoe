@@ -84,11 +84,14 @@ void resolve_rope_scaling(ModelConfig &cfg) {
     cfg.rope_mscale = mscale * cfg.rope_scaling_attn_factor;
 }
 
-void RopePlan::init(const ModelConfig &cfg, uint32_t n_dims) {
+void RopePlan::init(const ModelConfig &cfg, uint32_t n_dims, double base_override) {
     this->n_dims = n_dims;
     sections = cfg.rope_sections;
     interleaved_sections = cfg.mrope_interleaved;
-    freq_base = cfg.rope_theta > 0.0 ? cfg.rope_theta : 10000.0;
+    // A windowed layer can rotate at its own base (`rope.freq_base_swa`); the
+    // caller passes it, and 0 means "use the file's single base".
+    freq_base = base_override > 0.0 ? base_override
+                                    : (cfg.rope_theta > 0.0 ? cfg.rope_theta : 10000.0);
     freq_scale = cfg.rope_freq_scale > 0.0 ? cfg.rope_freq_scale : 1.0;
     ext_factor = cfg.rope_ext_factor;
     mscale = cfg.rope_mscale;

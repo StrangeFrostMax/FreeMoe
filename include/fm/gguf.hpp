@@ -285,6 +285,18 @@ struct ModelConfig {
     // `n_no_rope_layer_step = 4`, i.e. layer 3, 7, …). 0 means "every layer
     // rotates", which is what all but that family do.
     uint32_t no_rope_layer_step = 0;
+    // Some files state the same fact per layer instead of by period
+    // (`*.attention.rope_pattern`, flint), and a file may switch the rotation off
+    // on layers that are otherwise ordinary. Empty means "no per-layer statement",
+    // in which case `no_rope_layer_step` still applies. An explicit pattern wins:
+    // it is the only evidence that names the layers.
+    std::vector<uint8_t> rope_layers;
+    bool layer_has_rope(uint32_t layer) const {
+        if (!rope_layers.empty())
+            return layer < rope_layers.size() && rope_layers[layer] != 0;
+        if (no_rope_layer_step == 0) return true;
+        return (layer + 1) % no_rope_layer_step != 0;
+    }
     // Multiplier applied to the token embedding before the first block.
     // gemma uses sqrt(hidden); minicpm uses a fixed 12.0 unless the file says
     // otherwise. 1.0 means "no scaling", so this is off for llama-family.
@@ -601,6 +613,16 @@ struct ModelConfig {
     // reads the keys, so the defaults are what a real checkpoint runs with.
     double rope_yarn_beta_fast = 32.0;
     double rope_yarn_beta_slow = 1.0;
+    // A windowed layer may rotate at its own base (`*.rope.freq_base_swa`): the
+    // short-context layers see a shorter period, so a checkpoint can train them
+    // with a different one. Empty means the file states no second base, which is
+    // the usual case. Indexed by layer, because which layers are windowed is the
+    // file's sliding-window pattern rather than a period.
+    std::vector<double> rope_theta_layers;
+    double layer_rope_theta(uint32_t layer) const {
+        if (rope_theta_layers.empty()) return rope_theta;
+        return layer < rope_theta_layers.size() ? rope_theta_layers[layer] : rope_theta;
+    }
     // mRoPE: `{arch}.rope.dimension_sections`, four counts of rotary *pairs*
     // assigned to the time, height, width and extra axes. llama.cpp enables
     // mRoPE only when the first two are non-zero, so a file that carries the key
@@ -632,6 +654,16 @@ struct ModelConfig {
     uint32_t expert_intermediate = 0;
 
     uint32_t expert_width() const { return expert_intermediate ? expert_intermediate : intermediate; }
+
+    // Some families state one expert width per layer
+    // (`expert_feed_forward_length` as an array: flint, exaone-moe, maple).
+    // Empty means one width for the whole file.
+    std::vector<uint32_t> expert_intermediate_layers;
+    uint32_t layer_expert_width(uint32_t layer) const {
+        if (!expert_intermediate_layers.empty() && layer < expert_intermediate_layers.size())
+            return expert_intermediate_layers[layer];
+        return expert_width();
+    }
 
     // phi2 is built differently enough to need four separate switches, and each
     // is evidence-driven: the norm type comes from which epsilon key the file

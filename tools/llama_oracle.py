@@ -61,6 +61,35 @@ def _window_layers(md: dict[str, Any], arch: str, n_layer: int, window: int) -> 
     return [(layer % period) != 0 for layer in range(n_layer)]
 
 
+def _rope_layers(md: dict[str, Any], arch: str, n_layer: int) -> list[bool]:
+    """Per-layer rotary on/off, from `attention.rope_pattern` (flint).
+
+    Empty means the file states no per-layer pattern, in which case the periodic
+    `no_rope_step` rule applies instead.
+    """
+    value = md.get(f"{arch}.attention.rope_pattern")
+    if value is None:
+        return []
+    return [bool(v) for v in value]
+
+
+def _rope_theta_layers(md: dict[str, Any], arch: str, n_layer: int, window: int,
+                       window_layers: list[bool], theta: float) -> list[float]:
+    """Per-layer rotary bases, from `rope.freq_base_swa`.
+
+    A windowed layer rotates at the second base and the rest at the file's single
+    one. Empty means the file states no second base.
+    """
+    swa = md.get(f"{arch}.rope.freq_base_swa")
+    if swa is None or float(swa) <= 0.0 or float(swa) == theta:
+        return []
+    layers = []
+    for layer in range(n_layer):
+        windowed = (window_layers[layer] if window_layers else True) if window else False
+        layers.append(float(swa) if windowed else theta)
+    return layers
+
+
 # The names llama.cpp has used for the two sandwich-normalisation tensors, plus
 # dbrx's `attn_out_norm`, which is the same slot: the norm written after the
 # attention residual that normalises the feed-forward input. The rename is applied
@@ -225,7 +254,9 @@ def load_model(path: Path) -> dict[str, Any]:
         "logit_scale_inverse": ((arch in ("granite", "granitemoe")) and
                                 float(key("logit_scale", 0.0)) != 0.0),
         "logit_scale_inverse_value": float(key("logit_scale", 0.0)),
-        "qk_norm_after_rope": arch == "talkie",
+        # talkie normalises q/k after the rope; so does hunyuan-moe
+        # (src/models/hunyuan-moe.cpp rotates first, then calls build_norm).
+        "qk_norm_after_rope": arch in ("talkie", "hunyuan-moe"),
         "qk_norm_eps": None,  # None -> the file's own epsilon
         # A block that normalises without scaling carries no norm tensor at all.
         "weightless_norm": (not has("attn_norm.weight") and
@@ -304,6 +335,24 @@ def load_model(path: Path) -> dict[str, Any]:
         # gpt-oss alternates full and windowed layers, so one model-wide window
         # would describe half the block wrongly. Empty means "every layer".
         "window_layers": _window_layers(md, arch, n_layer, int(key("attention.sliding_window", 0))),
+        # flint states which layers rotate at all, per layer. exaone-moe and
+        # maple have no such key: they rotate exactly where `is_swa(il)` holds,
+        # so the window pattern *is* the rotary pattern.
+        "rope_layers": (_rope_layers(md, arch, n_layer)
+                        or ([(layer % 4) != 0 for layer in range(n_layer)]
+                            if arch == "exaone-moe"
+                               and md.get(f"{arch}.attention.sliding_window_pattern") is None
+                               and int(key("attention.sliding_window", 0)) != 0
+                            else [])
+                        or (_window_layers(md, arch, n_layer,
+                                           int(key("attention.sliding_window", 0)))
+                            if arch in ("exaone-moe", "maple") else [])),
+        # A windowed layer may rotate at its own base (`rope.freq_base_swa`).
+        "theta_layers": _rope_theta_layers(md, arch, n_layer,
+                                           int(key("attention.sliding_window", 0)),
+                                           _window_layers(md, arch, n_layer,
+                                                          int(key("attention.sliding_window", 0))),
+                                           float(key("rope.freq_base", 10000.0))),
         # gpt-oss feeds the FFN from its post-attention norm and has no ffn_norm
         # tensor of its own.
         "ffn_norm_is_post": (has("attn_post_norm.weight") and not has("ffn_norm.weight")),
@@ -336,8 +385,14 @@ def load_model(path: Path) -> dict[str, Any]:
         "top_k": int(key("expert_used_count", 0)),
         # Routed experts and the shared expert can each be narrower than the
         # dense FFN, so the three widths are separate.
-        "I_exp": 0 if not has_attn else int(key("expert_feed_forward_length",
-                                           key("feed_forward_length"))),
+        # The width may be one number or one per layer (`get_key_or_arr`:
+        # flint, exaone-moe and maple all read `n_ff_exp_arr`).
+        "I_exp": (0 if not has_attn else
+                  int((lambda v: v[0] if isinstance(v, list) else v)(
+                      key("expert_feed_forward_length", key("feed_forward_length"))))),
+        "I_exp_layers": ([int(v) for v in md[f"{arch}.expert_feed_forward_length"]]
+                         if isinstance(md.get(f"{arch}.expert_feed_forward_length"), list)
+                         else []),
         "I_shexp": 0 if not has_attn else int(key("expert_shared_feed_forward_length",
                                              key("feed_forward_length"))),
         # Evidence, not architecture name: the tensors are what the forward pass
@@ -366,7 +421,8 @@ def load_model(path: Path) -> dict[str, Any]:
         "dense_lead": int(key("leading_dense_block_count", 0)),
         # Router semantics: the gating function, the selection bias and
         # group-limited routing all change which experts run.
-        "gating": ("softmax-weight" if arch == "gpt-oss" else
+        "gating": ("softmax" if arch == "maple" else
+                   "softmax-weight" if arch == "gpt-oss" else
                    {1: "softmax", 2: "sigmoid", 3: "softmax-weight",
                     4: "sqrt-softplus"}.get(
                         int(key("expert_gating_func", 2 if arch == "glm4-moe" else 1)),
@@ -383,8 +439,12 @@ def load_model(path: Path) -> dict[str, Any]:
         # engine applies.
         "expert_norm": (False if arch == "deepseek" else
                         bool(key("expert_weights_norm", False)) or
-                        arch in ("smallthinker", "dbrx", "ernie4-5-moe", "minimax-m2")),
-        "expert_scale": float(key("expert_weights_scale", 1.0)),
+                        arch in ("smallthinker", "dbrx", "ernie4-5-moe", "maple",
+                                 "minimax-m2")),
+        # maple passes both the scale and the gating function as constants too,
+        # so a file that carries either key must not change the arithmetic.
+        "expert_scale": (1.0 if arch == "maple"
+                         else float(key("expert_weights_scale", 1.0))),
     }
     # A block with up/down but no gate has no gated activation. GGUF cannot say
     # which activation, so phi2's GELU is applied and anything else is refused --
@@ -640,7 +700,7 @@ def expert_output(cfg: dict[str, Any], layer: int, expert: int,
     contiguous slice. The slice geometry comes from the declared shapes, never
     from an assumption about float sizes.
     """
-    H, I = cfg["H"], cfg["I_exp"]
+    H, I = cfg["H"], (cfg["I_exp_layers"][layer] if cfg["I_exp_layers"] else cfg["I_exp"])
     tensors = cfg["tensors"]
     if prefix + "ffn_gate.0.weight" in tensors:
         # Per-expert layout: one two-dimensional tensor per (expert, projection),
@@ -1078,12 +1138,18 @@ class Session:
                             q = qk_head_norm(q, heads, p + "attn_q_norm")
                             k = qk_head_norm(k, kv_heads, p + "attn_k_norm")
                     step = cfg["no_rope_step"]
-                    # jamba rotates nothing at all: upstream's attention layer
-                    # never calls the rope.
-                    if not cfg["rope_disabled"] and (step == 0 or (layer + 1) % step != 0):
-                        rope_half(q, hd, heads, self.pos, cfg["rope_dim"], cfg["theta"],
+                    # A per-layer pattern (`attention.rope_pattern`) is the only
+                    # evidence that names the layers, so it wins over the periodic
+                    # rule; jamba rotates nothing at all.
+                    pattern = cfg["rope_layers"]
+                    has_rope = (pattern[layer] if pattern
+                                else (step == 0 or (layer + 1) % step != 0))
+                    theta = (cfg["theta_layers"][layer]
+                             if cfg["theta_layers"] else cfg["theta"])
+                    if not cfg["rope_disabled"] and has_rope:
+                        rope_half(q, hd, heads, self.pos, cfg["rope_dim"], theta,
                                   cfg["rope_scale"], cfg["rope_freqs"])
-                        rope_half(k, hd, kv_heads, self.pos, cfg["rope_dim"], cfg["theta"],
+                        rope_half(k, hd, kv_heads, self.pos, cfg["rope_dim"], theta,
                                   cfg["rope_scale"], cfg["rope_freqs"])
                     # talkie normalises q and k after the rotation.
                     if cfg["qk_norm"] and cfg["qk_norm_after_rope"]:

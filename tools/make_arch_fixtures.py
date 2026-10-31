@@ -318,6 +318,10 @@ def arch_tensors(spec: dict[str, Any]) -> list[TensorSpec]:
             # narrower than the dense FFN, so the width is its own setting.
             experts = spec["experts"]
             ew = spec.get("expert_width", i)
+            if spec.get("expert_width_arr"):
+                # One width per layer (`get_key_or_arr`): flint, exaone-moe and
+                # maple all read it as an array when the file states one.
+                ew = spec["expert_width_arr"][layer]
             out += [tensor(p + "ffn_gate_inp.weight", [h, experts], 0.12)]
             if spec.get("per_expert_tensors"):
                 # Per-expert layout: one two-dimensional tensor per (expert,
@@ -527,7 +531,10 @@ def arch_metadata(spec: dict[str, Any]) -> dict[str, tuple[Any, ...]]:
     if spec.get("expert_groups"):
         md[f"{arch}.expert_group_count"] = ("u32", spec["expert_groups"])
         md[f"{arch}.expert_group_used_count"] = ("u32", spec["group_used"])
-    if spec.get("expert_width"):
+    if spec.get("expert_width_arr"):
+        md[f"{arch}.expert_feed_forward_length"] = (
+            "array_u32", [int(v) for v in spec["expert_width_arr"]])
+    elif spec.get("expert_width"):
         md[f"{arch}.expert_feed_forward_length"] = ("u32", spec["expert_width"])
     if spec.get("shared_expert"):
         md[f"{arch}.expert_shared_feed_forward_length"] = (
@@ -589,6 +596,20 @@ def arch_metadata(spec: dict[str, Any]) -> dict[str, tuple[Any, ...]]:
         # multiple of the period is windowed.
         md[f"{arch}.attention.sliding_window_pattern"] = (
             "u32", spec["sliding_window_pattern"])
+    if spec.get("sliding_window_pattern_arr") is not None:
+        # The per-layer form (`ml.get_arr`): one flag per layer, and the only
+        # spelling that can describe a pattern that is not periodic.
+        md[f"{arch}.attention.sliding_window_pattern"] = (
+            "array_u32", [int(v) for v in spec["sliding_window_pattern_arr"]])
+    if spec.get("rope_pattern") is not None:
+        # flint states which layers rotate at all, per layer. Written as 0/1
+        # integers, which is what a converted checkpoint carries.
+        md[f"{arch}.attention.rope_pattern"] = (
+            "array_u32", [int(v) for v in spec["rope_pattern"]])
+    if spec.get("rope_freq_base_swa") is not None:
+        # A windowed layer trained at a shorter period (maple reads it back
+        # through `get_rope_freq_base`).
+        md[f"{arch}.rope.freq_base_swa"] = ("f32", spec["rope_freq_base_swa"])
     if mtp_layers:
         # llama.cpp sizes per-layer arrays by `n_layer_all`, head layers included
         # (`get_key_or_arr(..., hparams.n_layer_all)`). The array form is written
@@ -1066,6 +1087,98 @@ SPECS: list[dict[str, Any]] = [
         "arch_metadata": {
             "expert_weights_scale": ("f32", 1.5),
         },
+    },
+    {
+        # exaone-moe (llama.cpp src/models/exaone-moe.cpp): the rope is called only
+        # on the windowed layers (`is_local_layer = hparams.is_swa(il)`), the q/k
+        # norms are one head wide and applied before it, the expert width is an
+        # array, and the shared expert is added ungated. The window pattern here is
+        # the period form (2), so exactly one of the three layers rotates; a reader
+        # that rotates every layer cannot match the golden.
+        "slug": "exaone-moe",
+        "arch": "exaone-moe",
+        "name": "FreeMoe synthetic exaone-moe rotating only on its windowed layer",
+        "layers": 3,
+        "kv_heads": 2,
+        "qk_norm": True,
+        "gating": 1,
+        "sliding_window": 12,
+        "sliding_window_pattern": 2,
+        "experts": 4,
+        "expert_used": 2,
+        "expert_width_arr": [40, 32, 48],
+        "shared_expert": True,
+        "shared_gate": False,
+        "shared_width": 24,
+        "arch_metadata": {
+            "expert_weights_scale": ("f32", 1.5),
+        },
+    },
+    {
+        # flint (llama.cpp src/models/flint.cpp): the rotary pattern is stated by
+        # the file (`attention.rope_pattern`) rather than derived from the window,
+        # so this fixture's two disagree on purpose: layers 0 and 2 rotate, layer 1
+        # does not. Attention sinks are required, the q/k norms are head wide, the
+        # expert width is per layer, the leading block is dense and the shared
+        # expert is added ungated.
+        "slug": "flint",
+        "arch": "flint",
+        "name": "FreeMoe synthetic flint with a file-stated rotary pattern",
+        "layers": 3,
+        "kv_heads": 2,
+        "qk_norm": True,
+        "attn_sinks": True,
+        "gating": 1,
+        "dense_lead": 1,
+        "sliding_window": 12,
+        "sliding_window_pattern_arr": [1, 0, 1],
+        "rope_pattern": [1, 0, 1],
+        "experts": 4,
+        "expert_used": 2,
+        "expert_width_arr": [40, 40, 32],
+        "shared_expert": True,
+        "shared_gate": False,
+        "shared_width": 24,
+        "arch_metadata": {
+            "expert_weights_scale": ("f32", 1.25),
+        },
+    },
+    {
+        # maple (llama.cpp src/models/maple.cpp): rotates only on the windowed
+        # layers, and those layers get their own base (`rope.freq_base_swa`, read
+        # back through `get_rope_freq_base(cparams, il)`), so a reader that applies
+        # one base everywhere is wrong for half the stack. The router's
+        # renormalisation, its scale and the gating function are constants upstream;
+        # the file states none of them. The per-layer SwiGLU bound is stated.
+        "slug": "maple",
+        "arch": "maple",
+        "name": "FreeMoe synthetic maple with a windowed-layer rotary base",
+        "layers": 3,
+        "kv_heads": 2,
+        "qk_norm": True,
+        "sliding_window": 12,
+        "sliding_window_pattern_arr": [0, 1, 1],
+        "rope_freq_base_swa": 5000.0,
+        "swiglu_clamp": [0.0, 0.8, 1.4],
+        "experts": 4,
+        "expert_used": 2,
+        "expert_width_arr": [40, 32, 40],
+    },
+    {
+        # hunyuan-moe (llama.cpp src/models/hunyuan-moe.cpp): one layer runs both a
+        # dense MLP and the routed experts and sums them, with the dense branch read
+        # from the `*_shexp` tensors at the shared width. q and k are normalised
+        # *after* the rotation, which is the opposite of every other family here.
+        "slug": "hunyuan-moe",
+        "arch": "hunyuan-moe",
+        "name": "FreeMoe synthetic hunyuan-moe summing a dense MLP with the experts",
+        "kv_heads": 2,
+        "qk_norm": True,
+        "experts": 4,
+        "expert_used": 2,
+        "expert_width": 40,
+        "shared_expert": True,
+        "shared_gate": False,
     },
     {
         # baichuan 13B (llama.cpp src/models/baichuan.cpp): the block is chosen by

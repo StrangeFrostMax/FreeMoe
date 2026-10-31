@@ -263,8 +263,10 @@ private:
     std::mt19937_64 &rng() { return rng_; }
     std::vector<uint32_t> topk(const std::vector<float> &scores, uint32_t k) const;
     std::vector<float> softmax(const std::vector<float> &values) const;
+    // `freq_base` is the layer's rotary base (0 = the file's single base); a
+    // windowed layer can carry its own (`rope.freq_base_swa`).
     void rope_half(std::vector<float> &q, uint32_t q_heads, std::vector<float> &k,
-                   uint32_t k_heads, uint64_t position) const;
+                   uint32_t k_heads, uint64_t position, double freq_base = 0.0) const;
     void read_reference_logits(const std::string &path, std::vector<float> &out) const;
     std::vector<int32_t> read_reference_ids(const std::string &path) const;
     std::vector<RoutingEvent> read_reference_routing(const std::string &path) const;
