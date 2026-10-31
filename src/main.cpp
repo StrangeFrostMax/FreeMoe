@@ -118,7 +118,10 @@ void print_usage() {
         "  --kernels auto|scalar|avx2|zen3|avx512 --threads N   # CPU kernel dispatch\n"
         "  --prefill batched|sequential                        # prompt evaluation\n"
         "      auto never picks AVX-512: the target is Zen 3, which has none\n"
-        "  --temperature X --top-k N --top-p X --seed N    # sampling (run only)\n"
+        "  --temperature X --top-k N --top-p X --min-p X --seed N   # sampling\n"
+        "  --repetition-penalty X --presence-penalty X --frequency-penalty X\n"
+        "  --penalty-window N (0 = whole history)  --logit-bias ID:+X,ID:-Y\n"
+        "  --n-probs N                                    # report N alternatives\n"
         "  --allow-cpu-fallback                    --force-direct-fallback\n"
         "  --test-simulate-zen3 (device-info only)# force Zen 3 fallback diagnostics\n"
         "  --trace path --metrics path --report path --run-id ID --results-dir path\n"
@@ -185,10 +188,56 @@ fm::RunConfig build_run_config(const Args &args) {
     cfg.sampling.top_k = args.get_u32("top-k", 0);
     cfg.sampling.top_p = args.get_double("top-p", 1.0);
     cfg.sampling.seed = args.get_u64("seed", 0);
+    cfg.sampling.min_p = args.get_double("min-p", 0.0);
+    cfg.sampling.repetition_penalty = args.get_double("repetition-penalty", 1.0);
+    cfg.sampling.presence_penalty = args.get_double("presence-penalty", 0.0);
+    cfg.sampling.frequency_penalty = args.get_double("frequency-penalty", 0.0);
+    cfg.sampling.penalty_window = args.get_u32("penalty-window", 0);
+    cfg.sampling.n_probs = args.get_u32("n-probs", 0);
     if (cfg.sampling.temperature < 0.0)
         fm::fail(fm::ErrorCode::INVALID_ARGUMENT, "--temperature must not be negative");
     if (cfg.sampling.top_p < 0.0 || cfg.sampling.top_p > 1.0)
         fm::fail(fm::ErrorCode::INVALID_ARGUMENT, "--top-p must be within [0, 1]");
+    if (cfg.sampling.min_p < 0.0 || cfg.sampling.min_p > 1.0)
+        fm::fail(fm::ErrorCode::INVALID_ARGUMENT, "--min-p must be within [0, 1]");
+    if (cfg.sampling.repetition_penalty <= 0.0)
+        fm::fail(fm::ErrorCode::INVALID_ARGUMENT, "--repetition-penalty must be positive");
+    // `--logit-bias 12:+4,900:-2.5` — llama.cpp's spelling of a per-token bias.
+    if (args.has("logit-bias")) {
+        const std::string spec = args.get("logit-bias");
+        size_t start = 0;
+        while (start <= spec.size()) {
+            const size_t comma = spec.find(',', start);
+            const std::string item =
+                spec.substr(start, comma == std::string::npos ? std::string::npos : comma - start);
+            if (!item.empty()) {
+                const size_t colon = item.find(':');
+                if (colon == std::string::npos)
+                    fm::fail(fm::ErrorCode::INVALID_ARGUMENT,
+                             "--logit-bias entries are <token>:<bias>, got '" + item + "'");
+                uint64_t token = 0;
+                double bias = 0.0;
+                try {
+                    size_t used = 0;
+                    token = std::stoull(item.substr(0, colon), &used, 0);
+                    if (used != colon)
+                        throw std::invalid_argument("trailing characters");
+                    used = 0;
+                    const std::string bias_text = item.substr(colon + 1);
+                    bias = std::stod(bias_text, &used);
+                    if (used != bias_text.size()) throw std::invalid_argument("trailing characters");
+                } catch (const std::exception &) {
+                    fm::fail(fm::ErrorCode::INVALID_ARGUMENT,
+                             "--logit-bias entry is not <token>:<bias>: '" + item + "'");
+                }
+                if (token > 0xffffffffull)
+                    fm::fail(fm::ErrorCode::INVALID_ARGUMENT, "--logit-bias token out of range");
+                cfg.sampling.logit_bias[static_cast<uint32_t>(token)] = bias;
+            }
+            if (comma == std::string::npos) break;
+            start = comma + 1;
+        }
+    }
     cfg.abs_tol = args.get_double("abs-tol", fm::DEFAULT_ABS_TOL);
     cfg.rel_tol = args.get_double("rel-tol", fm::DEFAULT_REL_TOL);
     return cfg;
@@ -467,9 +516,34 @@ int command_run(const Args &args) {
     for (int32_t id : result.generated_ids) generated.push(Json::integer(id));
     out.set("generated_ids", std::move(generated));
     out.set("text", display_text(engine.detokenize(result.generated_ids)));
+    if (!result.alternatives.empty()) {
+        // One row per generated token: the alternatives that survived
+        // truncation, most likely first, with the probability the sampler used.
+        Json rows = Json::array();
+        for (const auto &row : result.alternatives) {
+            Json entry = Json::array();
+            for (const auto &[id, prob] : row) {
+                Json pair = Json::object();
+                pair.set("id", static_cast<int64_t>(id));
+                pair.set("prob", fm::fixed_double(prob, 9));
+                entry.push(std::move(pair));
+            }
+            rows.push(std::move(entry));
+        }
+        out.set("alternatives", std::move(rows));
+    }
     out.set("sampling_temperature", fm::fixed_double(cfg.sampling.temperature, 4));
     out.set("sampling_top_k", static_cast<int64_t>(cfg.sampling.top_k));
     out.set("sampling_top_p", fm::fixed_double(cfg.sampling.top_p, 4));
+    out.set("sampling_min_p", fm::fixed_double(cfg.sampling.min_p, 4));
+    out.set("sampling_repetition_penalty",
+            fm::fixed_double(cfg.sampling.repetition_penalty, 4));
+    out.set("sampling_presence_penalty", fm::fixed_double(cfg.sampling.presence_penalty, 4));
+    out.set("sampling_frequency_penalty", fm::fixed_double(cfg.sampling.frequency_penalty, 4));
+    out.set("sampling_penalty_window", static_cast<int64_t>(cfg.sampling.penalty_window));
+    out.set("sampling_n_probs", static_cast<int64_t>(cfg.sampling.n_probs));
+    out.set("sampling_logit_bias_count",
+            static_cast<int64_t>(cfg.sampling.logit_bias.size()));
     out.set("sampling_seed", cfg.sampling.seed);
     if (args.has("dump-logits")) {
         std::ostringstream os;
