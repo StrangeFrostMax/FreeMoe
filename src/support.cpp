@@ -147,6 +147,17 @@ const std::map<std::string, ArchFacts> &known_architectures() {
         // qkv, a per-head q/k norm and dense leading blocks.
         {"bailingmoe", {true, false}},
         {"bailingmoe2", {true, false}},
+        // Census batch 1, slice B. dbrx is a LayerNorm block whose only
+        // post-attention norm feeds the MoE; deepseek and dots1 add a dense lead
+        // and an ungated shared expert; ernie4-5-moe interleaves MoE layers;
+        // glm4-moe routes by sigmoid and normalises after the attention residual;
+        // minimax-m2 adds a router selection bias.
+        {"dbrx", {true, false}},
+        {"deepseek", {true, false}},
+        {"dots1", {true, false}},
+        {"ernie4-5-moe", {true, false}},
+        {"glm4-moe", {true, false}},
+        {"minimax-m2", {true, false}},
         {"glm4moe", {false, true}},
         {"multimodal", {false, true}},
     };

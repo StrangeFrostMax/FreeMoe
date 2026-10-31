@@ -476,6 +476,14 @@ std::string canonical_layer_name(std::string name) {
     static const std::map<std::string, std::string> renamed = {
         {"post_attention_norm", "attn_post_norm"},
         {"post_ffw_norm", "ffn_post_norm"},
+        // dbrx (`src/models/dbrx.cpp`) calls the tensor that normalises the
+        // feed-forward input `attn_out_norm`: it is written *after* the attention
+        // residual and is the block's only post-attention norm, so it is the same
+        // slot gpt-oss calls `attn_post_norm`. bert-family files and grok carry a
+        // tensor of the same name; none of those families is mapped, and no other
+        // mapped family writes it, so the alias cannot silently reinterpret a
+        // block this build already runs.
+        {"attn_out_norm", "attn_post_norm"},
     };
     const size_t dot = name.rfind('.');
     if (dot == std::string::npos) return name;
@@ -949,6 +957,12 @@ bool is_llama_family(const std::string &arch) {
         // Every one of those is a flag the adapter already reads, so no code path
         // is added for them.
         "bailingmoe", "bailingmoe2",
+        // Census batch 1, slice B: MoE trunks whose block is the same pre-norm
+        // block. dbrx additionally names its FFN norm `attn_out_norm` (aliased to
+        // `attn_post_norm` above) and uses LayerNorm; glm4-moe defaults to sigmoid
+        // routing; ernie4-5-moe and minimax-m2 normalise the router weights as a
+        // constant. Each of those is one rule below, not a new code path.
+        "dbrx", "deepseek", "dots1", "ernie4-5-moe", "glm4-moe", "minimax-m2",
         "granite",
         "granitemoe",
         "cohere2",
@@ -1411,6 +1425,12 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
                 fail(ErrorCode::METADATA_MISMATCH,
                      "expert_gating_func " + std::to_string(gating) + " has no known meaning");
             }
+        } else if (arch == "glm4-moe") {
+            // src/models/glm4-moe.cpp: `expert_gating_func` is optional, and NONE
+            // is turned into SIGMOID rather than softmax. A file that omits the
+            // key therefore routes by sigmoid, and the default has to be the
+            // architecture's, not this build's.
+            cfg.expert_gating = "sigmoid";
         }
         uint64_t groups = 0, groups_used = 0;
         if (opt_u64(doc, keys("expert_group_count"), &groups) && groups > 1) {
@@ -1919,6 +1939,20 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
         cfg.activation = "relu";
         cfg.expert_weights_norm = true;
     }
+
+    // The same applies to the router's weight normalisation, which four families
+    // pass as a constant instead of reading `expert_weights_norm`:
+    //   dbrx         `build_moe_ffn(..., LLM_FFN_SILU, true, ...)`
+    //   ernie4-5-moe `build_moe_ffn(..., LLM_FFN_SILU, true, ...)`
+    //   minimax-m2    `build_moe_ffn(..., LLM_FFN_SILU, true, ...)`
+    // and one that passes `false` regardless of what the file says:
+    //   deepseek      `build_moe_ffn(..., LLM_FFN_SILU, false, ...)`
+    // The key is absent from those four families' files, so the name is the only
+    // evidence, and hard-coding the opposite direction would be the same bug in
+    // the other direction.
+    static const std::set<std::string> router_norm_w = {"dbrx", "ernie4-5-moe", "minimax-m2"};
+    if (router_norm_w.count(arch) != 0) cfg.expert_weights_norm = true;
+    if (arch == "deepseek") cfg.expert_weights_norm = false;
 
     // The activation drives the arithmetic, so an unknown name is refused rather
     // than silently becoming silu. This runs after every branch that can set it
