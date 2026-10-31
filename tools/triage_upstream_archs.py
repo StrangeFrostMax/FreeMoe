@@ -80,7 +80,6 @@ IMPLEMENTED = {
 # them. One id per family, choosing the most fundamental missing piece, because
 # "needs three things" is a batch, not a row.
 CAPABILITIES = [
-    ("C-MTP-HEAD", "multi-token-prediction head", r"mtp\.|nextn\."),
     ("C-SHORTCONV", "short convolution / conv1d in the block", r"shortconv|short_conv|conv1d"),
     ("C-LINEAR-ATTN", "linear/recurrent attention layer", r"build_recurrent|linear_attn|gated_linear"),
     ("C-DELTA-NET", "gated delta-net scan", r"delta_net|ggml_gated_delta|build_delta"),
@@ -93,6 +92,22 @@ CAPABILITIES = [
     ("C-TID2EID", "token-id expert routing", r"experts_tid2eid|tid2eid"),
     ("C-ALTUP", "AltUp / per-layer token embeddings", r"build_inp_embd_per_layer|altup|AltUp"),
     ("C-DUAL-FFN", "dense and MoE FFN summed in one layer", r"ffn_norm_exps"),
+]
+
+# Blocks that are not blocking, with the reason. The NextN/MTP head is the case
+# this list exists for: upstream writes its tensors as `blk.{n_layer}.nextn.*`
+# and builds the head only when a loader asks for it (`ml.load_mtp`, false in an
+# inference run), so a checkpoint carrying one runs its trunk unchanged. The
+# engine ignores those tensors by rule and says so in `inspect`; the tolerance is
+# pinned by the `qwen3moe-mtp` fixture and the `mtp_head_tolerated` test.
+#
+# Listing it as a capability was wrong in a way that mattered: it made 16
+# families look unbuildable when the only thing standing between them and a row
+# was the rest of their block, and it hid the fact that nothing in the tree
+# proved the tolerance at all.
+TOLERATED = [
+    ("NextN / MTP head", r"mtp\.|nextn\.",
+     "tensors the trunk never reads; the loader ignores them by rule"),
 ]
 
 # Upstream spells some families differently from their adapter row.
@@ -120,6 +135,41 @@ def graph_body(path: Path) -> str:
     return text[idx:] if idx >= 0 else text
 
 
+# Calls whose presence is structural: `build_*`/`ggml_*` entry points. A family
+# whose call set is a near-superset of a mapped family's is a candidate for a row
+# after one graph read, not a candidate for a capability; the `extra` calls are
+# exactly what that read has to account for.
+CALL = re.compile(r"\b((?:build|ggml)_[a-z0-9_]+)\s*\(")
+
+
+def signature(path: Path) -> set[str]:
+    return set(CALL.findall(graph_body(path)))
+
+
+def nearest(sig: set[str], mapped_sigs: dict[str, set[str]]) -> dict | None:
+    # `extra` is restricted to calls that appear in *no* mapped family: a call the
+    # tree already handles elsewhere is not something the read has to explain,
+    # and leaving `build_moe_ffn` in this column made every dense-neighbour row
+    # look unimplemented when the trunk is exactly what is implemented.
+    known = set().union(*mapped_sigs.values()) if mapped_sigs else set()
+    best: tuple[float, str] | None = None
+    for arch, other in mapped_sigs.items():
+        union = sig | other
+        if not union:
+            continue
+        score = len(sig & other) / len(union)
+        if best is None or (score, arch) > best:
+            best = (score, arch)
+    if best is None:
+        return None
+    score, arch = best
+    return {
+        "arch": arch,
+        "similarity": round(score, 3),
+        "extra": sorted(sig - known)[:8],
+    }
+
+
 def adapter_arches() -> list[str]:
     """Adapter rows from the built binary; falls back to parsing the table."""
     exe = ROOT / "build" / "freemoe"
@@ -138,6 +188,7 @@ def classify(arch: str, path: Path, mapped: set[str]) -> dict:
     hits = [(cid, what) for cid, what, pattern in CAPABILITIES if re.search(pattern, graph)]
     explained = {cid: why for cid, why in EXPLAINED.get(arch, {}).items()}
     hits = [hit for hit in hits if hit[0] not in explained]
+    tolerated = [name for name, pattern, _ in TOLERATED if re.search(pattern, graph)]
     row = arch in mapped or ALIASES.get(arch) in mapped
     if row:
         # A caveat is not a blocker: the row exists and runs. The unmodelled
@@ -158,6 +209,7 @@ def classify(arch: str, path: Path, mapped: set[str]) -> dict:
         "verdict": verdict,
         "capability": capability,
         "blocking": [cid for cid, _ in hits],
+        "tolerated": tolerated,
         "explained": explained,
         "implemented": implemented,
     }
@@ -168,8 +220,18 @@ def build(llama_dir: Path, pin: str) -> dict:
     if not models.is_dir():
         raise SystemExit(f"{models} is not a directory")
     mapped = set(adapter_arches())
-    rows = [classify(path.stem, path, mapped) for path in sorted(models.glob("*.cpp"))
-            if path.name != "models.cpp"]
+    files = [path for path in sorted(models.glob("*.cpp")) if path.name != "models.cpp"]
+    mapped_sigs = {}
+    for path in files:
+        arch = path.stem
+        if arch in mapped or ALIASES.get(arch) in mapped:
+            mapped_sigs[arch] = signature(path)
+    rows = []
+    for path in files:
+        row = classify(path.stem, path, mapped)
+        if row["verdict"] == "unclassified":
+            row["nearest"] = nearest(signature(path), mapped_sigs)
+        rows.append(row)
     counts: dict[str, int] = {}
     for row in rows:
         counts[row["verdict"]] = counts.get(row["verdict"], 0) + 1
@@ -214,12 +276,50 @@ def render_table(census: dict) -> str:
         "named capability.",
         "",
     ]
+    pending = [r for r in census["rows"] if r["verdict"] == "unclassified"]
+    near = [r for r in pending if (r.get("nearest") or {}).get("similarity", 0) >= 0.6]
+    far = [r for r in pending if r not in near]
+    if near:
+        lines += [
+            "The unclassified rows, ordered by how much of their call set is already in a",
+            "mapped family. Overlap is a Jaccard score over the `build_*`/`ggml_*` calls in",
+            "the file — a hint about which graph to read first, **not** a verdict: two files",
+            "can make the same calls and wire them differently. The last column is what the",
+            "read has to account for.",
+            "",
+            "| Family | Closest mapped | Overlap | Calls the read must explain |",
+            "|---|---|---:|---|",
+        ]
+        for row in sorted(near, key=lambda r: (-r["nearest"]["similarity"], r["arch"])):
+            near_row = row["nearest"]
+            extra = ", ".join(f"`{c}`" for c in near_row["extra"]) or "—"
+            lines.append(f"| `{row['arch']}` | `{near_row['arch']}` | {near_row['similarity']:.2f} "
+                         f"| {extra} |")
+        lines.append("")
+    if far:
+        names = ", ".join("`" + r["arch"] + "`" for r in sorted(far, key=lambda r: r["arch"]))
+        lines.append(f"The other {len(far)} unclassified rows share no mapped shape above 0.6 "
+                     f"and need a read from the top: {names}.")
+        lines.append("")
+
     if census["blocked_by_capability"]:
         lines += ["| Capability | Families | Of which |", "|---|---:|---|"]
         for cid, families in census["blocked_by_capability"].items():
             what = census["capabilities"].get(cid, cid)
             lines.append(f"| `{cid}` — {what} | {len(families)} | {', '.join(f'`{f}`' for f in families)} |")
         lines.append("")
+    tolerated = [r["arch"] for r in census["rows"] if r.get("tolerated")]
+    if tolerated:
+        lines.append(f"**Not blocking:** {len(tolerated)} families carry a NextN / MTP head. "
+                     "Its tensors are named `blk.{n_layer}.nextn.*`, upstream builds the head "
+                     "only when a loader asks for it (`ml.load_mtp`), and this engine maps those "
+                     "tensors to `IGNORED` with the reason recorded in `inspect`. Pinned by the "
+                     "`qwen3moe-mtp` fixture and the `mtp_head_tolerated` test — bit-identical "
+                     "logits against the same file without the head.")
+        lines.append("")
+        lines.append(f"Families carrying one: {', '.join(f'`{a}`' for a in sorted(tolerated))}.")
+        lines.append("")
+
     caveats = [r for r in census["rows"] if r["verdict"] == "mapped-caveat"]
     if caveats:
         lines.append("Mapped rows whose file also builds a block the row does not model:")

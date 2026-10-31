@@ -32,6 +32,7 @@ src/gguf.cpp:955:15: note: variable tracking size limit exceeded with '-fvar-tra
 [PASS] dense_cpu_reference_and_operation_log
 [PASS] moe_readers_and_cache_sizes
 [PASS] per_expert_layout
+[PASS] mtp_head_tolerated
 [PASS] traces_and_replay_inputs
 [PASS] vnpu_reference_backend
 [PASS] tokenizer_real_vocabularies
@@ -69,7 +70,7 @@ src/gguf.cpp:955:15: note: variable tracking size limit exceeded with '-fvar-tra
 [PASS] chat_template_constructs
 [PASS] chat_template_engine
 [PASS] soak_sessions
-3758 checks, 0 failures
+3786 checks, 0 failures
 VNPU_FORCE_ISA=avx2_dual ./build/vnpu-selftest
 Virtual NPU selftest (vnpu 1.0.0)
 ==========================================
@@ -92,7 +93,7 @@ Virtual NPU selftest (vnpu 1.0.0)
 [PASS] rope_inplace
 [PASS] mtp_head
 [PASS] async_events_and_trace
-  autotune: unit=WILDCAT tiles=16x64x32 0.064 ms 8.22 GFLOP/s 3.06x scalar
+  autotune: unit=WILDCAT tiles=16x64x32 0.086 ms 6.10 GFLOP/s 3.04x scalar
 [PASS] autotune_small
 [PASS] local_cluster
 [PASS] stream_concurrency
@@ -241,7 +242,13 @@ python3 tools/make_arch_fixtures.py --check
 architecture fixtures are up to date
 python3 tools/gen_quant_tables.py --check
 src/quant_tables.cpp passes the structural check (9 tables, upstream not present)
+python3 scripts/kernels_table.py --check
+kernels table matches docs/evidence/kernels_bench.json
+python3 scripts/check_arch_census.py
+arch census: 171 families, 61 mapped (+2 with a caveat), 36 blocked by a named capability, 72 needing a graph read
 python3 tools/quant_reference.py --check
 {"status": "pass", "fixture": "/home/user/FreeMoe/tests/fixtures/quant_reference.bin"}
 python3 tools/make_quant_fixtures.py --check
 quant fixtures are up to date (6 variants)
+python3 scripts/benchmark_table.py --check
+benchmark tables match docs/evidence/benchmark_zen3.json

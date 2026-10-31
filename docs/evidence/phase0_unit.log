@@ -21,6 +21,7 @@
 [PASS] dense_cpu_reference_and_operation_log
 [PASS] moe_readers_and_cache_sizes
 [PASS] per_expert_layout
+[PASS] mtp_head_tolerated
 [PASS] traces_and_replay_inputs
 [PASS] vnpu_reference_backend
 [PASS] tokenizer_real_vocabularies
@@ -58,4 +59,4 @@
 [PASS] chat_template_constructs
 [PASS] chat_template_engine
 [PASS] soak_sessions
-3758 checks, 0 failures
+3786 checks, 0 failures

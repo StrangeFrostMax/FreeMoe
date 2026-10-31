@@ -412,6 +412,24 @@ def arch_tensors(spec: dict[str, Any]) -> list[TensorSpec]:
                                 ("attn_output", 0.75), ("ffn_gate", 1.25),
                                 ("ffn_up", 0.5), ("ffn_down", 2.0)):
                 out += [tensor(p + name + ".scale", [1], 0.0, values=[value])]
+    if spec.get("mtp_tensors"):
+        # The NextN / MTP head. Upstream names it `blk.{n_layer}.nextn.*` and
+        # skips it outright unless the loader is asked for MTP
+        # (`ml.load_mtp`, false in every normal run), so a checkpoint that
+        # carries one is a checkpoint whose trunk runs unchanged. The fixture
+        # carries the head anyway: an adapter that rejects unknown tensors would
+        # refuse a real file, and nothing in the tree proved that it does not.
+        head = f"blk.{layers}.nextn."
+        out += [
+            tensor(head + "eh_proj.weight", [h, 2 * h], 0.08),
+            tensor(head + "enorm.weight", [h], 0.0, norm=True),
+            tensor(head + "hnorm.weight", [h], 0.0, norm=True),
+            tensor(head + "shared_head_norm.weight", [h], 0.0, norm=True),
+            # A top-level `nextn.` prefix as well: upstream writes
+            # `nextn.pre_projection` outside any layer, and the rule has to
+            # cover both spellings or half the head leaks through.
+            tensor("nextn.pre_projection.weight", [h, h], 0.08),
+        ]
     if not spec.get("weightless_norm"):
         out += [tensor("output_norm.weight", [h], 0.0, norm=True)]
         if spec.get("layernorm") and spec.get("norm_bias", True):
@@ -1162,6 +1180,22 @@ SPECS: list[dict[str, Any]] = [
         "experts": 4,
         "expert_used": 2,
         "per_expert_tensors": True,
+    },
+    {
+        # The same `qwen3moe` block with a NextN / MTP head attached. The head's
+        # tensors are never read by the trunk, so this file must produce the
+        # base fixture's logits exactly — and it must load at all, which is the
+        # part a real checkpoint would fail on if the adapter rejected names it
+        # does not know.
+        "slug": "qwen3moe-mtp",
+        "arch": "qwen3moe",
+        "name": "FreeMoe synthetic qwen3moe carrying a multi-token-prediction head",
+        "kv_heads": 2,
+        "rope_dim": SHAPE["head_dim"],
+        "qk_norm": True,
+        "experts": 4,
+        "expert_used": 2,
+        "mtp_tensors": True,
     },
     {
         # deepseek2: multi-head latent attention — q through a low-rank

@@ -3149,6 +3149,107 @@ void test_attention_sinks() {
           "the probe reports attention sinks");
 }
 
+// C11 / C-MTP-HEAD: a checkpoint that carries a NextN (multi-token-prediction)
+// head. Upstream builds that head only when the loader asks for it
+// (`ml.load_mtp`, false in an inference run) and names its tensors
+// `blk.{n_layer}.nextn.*` / `nextn.*`, so a real file is a trunk plus a head the
+// trunk never reads. Two things therefore have to be true, and neither was
+// tested before: the file must load at all rather than being refused for names
+// the adapter cannot map, and the arithmetic must be *exactly* the trunk's.
+void test_mtp_head_tolerated() {
+    const std::string path = "tests/fixtures/qwen3moe-mtp-shape.gguf";
+    const ModelManifest manifest = build_manifest(parse_gguf_file(path), path);
+
+    // Every head tensor is mapped as ignored, with a reason a reader can act on.
+    CHECK(manifest.ignored_tensors.size() == 5,
+          "the five head tensors are recorded as ignored, not silently dropped");
+    for (const auto &entry : manifest.ignored_tensors) {
+        CHECK(entry.first.find("nextn") != std::string::npos,
+              "only NextN tensors are in the ignored list (" + entry.first + ")");
+        CHECK(entry.second.find("speculative") != std::string::npos,
+              "the reason names what the head is for (" + entry.second + ")");
+    }
+    for (const char *name : {"blk.2.nextn.eh_proj.weight", "nextn.pre_projection.weight"}) {
+        const TensorInfo *tensor = manifest.tensor(name);
+        CHECK(tensor != nullptr, std::string(name) + " is in the manifest");
+        if (tensor) CHECK(tensor->role == TensorRole::IGNORED, std::string(name) + " has no role");
+    }
+    // The trunk's own tensors are untouched: two layers, four experts, and no
+    // extra layer invented for the head (whose index is past the block count).
+    CHECK(manifest.config.layers == 2, "the head does not add a block to the trunk");
+    CHECK(manifest.config.expert_count == 4, "the routed experts are unchanged");
+    CHECK(manifest.tensor("blk.2.attn_q.weight") == nullptr,
+          "nothing is expected at the head's layer index");
+
+    // The counterfactual: the tolerance is what lets the file load. Renaming one
+    // head tensor to a name no rule covers makes the same file a refusal, so the
+    // rule cannot be deleted without a real checkpoint failing.
+    {
+        GGUFDocument doc = parse_gguf_file(path);
+        const auto it = doc.tensor_by_name.find("blk.2.nextn.eh_proj.weight");
+        CHECK(it != doc.tensor_by_name.end(), "the head tensor is in the parsed document");
+        if (it != doc.tensor_by_name.end()) {
+            const size_t index = it->second;
+            doc.tensor_by_name.erase(it);
+            doc.tensors[index].name = "blk.2.speculative_head.eh_proj.weight";
+            doc.tensor_by_name[doc.tensors[index].name] = index;
+            CHECK(throws_code(ErrorCode::UNKNOWN_TENSOR,
+                              [&]() { (void)build_manifest(doc, path); }),
+                  "a head tensor with an unrecognised name is still refused");
+        }
+    }
+
+    // End to end: same weights as `qwen3moe`, so it must reproduce that model's
+    // golden exactly — not merely produce logits of its own.
+    ArchGolden golden = read_arch_golden("tests/golden/qwen3moe_reference.txt");
+    RunConfig config;
+    config.model_path = path;
+    config.trace_path = "";
+    config.budget.total_hot_bytes = 64ull * 1024 * 1024;
+    Engine engine(config);
+    engine.initialize();
+    PromptResult result = engine.run_prompt(golden.prompt, 8);
+    CHECK(result.input_ids == golden.input_ids, "prompt tokenization matches the reference");
+    CHECK(result.prefill_logits.size() == golden.logits.size(),
+          "prefill produced one logit per vocabulary entry");
+    if (result.prefill_logits.size() == golden.logits.size()) {
+        double magnitude = 0.0;
+        for (float v : golden.logits) magnitude = std::max(magnitude, std::fabs(static_cast<double>(v)));
+        double worst = 0.0;
+        for (size_t i = 0; i < golden.logits.size(); ++i)
+            worst = std::max(worst, std::fabs(static_cast<double>(result.prefill_logits[i]) -
+                                              static_cast<double>(golden.logits[i])));
+        CHECK(worst <= 1e-4 + 1e-4 * magnitude,
+              "logits match the reference (worst " + std::to_string(worst) + ")");
+    }
+    CHECK(result.generated_ids == golden.greedy,
+          "greedy decoding matches the model without the head");
+
+    // The golden is text with six decimals, so "same arithmetic" is proved
+    // against the *other fixture* run through the same engine: bit equality,
+    // not a tolerance. If the head influenced anything, this is where it shows.
+    RunConfig base_config;
+    base_config.model_path = "tests/fixtures/qwen3moe-shape.gguf";
+    base_config.trace_path = "";
+    base_config.budget.total_hot_bytes = 64ull * 1024 * 1024;
+    Engine base_engine(base_config);
+    base_engine.initialize();
+    PromptResult base = base_engine.run_prompt(golden.prompt, 8);
+    CHECK(base.prefill_logits.size() == result.prefill_logits.size(),
+          "both fixtures produce the same vocabulary width");
+    size_t differing = 0;
+    for (size_t i = 0; i < base.prefill_logits.size() && i < result.prefill_logits.size(); ++i)
+        if (base.prefill_logits[i] != result.prefill_logits[i]) ++differing;
+    CHECK(differing == 0, "the head is bit-for-bit inert (" + std::to_string(differing) +
+                              " of " + std::to_string(base.prefill_logits.size()) + " differ)");
+    CHECK(base.generated_ids == result.generated_ids, "both fixtures decode the same tokens");
+
+    // The probe reports the same list, so the CLI answer matches the engine's.
+    const Json probe = probe_model(parse_gguf_file(path), path);
+    CHECK(probe.dump().find("nextn.eh_proj") != std::string::npos,
+          "the probe names the ignored head tensors");
+}
+
 // C8: a per-expert layout stores one tensor per (layer, expert, projection)
 // instead of one stacked tensor per (layer, projection). The numbers are the
 // same, so the engine must produce the same logits — and it must do so without
@@ -4979,6 +5080,7 @@ int main(int argc, char **argv) {
     maybe_run("dense_cpu_reference_and_operation_log", test_dense_cpu_reference_and_operation_log);
     maybe_run("moe_readers_and_cache_sizes", test_moe_readers_and_cache_sizes);
     maybe_run("per_expert_layout", test_per_expert_layout);
+    maybe_run("mtp_head_tolerated", test_mtp_head_tolerated);
     maybe_run("traces_and_replay_inputs", test_traces_and_replay_inputs);
     maybe_run("vnpu_reference_backend", test_vnpu_reference_backend);
     maybe_run("tokenizer_real_vocabularies", test_tokenizer_real_vocabularies);

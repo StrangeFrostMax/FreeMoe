@@ -88,10 +88,13 @@ family), the PR says so in a sentence and names the next permitted check:
 > checkpoint is in this workspace; a real `command-r` file must be run by
 > someone with weights before "Command R runs" is claimed outside the fixture.
 
-Numbers carry their environment: "3.40x on a 2-vCPU Xeon sandbox, hidden 512,
-8 layers, `--kernels zen3`, median of 3" is evidence; "3.4x faster" is not. The
-ISA is part of the environment, because a run that dispatched AVX-512 measured a
-path the Zen 3 target cannot execute.
+Numbers carry their environment: a record that names the sandbox, the shape,
+the ISA pin, the repeat policy and the commit it was taken at is evidence; a
+bare "3.4x faster" is not. The ISA is part of the environment, because a run
+that dispatched AVX-512 measured a path the Zen 3 target cannot execute — so
+the benchmark tables are generated from the archive
+(`scripts/benchmark_table.py`, `scripts/kernels_table.py`) and `make test`
+fails when the document and the record disagree.
 
 A census of what upstream contains is held to the same rule. `tools/
 triage_upstream_archs.py --write` over a checkout at a **pinned** commit

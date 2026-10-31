@@ -13,21 +13,21 @@
       "output": "docs/evidence/phase0_unit.log",
       "source_output": "build/phase0/unit.log",
       "exists": true,
-      "sha256": "b6307a2f8bc26194d7b9a9006dc109fac564e0c3494d289920c0b02fc3923a57"
+      "sha256": "adab9e4946ead01b97280164ba129755ce5f4c0e4df0635fd67dee017aca7dca"
     },
     {
       "command": "./build/freemoe inspect tests/fixtures/dense-fm.gguf --json",
       "output": "docs/evidence/inspect_dense.json",
       "source_output": "build/phase0/inspect_dense.json",
       "exists": true,
-      "sha256": "eca59a94df60d3e7103ad0b40d371138074814a5a36e5247b44dbe31ffe6b07a"
+      "sha256": "ca511e04444bc2954f737c00cfe09a4690f953f31d382ccd6afbfc42e3caa181"
     },
     {
       "command": "./build/freemoe inspect tests/fixtures/moe-fm.gguf --json",
       "output": "docs/evidence/inspect_moe.json",
       "source_output": "build/phase0/inspect_moe.json",
       "exists": true,
-      "sha256": "22ead1c381783ddff3db545b60cc43e1312447b08cbc82b5e189fcc8ed5b924e"
+      "sha256": "13d6ef45ecc7aa58e06f9c58a39cc86db0e72c92040b97ddbf2768982468d653"
     },
     {
       "command": "python3 tools/trace_replay.py --trace build/test-tmp/replay-trace.jsonl --metrics build/test-tmp/replay-metrics.json --check",

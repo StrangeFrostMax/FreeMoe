@@ -4,19 +4,20 @@
 `tools/triage_upstream_archs.py --check` re-derives the census from a pinned
 llama.cpp checkout, which needs the network. This script is the half that runs
 in `make test`: it takes the committed artefact as given and checks the things
-that are wrong statements rather than stale measurements:
+that would be *wrong statements* rather than stale measurements.
 
-* the partition adds up (every family has exactly one verdict);
-* every `blocked` family names a capability, and `blocked_by_capability` is that
-  claim restated rather than a second copy that can drift;
-* **no family with an adapter row is classified as blocked, and every adapter row
-  that corresponds to an upstream file appears in the census.** This is the check
+* the partition adds up — one verdict per family, counts match rows;
+* every `blocked` family names a capability, every named capability is declared,
+  and `blocked_by_capability` is that same claim restated rather than a second
+  copy that can drift;
+* **no family with an adapter row is classified blocked, and every adapter row
+  that has an upstream file appears in the census as mapped.** This is the check
   that would have caught the previous census: its capability list treated
-  `build_moe_ffn(` as unimplemented, so `llama`, `granite`, `phi3`, `qwen3moe`
-  and thirteen other mapped families were recorded as needing a block;
+  `build_moe_ffn(` as an unimplemented block, so `llama`, `granite`, `phi3`,
+  `qwen3moe` and thirteen other mapped families were counted as needing one;
 * the table in `docs/GAP_ANALYSIS.md` is the artefact rendered, not hand-typed.
 
-Exit 0 with a summary of the open work; exit 1 on any inconsistency.
+Exit 0 with the open-work counts; exit 1 on any inconsistency.
 """
 from __future__ import annotations
 
@@ -81,6 +82,10 @@ def main() -> int:
     claimed = {cid: sorted(names) for cid, names in claimed.items()}
     if claimed != census.get("blocked_by_capability", {}):
         problems.append("`blocked_by_capability` disagrees with the per-row capability ids")
+    # A capability no family needs at this pin is dead vocabulary, not a false
+    # claim — it is reported so the list gets pruned, but it does not fail the
+    # gate: upstream can drop a family without anything here being wrong.
+    unused = sorted(set(capabilities) - set(claimed))
 
     # 3. The adapter table is the source of truth for what is mapped.
     adapters = set(tool.adapter_arches())
@@ -98,7 +103,15 @@ def main() -> int:
             problems.append(f"{arch}: adapter row exists but the census calls it "
                             f"{by_arch[upstream]['verdict']}")
 
-    # 4. The document is the artefact rendered.
+    # 4. A caveat has to say what the unmodelled block is.
+    for row in rows:
+        if row["verdict"] == "mapped-caveat" and not row.get("blocking"):
+            problems.append(f"{row['arch']}: mapped-caveat with no block named")
+        if row["verdict"] == "unclassified" and row.get("nearest") is None:
+            problems.append(f"{row['arch']}: unclassified with no nearest mapped family; "
+                            f"the read queue is what makes the remaining work countable")
+
+    # 5. The document is the artefact rendered.
     doc = DOC.read_text(encoding="utf-8")
     if tool.splice(doc, tool.render_table(census)) != doc:
         problems.append("docs/GAP_ANALYSIS.md: the arch-census table is not what the "
@@ -111,6 +124,8 @@ def main() -> int:
               file=sys.stderr)
         return 1
 
+    if unused:
+        print(f"note: capabilities with no family at this pin: {', '.join(unused)}")
     blocked = counts.get("blocked", 0)
     unclassified = counts.get("unclassified", 0)
     print(f"arch census: {census['files']} families, {counts.get('mapped', 0)} mapped"

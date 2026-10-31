@@ -128,6 +128,34 @@ def render() -> str:
         )
     out.append("")
 
+    # The archive carries an explicit avx512_1t row for every shape; without it
+    # in the document, prose elsewhere ("AVX-512 wins everywhere", "AVX2 is ~25%
+    # slower") had nothing behind it and both statements were wrong.
+    pairs = []
+    for rows, names in ((f32, SHAPES), (quant, QUANT_SHAPES)):
+        for shape, label in names.items():
+            a = pick(rows, shape, "avx2_1t")
+            b = pick(rows, shape, "avx512_1t")
+            if a and b:
+                pairs.append((label, float(a["best_ms"]), float(b["best_ms"])))
+    if pairs:
+        out.append("AVX2+FMA3 against AVX-512, one thread, same shape and layout:")
+        out.append("")
+        out.append("| Shape | AVX2 | AVX-512 | AVX2 ÷ AVX-512 |")
+        out.append("|---|---:|---:|---:|")
+        for label, avx2, avx512 in pairs:
+            out.append(f"| {label} | {fmt_ms(avx2)} | {fmt_ms(avx512)} | {avx2 / avx512:.2f}× |")
+        out.append("")
+        slower = sum(1 for _, a, b in pairs if a > b * 1.02)
+        faster = sum(1 for _, a, b in pairs if a < b * 0.98)
+        out.append(
+            f"AVX-512 is the slower of the two on {slower} of {len(pairs)} shapes and "
+            f"AVX2 is the slower on {faster}; the rest are within 2%. There is no "
+            f"consistent winner at these widths, which is why nothing in this tree "
+            f"cites a percentage for \"AVX2 vs AVX-512\"."
+        )
+        out.append("")
+
     q4 = [
         pick(quant, shape, "avx2_1t")
         for shape in QUANT_SHAPES

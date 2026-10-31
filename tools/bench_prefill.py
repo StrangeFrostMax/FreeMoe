@@ -51,14 +51,18 @@ def build_shape(path: Path, hidden: int, intermediate: int, layers: int, heads: 
         fixtures.golden_path = saved_golden
 
 
-def run(model: Path, prompt: str, mode: str, budget_mb: int, kernels: str) -> float:
+def run(model: Path, prompt: str, mode: str, budget_mb: int, kernels: str) -> tuple[float, int]:
     out = subprocess.run(
         [str(FREEMOE), "run", str(model), "--tokens", "1", "--budget-mb", str(budget_mb),
          "--prefill", mode, "--prompt", prompt, "--kernels", kernels],
         capture_output=True, text=True, cwd=ROOT)
     if out.returncode != 0:
         raise SystemExit(f"{mode} prefill failed: {out.stdout[-400:]}{out.stderr[-400:]}")
-    return float(json.loads(out.stdout)["prefill_ms"])
+    payload = json.loads(out.stdout)
+    # The prompt length is reported by the run, not multiplied out from the
+    # repeat count: a table that says "185 tokens" has to be able to show where
+    # the 185 came from.
+    return float(payload["prefill_ms"]), int(payload.get("input_tokens", 0))
 
 
 def main() -> int:
@@ -91,11 +95,14 @@ def main() -> int:
                    for _ in range(args.repeat)]
             bat = [run(model, prompt, "batched", args.budget_mb, args.kernels)
                    for _ in range(args.repeat)]
-            rows.append({"reps": reps, "sequential_ms": statistics.median(seq),
-                         "batched_ms": statistics.median(bat)})
+            rows.append({"reps": reps,
+                         "prompt_tokens": seq[0][1],
+                         "sequential_ms": statistics.median([ms for ms, _ in seq]),
+                         "batched_ms": statistics.median([ms for ms, _ in bat])})
     for row in rows:
         speedup = row["sequential_ms"] / row["batched_ms"]
-        print(f"prompt x{row['reps']:<3} sequential {row['sequential_ms']:9.1f} ms   "
+        print(f"prompt x{row['reps']:<3} {row['prompt_tokens']:>4} tokens   "
+              f"sequential {row['sequential_ms']:9.1f} ms   "
               f"batched {row['batched_ms']:9.1f} ms   {speedup:5.2f}x")
     print(json.dumps({"status": "ok", "kernels": args.kernels,
                       "shape": {"hidden": args.hidden, "layers": args.layers,
