@@ -13,7 +13,7 @@
       "output": "docs/evidence/phase0_unit.log",
       "source_output": "build/phase0/unit.log",
       "exists": true,
-      "sha256": "adab9e4946ead01b97280164ba129755ce5f4c0e4df0635fd67dee017aca7dca"
+      "sha256": "5a97aac341d1205e57927a41fcea9509dd3fc2b1a7effb317ba57d430195316e"
     },
     {
       "command": "./build/freemoe inspect tests/fixtures/dense-fm.gguf --json",

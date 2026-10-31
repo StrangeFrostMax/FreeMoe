@@ -5,8 +5,8 @@ g++ -Iinclude -Ithird_party/vnpu/include -Ithird_party/vnpu/src -std=c++17 -O2 -
 g++ -std=c++17 -O2 -pthread -ffp-contract=fast -Wall -Wextra -Werror -Wno-unused-parameter -Wno-missing-field-initializers -MMD -MP build/obj/vnpu-selftest-main.o build/obj/vnpu-selftest.o build/obj/vnpu/cluster/cluster.o build/obj/vnpu/cluster/net.o build/obj/vnpu/cluster/node.o build/obj/vnpu/compat/compat.o build/obj/vnpu/core/autotune.o build/obj/vnpu/core/backend.o build/obj/vnpu/core/runtime.o build/obj/vnpu/core/scheduler.o build/obj/vnpu/kernels/kernels.o build/obj/vnpu/kernels/llm.o -o build/vnpu-selftest -pthread
 g++ -std=c++17 -O1 -g -pthread -fno-omit-frame-pointer -fsanitize=address,undefined -Wall -Wextra -Werror -Iinclude -Ithird_party/vnpu/include -Ithird_party/vnpu/src tests/fuzz_gguf.cpp src/common.cpp src/gguf.cpp src/quant.cpp src/quant_tables.cpp src/rope.cpp src/adapter.cpp src/kernels.cpp src/backend.cpp third_party/vnpu/src/cluster/cluster.cpp third_party/vnpu/src/cluster/net.cpp third_party/vnpu/src/cluster/node.cpp third_party/vnpu/src/compat/compat.cpp third_party/vnpu/src/core/autotune.cpp third_party/vnpu/src/core/backend.cpp third_party/vnpu/src/core/runtime.cpp third_party/vnpu/src/core/scheduler.cpp third_party/vnpu/src/kernels/kernels.cpp third_party/vnpu/src/kernels/llm.cpp -o build/fuzz_gguf -pthread
 src/gguf.cpp: In function 'fm::ModelManifest fm::build_manifest_llama(const GGUFDocument&, const std::string&, const std::string&)':
-src/gguf.cpp:955:15: note: variable tracking size limit exceeded with '-fvar-tracking-assignments', retrying without
-  955 | ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &source_path,
+src/gguf.cpp:987:15: note: variable tracking size limit exceeded with '-fvar-tracking-assignments', retrying without
+  987 | ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &source_path,
       |               ^~~~~~~~~~~~~~~~~~~~
 ./build/tests
 [fallback] explicit_fallback_test executed on scalar CPU (explicit --allow-cpu-fallback)
@@ -70,7 +70,7 @@ src/gguf.cpp:955:15: note: variable tracking size limit exceeded with '-fvar-tra
 [PASS] chat_template_constructs
 [PASS] chat_template_engine
 [PASS] soak_sessions
-3786 checks, 0 failures
+3824 checks, 0 failures
 VNPU_FORCE_ISA=avx2_dual ./build/vnpu-selftest
 Virtual NPU selftest (vnpu 1.0.0)
 ==========================================
@@ -93,7 +93,7 @@ Virtual NPU selftest (vnpu 1.0.0)
 [PASS] rope_inplace
 [PASS] mtp_head
 [PASS] async_events_and_trace
-  autotune: unit=WILDCAT tiles=16x64x32 0.086 ms 6.10 GFLOP/s 3.04x scalar
+  autotune: unit=WILDCAT tiles=16x64x32 0.090 ms 5.81 GFLOP/s 3.92x scalar
 [PASS] autotune_small
 [PASS] local_cluster
 [PASS] stream_concurrency
@@ -245,6 +245,7 @@ src/quant_tables.cpp passes the structural check (9 tables, upstream not present
 python3 scripts/kernels_table.py --check
 kernels table matches docs/evidence/kernels_bench.json
 python3 scripts/check_arch_census.py
+note: capabilities with no family at this pin: C-ATTN-COMP, C-DELTA-NET, C-TID2EID
 arch census: 171 families, 61 mapped (+2 with a caveat), 36 blocked by a named capability, 72 needing a graph read
 python3 tools/quant_reference.py --check
 {"status": "pass", "fixture": "/home/user/FreeMoe/tests/fixtures/quant_reference.bin"}
