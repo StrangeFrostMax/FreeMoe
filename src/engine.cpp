@@ -652,9 +652,13 @@ std::vector<float> Engine::forward_token(int32_t token, uint64_t position,
         var /= x.size();
         const double scale = 1.0 / std::sqrt(var + c.rms_eps);
         std::vector<float> y(x.size());
-        for (uint32_t i = 0; i < x.size(); ++i)
-            y[i] = static_cast<float>((static_cast<double>(x[i]) - mean) * scale * w[i] +
+        for (uint32_t i = 0; i < x.size(); ++i) {
+            // A null weight is upstream's `build_norm(x, NULL, NULL, ...)`: the
+            // vector is normalised and not scaled (olmo, talkie).
+            const double gain = w == nullptr ? 1.0 : static_cast<double>(w[i]);
+            y[i] = static_cast<float>((static_cast<double>(x[i]) - mean) * scale * gain +
                                       (b == nullptr ? 0.0 : static_cast<double>(b[i])));
+        }
         backend_->record_control(name, x.size() * sizeof(float) * 3, y.size() * sizeof(float));
         return y;
     };
@@ -667,6 +671,9 @@ std::vector<float> Engine::forward_token(int32_t token, uint64_t position,
         // llama.cpp passes the bias pointer through unchanged, so a LayerNorm
         // with no `*.bias` tensor is a bias-free LayerNorm, not a broken file
         // (cohere2's decoder passes NULL for both norms).
+        if (c.weightless_norm)
+            return c.layer_norm ? layernorm(x, nullptr, nullptr, label)
+                                : rmsnorm(x, nullptr, label);
         if (c.layer_norm)
             return layernorm(x, norm_weights(w), has_bias(b) ? bias_weights(b) : nullptr, label);
         return rmsnorm(x, norm_weights(w), label);
@@ -1145,29 +1152,46 @@ std::vector<float> Engine::forward_token(int32_t token, uint64_t position,
             backend_->record_control("attn_bias.L" + std::to_string(layer),
                                      (c.hidden + 2 * kv_dim) * sizeof(float), 0);
         }
-        if (c.qk_norm) {
-            // qwen3: RMSNorm each head's q and k independently, using one shared
-            // scale vector of head_dim entries, before the rotary step.
-            const std::string lp = "blk." + std::to_string(layer) + ".";
-            const float *q_scale = norm_weights(lp + "attn_q_norm.weight");
-            const float *k_scale = norm_weights(lp + "attn_k_norm.weight");
-            auto head_norm = [&](std::vector<float> &vec, uint32_t heads, const float *scale,
-                                 const std::string &name) {
-                for (uint32_t h = 0; h < heads; ++h) {
-                    const size_t base = static_cast<size_t>(h) * c.head_dim;
-                    double ss = 0.0;
-                    for (uint32_t j = 0; j < c.head_dim; ++j)
-                        ss += static_cast<double>(vec[base + j]) * vec[base + j];
-                    const double s = 1.0 / std::sqrt(ss / c.head_dim + c.rms_eps);
-                    for (uint32_t j = 0; j < c.head_dim; ++j)
-                        vec[base + j] = static_cast<float>(vec[base + j] * s * scale[j]);
+        // Per-head q/k normalisation. Which layout, which norm and where it sits
+        // relative to the rotation are three separate facts (see
+        // `ModelConfig::qk_norm_matrix`): qwen3 is a shared RMSNorm scale applied
+        // before the rope, command-r and chameleon are one LayerNorm row per head
+        // (optionally biased), and talkie normalises after the rope.
+        const std::string qk_prefix = "blk." + std::to_string(layer) + ".";
+        auto head_norm = [&](std::vector<float> &vec, uint32_t heads, const float *scale,
+                             const std::string &name) {
+            for (uint32_t h = 0; h < heads; ++h) {
+                const size_t base = static_cast<size_t>(h) * c.head_dim;
+                // A matrix-shaped weight carries one row per head; a shared one
+                // is a single row every head reuses.
+                const float *h_scale = c.qk_norm_matrix
+                                           ? scale + static_cast<size_t>(h) * c.head_dim
+                                           : scale;
+                double mean = 0.0;
+                if (c.qk_norm_layernorm) {
+                    for (uint32_t j = 0; j < c.head_dim; ++j) mean += vec[base + j];
+                    mean /= c.head_dim;
                 }
-                backend_->record_control(name, vec.size() * sizeof(float) * 2,
-                                         vec.size() * sizeof(float));
-            };
-            head_norm(q, c.heads, q_scale, "qk_norm.q.L" + std::to_string(layer));
-            head_norm(k, c.kv_heads, k_scale, "qk_norm.k.L" + std::to_string(layer));
-        }
+                double ss = 0.0;
+                for (uint32_t j = 0; j < c.head_dim; ++j) {
+                    const double d = static_cast<double>(vec[base + j]) - mean;
+                    ss += d * d;
+                }
+                const double s = 1.0 / std::sqrt(ss / c.head_dim + c.qk_norm_eps);
+                for (uint32_t j = 0; j < c.head_dim; ++j)
+                    vec[base + j] = static_cast<float>((static_cast<double>(vec[base + j]) - mean) *
+                                                       s * h_scale[j]);
+            }
+            backend_->record_control(name, vec.size() * sizeof(float) * 2,
+                                     vec.size() * sizeof(float));
+        };
+        auto apply_qk_norm = [&]() {
+            head_norm(q, c.heads, norm_weights(qk_prefix + "attn_q_norm.weight"),
+                      "qk_norm.q.L" + std::to_string(layer));
+            head_norm(k, c.kv_heads, norm_weights(qk_prefix + "attn_k_norm.weight"),
+                      "qk_norm.k.L" + std::to_string(layer));
+        };
+        if (c.qk_norm && !c.qk_norm_after_rope) apply_qk_norm();
         // NoPE layers (SmolLM3) skip the rotation entirely: their keys stay as the
         // projection produced them, and the position information reaches the model
         // through the layers that do rotate.
@@ -1178,6 +1202,8 @@ std::vector<float> Engine::forward_token(int32_t token, uint64_t position,
                             (c.no_rope_layer_step == 0 ||
                              (layer + 1) % c.no_rope_layer_step != 0);
         if (!c.mla && rotate) rope_half(q, c.heads, k, c.kv_heads, position);
+        // talkie's block normalises q and k *after* the rotation.
+        if (c.qk_norm && c.qk_norm_after_rope && !c.mla) apply_qk_norm();
         // llama.cpp's per-position attention temperature (mistral3, llama4-style
         // checkpoints): every query component is scaled by
         //   log(floor(pos / floor) + 1) * temperature_scale + 1
@@ -1655,6 +1681,14 @@ std::vector<float> Engine::forward_token(int32_t token, uint64_t position,
         for (uint32_t i = 0; i < c.vocab; ++i) logits[i] += b[i];
         backend_->record_control("output_bias", logits.size() * sizeof(float), 0);
     }
+    if (c.logit_scale_applied) {
+        // command-r multiplies the output logits by `*.logit_scale`; granite
+        // records the same key and never applies it.
+        const float s = static_cast<float>(c.logit_scale);
+        for (float &v : logits) v *= s;
+        backend_->record_control("logit_scale", logits.size() * sizeof(float),
+                                 logits.size() * sizeof(float));
+    }
     if (c.final_logit_softcap > 0.0) {
         for (float &v : logits)
             v = static_cast<float>(c.final_logit_softcap *
@@ -1681,6 +1715,10 @@ bool Engine::supports_batched_prefill() const {
     if (c.parallel_residual) return false;
     if (c.ffn_norm_is_post) return false;
     if (c.ffn_norm_ada) return false;
+    // command-r and talkie normalize q/k with their own layout, norm type and
+    // position; the batch path only knows qwen3's shared pre-rope RMSNorm.
+    if (c.qk_norm_matrix || c.qk_norm_layernorm || c.qk_norm_after_rope)
+        return false;
     if (!c.has_ffn) return false;
     return true;
 }
@@ -1713,7 +1751,9 @@ std::vector<float> Engine::prefill_batch(const std::vector<int32_t> &tokens,
     // nothing rather than refused.
     auto norm_row = [&](const float *in, uint32_t width, const std::string &prefix,
                         float *out, const std::string &label, uint32_t rows) {
-        const float *w = norm_weights(prefix + ".weight");
+        // A weightless block normalises and does not scale (olmo, talkie), which
+        // is upstream's build_norm(x, NULL, NULL, ...).
+        const float *w = c.weightless_norm ? nullptr : norm_weights(prefix + ".weight");
         if (c.layer_norm) {
             const std::string bias_name = prefix + ".bias";
             const float *b = has_bias(bias_name) ? bias_weights(bias_name) : nullptr;
@@ -1727,16 +1767,19 @@ std::vector<float> Engine::prefill_batch(const std::vector<int32_t> &tokens,
             }
             var /= width;
             const double scale = 1.0 / std::sqrt(var + c.rms_eps);
-            for (uint32_t i = 0; i < width; ++i)
-                out[i] = static_cast<float>((static_cast<double>(in[i]) - mean) * scale * w[i] +
+            for (uint32_t i = 0; i < width; ++i) {
+                const double gain = w == nullptr ? 1.0 : static_cast<double>(w[i]);
+                out[i] = static_cast<float>((static_cast<double>(in[i]) - mean) * scale * gain +
                                             (b == nullptr ? 0.0 : static_cast<double>(b[i])));
+            }
         } else {
             double ss = 0.0;
             for (uint32_t i = 0; i < width; ++i) ss += static_cast<double>(in[i]) * in[i];
             const double scale = 1.0 / std::sqrt(ss / static_cast<double>(width) + c.rms_eps);
-            for (uint32_t i = 0; i < width; ++i)
-                out[i] = static_cast<float>(in[i] * scale *
-                                            static_cast<float>(norm_bias + w[i]));
+            for (uint32_t i = 0; i < width; ++i) {
+                const double gain = w == nullptr ? 1.0 : norm_bias + w[i];
+                out[i] = static_cast<float>(in[i] * scale * gain);
+            }
         }
         backend_->record_control(label, static_cast<uint64_t>(width) * rows * sizeof(float) * 2,
                                  static_cast<uint64_t>(width) * rows * sizeof(float));

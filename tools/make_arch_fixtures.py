@@ -114,9 +114,13 @@ def arch_tensors(spec: dict[str, Any]) -> list[TensorSpec]:
             tensor("token_embd_norm.weight", [h], 0.0, norm=True),
             tensor("token_embd_norm.bias", [h], 0.05),
         ]
+    weightless = bool(spec.get("weightless_norm"))
     for layer in range(layers):
         p = f"blk.{layer}."
-        out += [tensor(p + "attn_norm.weight", [h], 0.0, norm=True)]
+        # olmo and talkie call upstream's build_norm(x, NULL, NULL, ...): the file
+        # carries no scale for any norm, so none is written here either.
+        if not weightless:
+            out += [tensor(p + "attn_norm.weight", [h], 0.0, norm=True)]
         # A hybrid stack (jamba) interleaves the two block kinds, so the mask
         # decides what this layer carries. A pure file leaves it unset and every
         # layer gets the same shape.
@@ -167,7 +171,7 @@ def arch_tensors(spec: dict[str, Any]) -> list[TensorSpec]:
                     tensor(p + "ffn_down.weight", [i, h], 0.16),
                 ]
             continue
-        if spec.get("layernorm") and spec.get("norm_bias", True):
+        if spec.get("layernorm") and spec.get("norm_bias", True) and not weightless:
             out += [tensor(p + "attn_norm.bias", [h], 0.05)]
         if spec.get("attn_norm_2"):
             # falcon-40b's second pre-attention norm: its own weight, plus a bias
@@ -221,11 +225,25 @@ def arch_tensors(spec: dict[str, Any]) -> list[TensorSpec]:
             # match the golden.
             out += [tensor(p + "attn_sinks.weight", [heads], 0.75)]
         if spec.get("qk_norm"):
-            # One head's worth of scale, shared by every head.
-            out += [
-                tensor(p + "attn_q_norm.weight", [hd], 0.0, norm=True),
-                tensor(p + "attn_k_norm.weight", [hd], 0.0, norm=True),
-            ]
+            # Deliberately *not* uniform: a scale of 1.0 everywhere would make
+            # "per head" and "shared" arithmetically identical, so the layout
+            # (and the scale itself) would be untestable.
+            def qk_values(count: int, slot: int) -> list[float]:
+                return [1.0 + 0.2 * (((i + slot) % 5) - 2) for i in range(count)]
+            if spec.get("qk_norm_matrix"):
+                # command-r: one row per head, first axis fastest.
+                out += [
+                    tensor(p + "attn_q_norm.weight", [hd, heads], 0.0,
+                           values=qk_values(hd * heads, layer)),
+                    tensor(p + "attn_k_norm.weight", [hd, kv_heads], 0.0,
+                           values=qk_values(hd * kv_heads, layer + 1)),
+                ]
+            else:
+                # One head's worth of scale, shared by every head.
+                out += [
+                    tensor(p + "attn_q_norm.weight", [hd], 0.0, values=qk_values(hd, layer)),
+                    tensor(p + "attn_k_norm.weight", [hd], 0.0, values=qk_values(hd, layer + 1)),
+                ]
         if spec.get("qkv_bias") and not spec.get("fused_qkv"):
             # A bias of modest size: large enough to matter if the engine forgets
             # it, small enough not to swamp the rest of the arithmetic.
@@ -253,8 +271,9 @@ def arch_tensors(spec: dict[str, Any]) -> list[TensorSpec]:
             # tensor attn_post_norm; there is no ffn_norm of its own.
             out += [tensor(p + "attn_post_norm.weight", [h], 0.0, norm=True)]
         elif not spec.get("parallel_residual"):
-            out += [tensor(p + "ffn_norm.weight", [h], 0.0, norm=True)]
-            if spec.get("layernorm"):
+            if not weightless:
+                out += [tensor(p + "ffn_norm.weight", [h], 0.0, norm=True)]
+            if spec.get("layernorm") and not weightless:
                 if spec.get("norm_bias", True):
                     out += [tensor(p + "ffn_norm.bias", [h], 0.05)]
         moe_here = (spec.get("experts") and layer >= spec.get("dense_lead", 0)
@@ -354,9 +373,10 @@ def arch_tensors(spec: dict[str, Any]) -> list[TensorSpec]:
                                 ("attn_output", 0.75), ("ffn_gate", 1.25),
                                 ("ffn_up", 0.5), ("ffn_down", 2.0)):
                 out += [tensor(p + name + ".scale", [1], 0.0, values=[value])]
-    out += [tensor("output_norm.weight", [h], 0.0, norm=True)]
-    if spec.get("layernorm") and spec.get("norm_bias", True):
-        out += [tensor("output_norm.bias", [h], 0.05)]
+    if not spec.get("weightless_norm"):
+        out += [tensor("output_norm.weight", [h], 0.0, norm=True)]
+        if spec.get("layernorm") and spec.get("norm_bias", True):
+            out += [tensor("output_norm.bias", [h], 0.05)]
     if not spec.get("tied_output"):
         out += [tensor("output.weight", [h, V], 0.25)]
     if spec.get("logit_bias"):
@@ -648,6 +668,71 @@ SPECS: list[dict[str, Any]] = [
         "ffn_no_gate": True,
         "ffn_bias": True,
         "attn_output_bias": True,
+    },
+    {
+        # seed-oss (llama.cpp src/models/seed-oss.cpp): a llama-shaped block whose
+        # *second* norm is `attn_post_norm` and feeds the FFN, while the residual
+        # is taken before it.
+        "slug": "seed-oss",
+        "arch": "seed-oss",
+        "name": "FreeMoe synthetic seed-oss with a post-attention FFN norm",
+        "ffn_norm_from_post": True,
+    },
+    {
+        # plamo (llama.cpp src/models/plamo.cpp): the FFN reads the attention's own
+        # normalised input and both branches are added to the residual separately,
+        # so the block has no ffn_norm at all.
+        "slug": "plamo",
+        "arch": "plamo",
+        "name": "FreeMoe synthetic plamo with a shared attention/FFN norm",
+        "parallel_residual": True,
+    },
+    {
+        # smallthinker (llama.cpp src/models/smallthinker.cpp): routed experts with
+        # a plain ReLU on the gate (`LLM_FFN_RELU`), expert weights renormalised
+        # (`norm_w = true`), and a bias on the attention output.
+        "slug": "smallthinker",
+        "arch": "smallthinker",
+        "name": "FreeMoe synthetic smallthinker with ReLU-routed experts",
+        "experts": 4,
+        "expert_top_k": 2,
+        "attn_output_bias": True,
+    },
+    {
+        # command-r (llama.cpp src/models/command-r.cpp): a LayerNorm block whose
+        # q/k norms are one LayerNorm row per head ({head_dim, heads}), and whose
+        # output logits are scaled by `command-r.logit_scale`.
+        "slug": "command-r",
+        "arch": "command-r",
+        "name": "FreeMoe synthetic command-r with per-head q/k LayerNorm",
+        "layernorm": True,
+        "qk_norm": True,
+        "qk_norm_matrix": True,
+        "logit_scale": 0.25,
+    },
+    {
+        # olmo (llama.cpp src/models/olmo.cpp): every norm is `build_norm(x, NULL,
+        # NULL, LLM_NORM)`, so the file carries no norm scale at all.
+        "slug": "olmo",
+        "arch": "olmo",
+        "name": "FreeMoe synthetic olmo with weightless LayerNorms",
+        "layernorm": True,
+        "weightless_norm": True,
+    },
+    {
+        # phimoe (llama.cpp src/models/phimoe.cpp + models.h: the graph *is*
+        # phi3's) - fused qkv with a bias, biased LayerNorm on both block norms,
+        # a bias on the attention output and on the logits, and routed experts.
+        "slug": "phimoe",
+        "arch": "phimoe",
+        "name": "FreeMoe synthetic phimoe: phi3's block with routed experts",
+        "layernorm": True,
+        "fused_qkv": True,
+        "qkv_bias": True,
+        "attn_output_bias": True,
+        "logit_bias": True,
+        "experts": 4,
+        "expert_top_k": 2,
     },
     {
         # bloom (llama.cpp src/models/bloom.cpp): bias-carrying LayerNorm on the

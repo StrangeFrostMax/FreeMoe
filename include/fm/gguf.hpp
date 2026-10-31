@@ -300,6 +300,22 @@ struct ModelConfig {
     // Absolute learned position embeddings (`position_embd.weight`, one row per
     // context position) added to the token embedding. gpt2 and starcoder have no
     // rotary position at all: the position is a vector in the residual stream.
+    // Norms with no scale tensor at all: olmo and talkie call upstream's
+    // `build_norm(x, NULL, NULL, ...)`, so the block normalises and does not
+    // scale. A file of either family carries no `*.norm.weight`.
+    bool weightless_norm = false;
+    // The q/k norm's weight is one row per head ({head_dim, heads}) instead of a
+    // single shared vector, and it may be mean-centred (LayerNorm) and carry a
+    // bias. command-r and chameleon write it that way.
+    bool qk_norm_matrix = false;
+    bool qk_norm_layernorm = false;
+    // talkie normalises q and k *after* the rotation, not before.
+    bool qk_norm_after_rope = false;
+    float qk_norm_eps = 1e-5f;
+    // `*.logit_scale` is *recorded only* for granite (llama.cpp reads it and
+    // never applies it) and *applied* for command-r, whose graph multiplies the
+    // logits by it. This flag is what separates the two.
+    bool logit_scale_applied = false;
     bool position_embd = false;
     // falcon-40b normalises the block input twice: `attn_norm_2` feeds the
     // attention projections. When the tensor is absent (falcon-7b) the attention

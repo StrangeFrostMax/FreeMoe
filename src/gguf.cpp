@@ -879,6 +879,12 @@ bool is_llama_family(const std::string &arch) {
         "starcoder",
         "falcon",
         "mpt",
+        "seed-oss",
+        "plamo",
+        "smallthinker",
+        "command-r",
+        "olmo",
+        "phimoe",
         "cohere2",
         "deci",
         "hunyuan-dense",
@@ -1438,6 +1444,12 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
         }
     }
 
+    // command-r scales the output logits by `*.logit_scale`; granite records the
+    // same key and never applies it, so the application is per architecture.
+    if (arch == "command-r" && opt_double(doc, keys("logit_scale"), &number) && number != 0.0) {
+        cfg.logit_scale = number;
+        cfg.logit_scale_applied = true;
+    }
     if (opt_double(doc, keys("attention.layer_norm_rms_epsilon"), &number)) cfg.rms_eps = number;
     else cfg.rms_eps = 1e-5;
 
@@ -1458,13 +1470,33 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
     }
     // Biased norms, and the biases phi2 puts on the FFN, the attention output
     // and the logits. All of them are read from the tensors.
+    // A block that normalises without scaling carries no norm tensor at all
+    // (olmo, talkie). It is a file-level fact, so a file that has the scale on
+    // one norm and not another is refused rather than half-applied.
+    {
+        const bool attn_nw = doc.tensor_by_name.count(layer_name(probe, "attn_norm.weight")) != 0;
+        const bool out_nw = doc.tensor_by_name.count("output_norm.weight") != 0;
+        const bool ffn_nw = doc.tensor_by_name.count(layer_name(probe, "ffn_norm.weight")) != 0;
+        // A weightless block scales nothing, so a file that carries the scale on
+        // the feed-forward norm alone is inconsistent and refused. (A *present*
+        // scale on the entry norm says nothing about the FFN: phi2 shares it and
+        // gpt-oss calls the second one attn_post_norm, so both are checked
+        // further down by their own rules.)
+        if (attn_nw != out_nw || (!attn_nw && ffn_nw))
+            fail(ErrorCode::MISSING_REQUIRED_TENSOR,
+                 "norm scales must be present on every norm, or on none");
+        cfg.weightless_norm = !attn_nw;
+    }
     {
         const bool attn_nb = doc.tensor_by_name.count(layer_name(probe, "attn_norm.bias")) != 0;
         const bool out_nb = doc.tensor_by_name.count("output_norm.bias") != 0;
         const bool ffn_present =
             doc.tensor_by_name.count(layer_name(probe, "ffn_norm.weight")) != 0;
         const bool ffn_nb = doc.tensor_by_name.count(layer_name(probe, "ffn_norm.bias")) != 0;
-        if ((attn_nb || out_nb || ffn_nb) && !(attn_nb && out_nb && (!ffn_present || ffn_nb)))
+        // A weightless block has no norm tensors at all, so there is nothing for
+        // a bias to be inconsistent with.
+        if (!cfg.weightless_norm &&
+            (attn_nb || out_nb || ffn_nb) && !(attn_nb && out_nb && (!ffn_present || ffn_nb)))
             fail(ErrorCode::MISSING_REQUIRED_TENSOR,
                  "norm biases must be present on every norm, or on none");
         if (attn_nb != out_nb)
@@ -1509,8 +1541,11 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
             doc.tensor_by_name.count(layer_name(probe, "attn_post_norm.weight")) != 0;
         // A recurrent layer has no FFN to normalise, so the absence of an
         // ffn_norm there is not phi2's shared residual.
-        if (!ffn_present && !attn_post_present && has_attn) {
-            if (doc.tensor_by_name.count(layer_name(probe, "attn_norm.weight")) == 0)
+        // A weightless block scales no norm, so its missing ffn_norm tensor is not
+        // phi2's shared residual.
+        if (!cfg.weightless_norm && !ffn_present && !attn_post_present && has_attn) {
+            if (!cfg.weightless_norm &&
+                doc.tensor_by_name.count(layer_name(probe, "attn_norm.weight")) == 0)
                 fail(ErrorCode::MISSING_REQUIRED_TENSOR,
                      "no ffn_norm and no attn_norm: nothing normalises the FFN input");
             cfg.parallel_residual = true;
@@ -1716,6 +1751,15 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
         cfg.activation = it->second;
     }
 
+    // smallthinker's routed experts are built with the activation and the
+    // weight-normalisation as *constants* in the graph
+    // (`build_moe_ffn(..., LLM_FFN_RELU, /*norm_w=*/true, ...)`), so neither is
+    // in the file and the architecture name is the only evidence.
+    if (arch == "smallthinker") {
+        cfg.activation = "relu";
+        cfg.expert_weights_norm = true;
+    }
+
     // The activation drives the arithmetic, so an unknown name is refused rather
     // than silently becoming silu. This runs after every branch that can set it
     // (the family defaults, the clamped variants, the gate-free table).
@@ -1897,6 +1941,28 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
             fail(ErrorCode::MISSING_REQUIRED_TENSOR,
                  "q/k normalisation must be present on both q and k, not just one");
         cfg.qk_norm = has_q_norm;
+        if (has_q_norm) {
+            // One row per head ({head_dim, heads}) is command-r / chameleon; a
+            // single shared vector of head_dim entries is qwen3's layout.
+            const TensorInfo *qn = m.tensor(layer_name(probe, "attn_q_norm.weight"));
+            cfg.qk_norm_matrix = qn != nullptr && qn->dims.size() == 2;
+        }
+
+    // The q/k norm's *mode* is not representable in GGUF metadata: a file says
+    // "there is a tensor of head_dim entries" and nothing more. command-r and
+    // chameleon write it as a mean-centred LayerNorm (command-r with the file's
+    // LayerNorm epsilon, chameleon with torch's 1e-5 regardless), and talkie
+    // applies it after the rotation rather than before. Those three facts come
+    // from the architecture, exactly like the gate-free activation table.
+    if (cfg.qk_norm) {
+        if (arch == "command-r") {
+            cfg.qk_norm_layernorm = true;   // src/models/command-r.cpp: LLM_NORM
+        } else if (arch == "talkie") {
+            // "reference applies qknorm after rope"
+            cfg.qk_norm_after_rope = true;
+        }
+    }
+
     }
 
     if (cfg.hidden > 65536 || cfg.layers > 1024 || cfg.heads > 4096 || cfg.head_dim > 1024 ||
@@ -1954,7 +2020,7 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
         expect("token_embd_norm.bias");
     }
     if (cfg.position_embd) expect("position_embd.weight");
-    expect("output_norm.weight");
+    if (!cfg.weightless_norm) expect("output_norm.weight");
     // A checkpoint without `output.weight` ties the output projection to the
     // token table. That is a supported layout, not a missing tensor: the maths
     // is identical, so it is aliased rather than duplicated.
@@ -1966,7 +2032,7 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
     for (uint32_t l = 0; l < cfg.layers; ++l) {
         // Every layer opens with the block's entry norm, whatever kind of mixer
         // follows it, so this is claimed before the two mixer branches split.
-        expect(layer_name(l, "attn_norm.weight"));
+        if (!cfg.weightless_norm) expect(layer_name(l, "attn_norm.weight"));
         if (cfg.norm_bias) expect(layer_name(l, "attn_norm.bias"));
         // falcon-40b's second pre-attention norm, when the file carries one.
         if (cfg.attn_norm_2) {
@@ -2044,7 +2110,7 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
         if (!cfg.layer_has_ffn(l)) continue;
         if (!cfg.parallel_residual && cfg.ffn_norm_is_post)
             expect(layer_name(l, "attn_post_norm.weight"));
-        else if (!cfg.parallel_residual) expect(layer_name(l, "ffn_norm.weight"));
+        else if (!cfg.parallel_residual && !cfg.weightless_norm) expect(layer_name(l, "ffn_norm.weight"));
         if (cfg.norm_bias && !cfg.parallel_residual) expect(layer_name(l, "ffn_norm.bias"));
         if (cfg.ffn_bias) {
             expect(layer_name(l, "ffn_up.bias"));
@@ -2151,11 +2217,12 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
     expect_dims(*m.tensor("token_embd.weight"), {cfg.hidden, cfg.vocab});
     if (const TensorInfo *t = m.tensor("output.weight"))
         expect_dims(*t, {cfg.hidden, cfg.vocab});
-    expect_dims(*m.tensor("output_norm.weight"), {cfg.hidden});
+    if (!cfg.weightless_norm) expect_dims(*m.tensor("output_norm.weight"), {cfg.hidden});
     if (cfg.norm_bias) expect_dims(*m.tensor("output_norm.bias"), {cfg.hidden});
     if (cfg.logit_bias) expect_dims(*m.tensor("output.bias"), {cfg.vocab});
     for (uint32_t l = 0; l < cfg.layers; ++l) {
-        expect_dims(*m.tensor(layer_name(l, "attn_norm.weight")), {cfg.hidden});
+        if (!cfg.weightless_norm)
+            expect_dims(*m.tensor(layer_name(l, "attn_norm.weight")), {cfg.hidden});
         if (cfg.layer_is_recurrent(l)) {
             // The shapes the state layout and both scans are derived from. Each
             // is checked against the metadata, so a file whose tensors and keys
@@ -2247,8 +2314,15 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
             expect_dims(*m.tensor(layer_name(l, "ffn_post_norm.weight")), {cfg.hidden});
         }
         if (cfg.qk_norm) {
-            expect_dims(*m.tensor(layer_name(l, "attn_q_norm.weight")), {cfg.head_dim});
-            expect_dims(*m.tensor(layer_name(l, "attn_k_norm.weight")), {cfg.head_dim});
+            // A matrix-shaped weight carries one row per head; a shared one is a
+            // single head's worth that every head reuses.
+            auto expect_qk = [&](const char *suffix, uint32_t heads) {
+                const TensorInfo &t = *m.tensor(layer_name(l, suffix));
+                if (cfg.qk_norm_matrix) expect_dims(t, {cfg.head_dim, heads});
+                else expect_dims(t, {cfg.head_dim});
+            };
+            expect_qk("attn_q_norm.weight", cfg.heads);
+            expect_qk("attn_k_norm.weight", cfg.kv_heads);
         }
         // One sink logit per query head -- not per kv head: the sink is applied
         // after the query head's own softmax.
@@ -2274,7 +2348,7 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
         // on the layers that carry one (all of them, except in a pure mamba file).
         if (cfg.norm_bias) expect_dims(*m.tensor(layer_name(l, "attn_norm.bias")), {cfg.hidden});
         if (!cfg.layer_has_ffn(l)) continue;
-        if (!cfg.parallel_residual)
+        if (!cfg.parallel_residual && !cfg.weightless_norm)
             expect_dims(*m.tensor(layer_name(l, cfg.ffn_norm_is_post ? "attn_post_norm.weight"
                                                                    : "ffn_norm.weight")),
                         {cfg.hidden});
