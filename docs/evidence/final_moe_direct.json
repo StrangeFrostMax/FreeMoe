@@ -21,9 +21,9 @@
   "direct_fallbacks": 0,
   "source_changed_events": 0,
   "live_allocations": 0,
-  "peak_process_ram_bytes": 251760640,
-  "prefill_tokens_per_s": "719.201741",
-  "decode_tokens_per_s": "712.592321",
-  "p95_inter_token_ms": "1.694886",
+  "peak_process_ram_bytes": 251764736,
+  "prefill_tokens_per_s": "689.679348",
+  "decode_tokens_per_s": "672.462243",
+  "p95_inter_token_ms": "1.841209",
   "report_path": "results/final-moe-direct/report.json"
 }

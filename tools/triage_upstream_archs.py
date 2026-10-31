@@ -80,7 +80,6 @@ IMPLEMENTED = {
 # them. One id per family, choosing the most fundamental missing piece, because
 # "needs three things" is a batch, not a row.
 CAPABILITIES = [
-    ("C-MTP-HEAD", "multi-token-prediction head", r"mtp\.|nextn\."),
     ("C-SHORTCONV", "short convolution / conv1d in the block", r"shortconv|short_conv|conv1d"),
     ("C-LINEAR-ATTN", "linear/recurrent attention layer", r"build_recurrent|linear_attn|gated_linear"),
     ("C-DELTA-NET", "gated delta-net scan", r"delta_net|ggml_gated_delta|build_delta"),
@@ -93,6 +92,22 @@ CAPABILITIES = [
     ("C-TID2EID", "token-id expert routing", r"experts_tid2eid|tid2eid"),
     ("C-ALTUP", "AltUp / per-layer token embeddings", r"build_inp_embd_per_layer|altup|AltUp"),
     ("C-DUAL-FFN", "dense and MoE FFN summed in one layer", r"ffn_norm_exps"),
+]
+
+# Blocks that are not blocking, with the reason. The NextN/MTP head is the case
+# this list exists for: upstream writes its tensors as `blk.{n_layer}.nextn.*`
+# and builds the head only when a loader asks for it (`ml.load_mtp`, false in an
+# inference run), so a checkpoint carrying one runs its trunk unchanged. The
+# engine ignores those tensors by rule and says so in `inspect`; the tolerance is
+# pinned by the `qwen3moe-mtp` fixture and the `mtp_head_tolerated` test.
+#
+# Listing it as a capability was wrong in a way that mattered: it made 16
+# families look unbuildable when the only thing standing between them and a row
+# was the rest of their block, and it hid the fact that nothing in the tree
+# proved the tolerance at all.
+TOLERATED = [
+    ("NextN / MTP head", r"mtp\.|nextn\.",
+     "tensors the trunk never reads; the loader ignores them by rule"),
 ]
 
 # Upstream spells some families differently from their adapter row.
@@ -138,6 +153,7 @@ def classify(arch: str, path: Path, mapped: set[str]) -> dict:
     hits = [(cid, what) for cid, what, pattern in CAPABILITIES if re.search(pattern, graph)]
     explained = {cid: why for cid, why in EXPLAINED.get(arch, {}).items()}
     hits = [hit for hit in hits if hit[0] not in explained]
+    tolerated = [name for name, pattern, _ in TOLERATED if re.search(pattern, graph)]
     row = arch in mapped or ALIASES.get(arch) in mapped
     if row:
         # A caveat is not a blocker: the row exists and runs. The unmodelled
@@ -158,6 +174,7 @@ def classify(arch: str, path: Path, mapped: set[str]) -> dict:
         "verdict": verdict,
         "capability": capability,
         "blocking": [cid for cid, _ in hits],
+        "tolerated": tolerated,
         "explained": explained,
         "implemented": implemented,
     }
@@ -220,6 +237,18 @@ def render_table(census: dict) -> str:
             what = census["capabilities"].get(cid, cid)
             lines.append(f"| `{cid}` — {what} | {len(families)} | {', '.join(f'`{f}`' for f in families)} |")
         lines.append("")
+    tolerated = [r["arch"] for r in census["rows"] if r.get("tolerated")]
+    if tolerated:
+        lines.append(f"**Not blocking:** {len(tolerated)} families carry a NextN / MTP head. "
+                     "Its tensors are named `blk.{n_layer}.nextn.*`, upstream builds the head "
+                     "only when a loader asks for it (`ml.load_mtp`), and this engine maps those "
+                     "tensors to `IGNORED` with the reason recorded in `inspect`. Pinned by the "
+                     "`qwen3moe-mtp` fixture and the `mtp_head_tolerated` test — bit-identical "
+                     "logits against the same file without the head.")
+        lines.append("")
+        lines.append(f"Families carrying one: {', '.join(f'`{a}`' for a in sorted(tolerated))}.")
+        lines.append("")
+
     caveats = [r for r in census["rows"] if r["verdict"] == "mapped-caveat"]
     if caveats:
         lines.append("Mapped rows whose file also builds a block the row does not model:")

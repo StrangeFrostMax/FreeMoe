@@ -9,7 +9,6 @@ a fresh clone — the per-run artefacts are listed, not committed.
 
 | Run directory | Status | Exit | Model | Backend | Reader | Artefacts |
 |---|---|---:|---|---|---|---|
-| `results/benchmark` | incomplete | ? |  |  |  | _none_ |
 | `results/example-local` | pass | 0 | tests/fixtures/moe-fm.gguf | cpu | buffered | `report.json` `metrics.json` `trace.jsonl` |
 | `results/final-dense-cpu` | pass | 0 | tests/fixtures/dense-fm.gguf | cpu | buffered | `report.json` `metrics.json` `trace.jsonl` |
 | `results/final-moe-cpu` | pass | 0 | tests/fixtures/moe-fm.gguf | cpu | buffered | `report.json` `metrics.json` `trace.jsonl` |

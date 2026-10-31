@@ -434,8 +434,11 @@ activation, norm biases and FFN biases, and their fixtures pin the logits.
    ~~MLA (`deepseek2`)~~ **DONE** — see the section above.
    Still open: `glm4-moe`, `minicpm3`, `olmo2` (its q/k norm is *not* per head,
    so it needs a second norm placement), `olmoe`/`mixtral` (MoE variants of the
-   same block), the MTP/`nextn` heads (parsed and reported as ignored), and the
-   rest of llama.cpp's `src/models/` tree.
+   same block), the MTP/`nextn` heads (parsed, reported as ignored in `inspect`,
+   and pinned by the `qwen3moe-mtp` fixture: the file loads, the head's five
+   tensors are mapped to `IGNORED` with the reason, and the logits are
+   bit-identical to the same checkpoint without the head), and the rest of
+   llama.cpp's `src/models/` tree.
 6b. ~~**Chat templates.**~~ **DONE** — restricted Jinja interpreter, 10 built-in
    templates, evidence-based selection, `--render-only` for inspection.
 7. **Ternary formats** (`PTQ1_0`/`TQ1_0`/`TQ2_0`) for #20 and #21.

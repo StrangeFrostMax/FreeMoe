@@ -3167,6 +3167,18 @@ Json inspect_json(const ModelManifest &manifest, const std::string &source_path)
     out.set("model_map", std::move(model_map));
     out.set("unresolved_roles", Json::array());
 
+    // Tensors the file carries that this adapter deliberately does not execute
+    // (the NextN/MTP head is the only case today). The reason travels with the
+    // name: "supported" must never quietly mean "part of this was skipped".
+    Json ignored = Json::array();
+    for (const auto &ignored_entry : manifest.ignored_tensors) {
+        Json item = Json::object();
+        item.set("source_name", ignored_entry.first);
+        item.set("reason", ignored_entry.second);
+        ignored.push(std::move(item));
+    }
+    out.set("ignored_tensors", std::move(ignored));
+
     Json experts = Json::array();
     for (const auto &rec : manifest.experts) {
         Json e = Json::object();

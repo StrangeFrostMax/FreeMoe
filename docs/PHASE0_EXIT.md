@@ -8,9 +8,9 @@ verification. Hashes are SHA-256 of the exact redirected output file listed.
 | Command | Output file | SHA-256 |
 |---|---|---|
 | `make clean && make -j1` | `docs/evidence/phase0_build.log` | `02527494b9e6c5aba61eece33fc698146b2d706290de8276d028c4266f3653c4` |
-| `./build/tests` | `docs/evidence/phase0_unit.log` | `b6307a2f8bc26194d7b9a9006dc109fac564e0c3494d289920c0b02fc3923a57` |
-| `./build/freemoe inspect tests/fixtures/dense-fm.gguf --json` | `docs/evidence/inspect_dense.json` | `eca59a94df60d3e7103ad0b40d371138074814a5a36e5247b44dbe31ffe6b07a` |
-| `./build/freemoe inspect tests/fixtures/moe-fm.gguf --json` | `docs/evidence/inspect_moe.json` | `22ead1c381783ddff3db545b60cc43e1312447b08cbc82b5e189fcc8ed5b924e` |
+| `./build/tests` | `docs/evidence/phase0_unit.log` | `adab9e4946ead01b97280164ba129755ce5f4c0e4df0635fd67dee017aca7dca` |
+| `./build/freemoe inspect tests/fixtures/dense-fm.gguf --json` | `docs/evidence/inspect_dense.json` | `ca511e04444bc2954f737c00cfe09a4690f953f31d382ccd6afbfc42e3caa181` |
+| `./build/freemoe inspect tests/fixtures/moe-fm.gguf --json` | `docs/evidence/inspect_moe.json` | `13d6ef45ecc7aa58e06f9c58a39cc86db0e72c92040b97ddbf2768982468d653` |
 | `python3 tools/trace_replay.py --trace build/test-tmp/replay-trace.jsonl --metrics build/test-tmp/replay-metrics.json --check` | `docs/evidence/phase0_replay.json` | `02c8aed9a8de426328d25d923f4888ac40a1ff1c1bf4820557395aec60e2628b` |
 | `python3 tools/check_trace.py build/test-tmp/replay-trace.jsonl build/test-tmp/prefetch-trace.jsonl build/test-tmp/cachehit-trace.jsonl` | `docs/evidence/phase0_trace_events.json` | `567935e7ab9befc3217760b2614819a067885964dbf5faced342776ed922e23f` |
 | `python3 scripts/check_architecture.py` | `docs/evidence/phase0_architecture.json` | `759c69d0d2f30582f94886de44e4f50a8fa2c7eefe8b6b7995b36eaa704412e1` |
