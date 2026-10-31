@@ -101,6 +101,30 @@ targets apply only to the synthetic D3 MoE fixture on the recorded sandbox:
 - 20/20 prompt correctness comparisons pass;
 - no invalid state transitions, checksum failures or unbounded allocations.
 
+The recorded profile is the deployment target's: `--kernels zen3`, i.e. dual
+256-bit AVX2 + FMA3. `auto` resolves to the same thing on every host, because
+AVX-512 requires an explicit request; a run that used it would not describe a
+Zen 3 machine.
+
+The profile is part of the record, not of the narrative. `benchmarks/run_repeats.sh`
+writes `extra_args` into the run's `protocol.txt`, every backend operation names
+the ISA it ran (`cpu-avx2_fma`), and
+
+```sh
+mkdir -p build
+python3 tools/bench_prefill.py --kernels zen3 --repeat 3 2>/dev/null | tail -1 \\
+    > build/prefill_zen3.json
+python3 scripts/archive_benchmark.py \\
+    --run-dir results/benchmark/synthetic-moe-buffered \\
+    --prefill-json build/prefill_zen3.json
+```
+
+turns that run into `docs/evidence/benchmark_zen3.json` — summary medians and
+spreads, the reference comparison, the ISA tally and the `tools/bench_prefill.py`
+rows. It **fails** (non-zero exit, `status: fail` in the file) when a pinned
+profile did not dispatch, so an archive cannot claim the target's numbers for a
+run that fell back to another ISA.
+
 These are project inputs, not measured hardware claims. The exact target
 Zen 3 CPU model, RAM, storage, GPU/NPU SDK, driver and usable VRAM are **unknown
 (D1)**, so the performance-qualified release gate remains closed until a real
@@ -140,6 +164,7 @@ make fuzz FUZZ_SECONDS=72
 make soak
 bash scripts/run_record.sh configs/example.env
 bash benchmarks/run_repeats.sh configs/benchmark.env
+python3 scripts/archive_benchmark.py --run-dir results/benchmark/synthetic-moe-buffered
 ```
 
 ## D8 prompt and ID file hashes

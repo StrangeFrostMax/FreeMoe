@@ -50,6 +50,7 @@
     "shutdown",
     "source_verify",
     "token",
+    "tokenizer_ready",
     "upload_complete",
     "upload_queued",
     "weights_uploaded"

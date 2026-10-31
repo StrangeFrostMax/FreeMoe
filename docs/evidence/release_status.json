@@ -11,6 +11,7 @@
     "unit_and_vendor_selftests": true,
     "zen3_fallback": true,
     "cpu_kernel_benchmark": true,
+    "kernels_table_matches_report": true,
     "fuzz_72s_clean": true,
     "soak_three_sessions": true
   }

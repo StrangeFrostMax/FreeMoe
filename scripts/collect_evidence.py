@@ -32,8 +32,14 @@ DETERMINISTIC_COMMANDS = [
     ("python3 scripts/check_architecture.py", "architecture.json"),
     ("python3 scripts/check_dependencies.py", "dependencies.json"),
     ("python3 scripts/zen3_fallback_check.py", "zen3_fallback.json"),
-    ("./build/freemoe bench --iterations 20 --out build/phase0/bench.json", "bench.json"),
 ]
+
+# Timings, not hashes. A benchmark output contains elapsed-time counters and the
+# host's CPU string, so no two runs of it are byte-identical; listing it under
+# the reproducible commands (as this script used to) promised something the file
+# cannot deliver. It is regenerated and archived on its own terms — see
+# `docs/BENCHMARK_PROTOCOL.md` and `scripts/archive_benchmark.py`.
+BENCH_COMMAND = "./build/freemoe bench --iterations 20 --out build/phase0/bench.json"
 
 DIRECT_EVIDENCE_OUTPUTS = {"inspect_dense.json", "inspect_moe.json", "zen3_fallback.json"}
 
@@ -136,6 +142,19 @@ def main() -> int:
         all(float(row.get("best_ms", 0)) > 0 for row in bench.get("results", [])) and
         any(float(row.get("gflops", 0)) > 0 for row in bench.get("results", []))
     )
+    # The archive was just replaced, so the numbers quoted in docs/KERNELS.md
+    # may no longer be the numbers in it. This is the same renderer `make test`
+    # runs; here it runs *after* the copy, which is the only point at which the
+    # document can be chasing a stale record.
+    kernels_doc = subprocess.run(
+        [sys.executable, str(ROOT / "scripts" / "kernels_table.py"), "--check"],
+        cwd=ROOT, capture_output=True, text=True, check=False,
+    )
+    kernels_doc_ok = kernels_doc.returncode == 0
+    if not kernels_doc_ok:
+        print(kernels_doc.stdout, end="")
+        print(kernels_doc.stderr, end="", file=sys.stderr)
+
     zen3_fallback = load_json(EVIDENCE / "zen3_fallback.json")
     zen3_ok = bool(
         zen3_fallback and
@@ -158,6 +177,7 @@ def main() -> int:
         "zen3_fallback_report": "docs/evidence/zen3_fallback.json",
         "kernel_benchmark": kernel_ok,
         "kernel_benchmark_report": "docs/evidence/kernels_bench.json",
+        "kernels_table_matches_report": kernels_doc_ok,
         "resolved_kernel_isa": (bench or {}).get("resolved_isa", "unknown"),
         "soak_passed": "soak: three sessions passed" in soak_log,
         "fuzz": fuzz_json or {},
@@ -197,8 +217,12 @@ def main() -> int:
     unit_ok = test_summary["unit_failures"] == 0 and test_summary["vendor_selftest_failures"] == 0
     fuzz_ok = bool(fuzz_json and fuzz_json.get("iterations", 0) > 0 and test_summary["sanitizer_findings"] == 0)
     soak_ok = test_summary["soak_passed"]
+    # A document that quotes a replaced benchmark record is a false claim about
+    # the evidence, so it fails the gate with the correctness checks rather than
+    # being reported as a cosmetic mismatch.
     correctness_prototype = all([all_final_pass, expert_counts_ok, no_checksum_failures,
-                                 no_live_allocations, unit_ok, zen3_ok, fuzz_ok, soak_ok])
+                                 no_live_allocations, unit_ok, zen3_ok, fuzz_ok, soak_ok,
+                                 kernels_doc_ok])
     paged_moe = (summaries["final_moe_direct"]["status"] == "pass" and
                  summaries["final_moe_direct"]["cache_misses"] > 0 and
                  summaries["final_moe_direct"]["checksum_failures"] == 0 and
@@ -216,6 +240,7 @@ def main() -> int:
             "unit_and_vendor_selftests": unit_ok,
             "zen3_fallback": zen3_ok,
             "cpu_kernel_benchmark": kernel_ok,
+            "kernels_table_matches_report": kernels_doc_ok,
             "fuzz_72s_clean": fuzz_ok,
             "soak_three_sessions": soak_ok,
         },
@@ -249,6 +274,13 @@ and summarised in `docs/evidence/test_summary.json` and
 - `make test` -> `docs/evidence/phase0_test.log`
 - `make fuzz FUZZ_SECONDS=72` -> `docs/evidence/phase0_fuzz.log`
 - `make soak` -> `docs/evidence/phase0_soak.log`
+- `{BENCH_COMMAND}` -> `docs/evidence/kernels_bench.json` (kernel timings; also
+  records the ISA `auto` resolved to, and `scripts/archive_benchmark.py` gates a
+  benchmark run on that). Every number this file quotes into `docs/KERNELS.md`
+  is rendered from it by `scripts/kernels_table.py`, and
+  `scripts/kernels_table.py --check` is part of the gate below, so a record that
+  is replaced without re-rendering the document fails here instead of leaving a
+  stale table in place.
 
 ## P0 items
 

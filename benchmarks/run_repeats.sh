@@ -33,6 +33,12 @@ mkdir -p "$OUT"
     echo "repetitions=$R"
     echo "model=$MODEL backend=$BACKEND reader=$READER cache_slots=$CACHE_SLOTS"
     echo "target_p95_ms=$TARGET_P95_MS min_prefill_tps=$MIN_PREFILL_TPS"
+    # The pin is part of the measurement, not an implementation detail: a record
+    # that does not say which ISA profile ran cannot be re-checked later. The
+    # per-operation dispatch each run actually used is in the report
+    # (`backend.operations[].backend`), so this line states intent and the report
+    # states fact.
+    echo "extra_args=${EXTRA_ARGS:-}"
     echo "commit=$(git rev-parse HEAD)"
 } > "$OUT/protocol.txt"
 

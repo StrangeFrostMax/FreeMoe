@@ -10,7 +10,7 @@
     },
     {
       "name": "C++17 standard library",
-      "version": "GCC 12.2 libstdc++ on D1 sandbox",
+      "version": "whichever libstdc++ the system compiler ships; built and tested with GCC 12 and GCC 13",
       "licence": "compiler runtime",
       "build_reference": "implicit",
       "found_in_build": true
@@ -20,6 +20,13 @@
       "version": "OS-provided",
       "licence": "OS licence",
       "build_reference": "`Threads::Threads`",
+      "found_in_build": true
+    },
+    {
+      "name": "Python 3",
+      "version": "3.8 or newer, standard library only, for the generators and checkers",
+      "licence": "PSF-2.0",
+      "build_reference": "implicit",
       "found_in_build": true
     }
   ],
