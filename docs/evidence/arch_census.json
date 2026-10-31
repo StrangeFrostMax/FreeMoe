@@ -91,6 +91,13 @@
     "router-bias",
     "shared-expert"
    ],
+   "nearest": {
+    "arch": "phi3",
+    "extra": [
+     "ggml_sigmoid"
+    ],
+    "similarity": 0.833
+   },
    "tolerated": [],
    "verdict": "unclassified"
   },
@@ -103,6 +110,13 @@
    "implemented": [
     "qk-norm"
    ],
+   "nearest": {
+    "arch": "xverse",
+    "extra": [
+     "ggml_xielu"
+    ],
+    "similarity": 0.857
+   },
    "tolerated": [],
    "verdict": "unclassified"
   },
@@ -162,6 +176,11 @@
     "moe",
     "shared-expert"
    ],
+   "nearest": {
+    "arch": "xverse",
+    "extra": [],
+    "similarity": 0.929
+   },
    "tolerated": [],
    "verdict": "unclassified"
   },
@@ -177,6 +196,11 @@
     "router-bias",
     "shared-expert"
    ],
+   "nearest": {
+    "arch": "xverse",
+    "extra": [],
+    "similarity": 0.929
+   },
    "tolerated": [],
    "verdict": "unclassified"
   },
@@ -213,6 +237,13 @@
     "qk-norm",
     "router-bias"
    ],
+   "nearest": {
+    "arch": "gemma2",
+    "extra": [
+     "ggml_sigmoid"
+    ],
+    "similarity": 0.714
+   },
    "tolerated": [],
    "verdict": "unclassified"
   },
@@ -226,6 +257,13 @@
     "moe",
     "qk-norm"
    ],
+   "nearest": {
+    "arch": "llama",
+    "extra": [
+     "ggml_build_forward_order"
+    ],
+    "similarity": 0.6
+   },
    "tolerated": [],
    "verdict": "unclassified"
   },
@@ -258,6 +296,15 @@
    "implemented": [
     "qk-norm"
    ],
+   "nearest": {
+    "arch": "xverse",
+    "extra": [
+     "ggml_clamp",
+     "ggml_element_size",
+     "ggml_set_1d"
+    ],
+    "similarity": 0.765
+   },
    "tolerated": [],
    "verdict": "unclassified"
   },
@@ -319,6 +366,14 @@
    "explained": {},
    "file": "cogvlm.cpp",
    "implemented": [],
+   "nearest": {
+    "arch": "starcoder",
+    "extra": [
+     "ggml_element_size",
+     "ggml_rope"
+    ],
+    "similarity": 0.6
+   },
    "tolerated": [],
    "verdict": "unclassified"
   },
@@ -343,6 +398,14 @@
     "moe",
     "shared-expert"
    ],
+   "nearest": {
+    "arch": "phi3",
+    "extra": [
+     "build_inp_embd_h",
+     "ggml_build_forward_select"
+    ],
+    "similarity": 0.652
+   },
    "tolerated": [
     "NextN / MTP head"
    ],
@@ -369,6 +432,11 @@
    "implemented": [
     "moe"
    ],
+   "nearest": {
+    "arch": "qwen3moe",
+    "extra": [],
+    "similarity": 1.0
+   },
    "tolerated": [],
    "verdict": "unclassified"
   },
@@ -392,6 +460,11 @@
     "moe",
     "shared-expert"
    ],
+   "nearest": {
+    "arch": "xverse",
+    "extra": [],
+    "similarity": 0.929
+   },
    "tolerated": [],
    "verdict": "unclassified"
   },
@@ -424,6 +497,11 @@
     "shared-expert",
     "tied-output"
    ],
+   "nearest": {
+    "arch": "phimoe",
+    "extra": [],
+    "similarity": 1.0
+   },
    "tolerated": [],
    "verdict": "unclassified"
   },
@@ -533,6 +611,11 @@
     "router-bias",
     "shared-expert"
    ],
+   "nearest": {
+    "arch": "xverse",
+    "extra": [],
+    "similarity": 0.929
+   },
    "tolerated": [],
    "verdict": "unclassified"
   },
@@ -562,6 +645,11 @@
    "explained": {},
    "file": "dream.cpp",
    "implemented": [],
+   "nearest": {
+    "arch": "xverse",
+    "extra": [],
+    "similarity": 0.857
+   },
    "tolerated": [],
    "verdict": "unclassified"
   },
@@ -588,6 +676,11 @@
     "router-bias",
     "shared-expert"
    ],
+   "nearest": {
+    "arch": "xverse",
+    "extra": [],
+    "similarity": 0.929
+   },
    "tolerated": [],
    "verdict": "unclassified"
   },
@@ -598,6 +691,11 @@
    "explained": {},
    "file": "ernie4-5.cpp",
    "implemented": [],
+   "nearest": {
+    "arch": "xverse",
+    "extra": [],
+    "similarity": 1.0
+   },
    "tolerated": [],
    "verdict": "unclassified"
   },
@@ -608,6 +706,11 @@
    "explained": {},
    "file": "eurobert.cpp",
    "implemented": [],
+   "nearest": {
+    "arch": "xverse",
+    "extra": [],
+    "similarity": 0.714
+   },
    "tolerated": [],
    "verdict": "unclassified"
   },
@@ -623,6 +726,11 @@
     "router-bias",
     "shared-expert"
    ],
+   "nearest": {
+    "arch": "openai-moe",
+    "extra": [],
+    "similarity": 0.929
+   },
    "tolerated": [],
    "verdict": "unclassified"
   },
@@ -645,6 +753,11 @@
    "implemented": [
     "qk-norm"
    ],
+   "nearest": {
+    "arch": "olmo2",
+    "extra": [],
+    "similarity": 0.933
+   },
    "tolerated": [],
    "verdict": "unclassified"
   },
@@ -657,6 +770,11 @@
    "implemented": [
     "ssm-mamba"
    ],
+   "nearest": {
+    "arch": "xverse",
+    "extra": [],
+    "similarity": 0.8
+   },
    "tolerated": [],
    "verdict": "unclassified"
   },
@@ -683,6 +801,11 @@
     "shared-expert",
     "sinks"
    ],
+   "nearest": {
+    "arch": "openai-moe",
+    "extra": [],
+    "similarity": 0.929
+   },
    "tolerated": [],
    "verdict": "unclassified"
   },
@@ -695,6 +818,11 @@
    "implemented": [
     "qk-norm"
    ],
+   "nearest": {
+    "arch": "phi2",
+    "extra": [],
+    "similarity": 0.8
+   },
    "tolerated": [],
    "verdict": "unclassified"
   },
@@ -707,6 +835,14 @@
    "implemented": [
     "qk-norm"
    ],
+   "nearest": {
+    "arch": "plm",
+    "extra": [
+     "build_inp_per_layer",
+     "ggml_gelu"
+    ],
+    "similarity": 0.536
+   },
    "tolerated": [],
    "verdict": "unclassified"
   },
@@ -765,6 +901,11 @@
    "implemented": [
     "qk-norm"
    ],
+   "nearest": {
+    "arch": "cohere2",
+    "extra": [],
+    "similarity": 0.5
+   },
    "tolerated": [],
    "verdict": "unclassified"
   },
@@ -780,6 +921,16 @@
     "qk-norm",
     "router-bias"
    ],
+   "nearest": {
+    "arch": "mistral3",
+    "extra": [
+     "build_inp_per_layer",
+     "ggml_backend_tensor_set",
+     "ggml_element_size",
+     "ggml_gelu"
+    ],
+    "similarity": 0.469
+   },
    "tolerated": [],
    "verdict": "unclassified"
   },
@@ -816,6 +967,11 @@
     "router-bias",
     "shared-expert"
    ],
+   "nearest": {
+    "arch": "glm4",
+    "extra": [],
+    "similarity": 0.933
+   },
    "tolerated": [
     "NextN / MTP head"
    ],
@@ -887,6 +1043,11 @@
     "shared-expert",
     "ssm-mamba"
    ],
+   "nearest": {
+    "arch": "granite",
+    "extra": [],
+    "similarity": 0.8
+   },
    "tolerated": [],
    "verdict": "unclassified"
   },
@@ -916,6 +1077,11 @@
     "shared-expert",
     "sinks"
    ],
+   "nearest": {
+    "arch": "granite",
+    "extra": [],
+    "similarity": 0.895
+   },
    "tolerated": [],
    "verdict": "unclassified"
   },
@@ -928,6 +1094,20 @@
    "implemented": [
     "embedding-scale"
    ],
+   "nearest": {
+    "arch": "granite",
+    "extra": [
+     "build_switched_lora_delta",
+     "build_switched_lora_mm",
+     "ggml_cast",
+     "ggml_clamp",
+     "ggml_element_size",
+     "ggml_pad",
+     "ggml_reshape_1d",
+     "ggml_round"
+    ],
+    "similarity": 0.412
+   },
    "tolerated": [],
    "verdict": "unclassified"
   },
@@ -953,6 +1133,11 @@
    "implemented": [
     "moe"
    ],
+   "nearest": {
+    "arch": "phi3",
+    "extra": [],
+    "similarity": 0.882
+   },
    "tolerated": [],
    "verdict": "unclassified"
   },
@@ -966,6 +1151,11 @@
     "moe",
     "qk-norm"
    ],
+   "nearest": {
+    "arch": "qwen3moe",
+    "extra": [],
+    "similarity": 0.929
+   },
    "tolerated": [],
    "verdict": "unclassified"
   },
@@ -978,6 +1168,13 @@
    "implemented": [
     "embedding-scale"
    ],
+   "nearest": {
+    "arch": "starcoder",
+    "extra": [
+     "build_stack"
+    ],
+    "similarity": 0.538
+   },
    "tolerated": [],
    "verdict": "unclassified"
   },
@@ -1002,6 +1199,11 @@
     "qk-norm",
     "shared-expert"
    ],
+   "nearest": {
+    "arch": "xverse",
+    "extra": [],
+    "similarity": 0.929
+   },
    "tolerated": [],
    "verdict": "unclassified"
   },
@@ -1015,6 +1217,11 @@
     "mrope",
     "qk-norm"
    ],
+   "nearest": {
+    "arch": "glm4",
+    "extra": [],
+    "similarity": 1.0
+   },
    "tolerated": [],
    "verdict": "unclassified"
   },
@@ -1031,6 +1238,11 @@
     "router-bias",
     "shared-expert"
    ],
+   "nearest": {
+    "arch": "mistral3",
+    "extra": [],
+    "similarity": 0.762
+   },
    "tolerated": [
     "NextN / MTP head"
    ],
@@ -1105,6 +1317,11 @@
    "implemented": [
     "qk-norm"
    ],
+   "nearest": {
+    "arch": "phimoe",
+    "extra": [],
+    "similarity": 1.0
+   },
    "tolerated": [],
    "verdict": "unclassified"
   },
@@ -1115,6 +1332,11 @@
    "explained": {},
    "file": "jina-bert-v3.cpp",
    "implemented": [],
+   "nearest": {
+    "arch": "phimoe",
+    "extra": [],
+    "similarity": 1.0
+   },
    "tolerated": [],
    "verdict": "unclassified"
   },
@@ -1130,6 +1352,14 @@
     "router-bias",
     "shared-expert"
    ],
+   "nearest": {
+    "arch": "phi3",
+    "extra": [
+     "build_routed_value",
+     "ggml_softplus"
+    ],
+    "similarity": 0.7
+   },
    "tolerated": [],
    "verdict": "unclassified"
   },
@@ -1183,6 +1413,13 @@
     "router-bias",
     "shared-expert"
    ],
+   "nearest": {
+    "arch": "openai-moe",
+    "extra": [
+     "ggml_argsort_top_k"
+    ],
+    "similarity": 0.812
+   },
    "tolerated": [],
    "verdict": "unclassified"
   },
@@ -1199,6 +1436,13 @@
     "shared-expert",
     "sliding-window"
    ],
+   "nearest": {
+    "arch": "olmo2",
+    "extra": [
+     "ggml_softplus"
+    ],
+    "similarity": 0.789
+   },
    "tolerated": [],
    "verdict": "unclassified"
   },
@@ -1284,6 +1528,11 @@
     "moe",
     "qk-norm"
    ],
+   "nearest": {
+    "arch": "qwen3moe",
+    "extra": [],
+    "similarity": 0.857
+   },
    "tolerated": [],
    "verdict": "unclassified"
   },
@@ -1294,6 +1543,11 @@
    "explained": {},
    "file": "llada.cpp",
    "implemented": [],
+   "nearest": {
+    "arch": "xverse",
+    "extra": [],
+    "similarity": 0.857
+   },
    "tolerated": [],
    "verdict": "unclassified"
   },
@@ -1329,6 +1583,11 @@
     "moe",
     "shared-expert"
    ],
+   "nearest": {
+    "arch": "mistral3",
+    "extra": [],
+    "similarity": 0.8
+   },
    "tolerated": [],
    "verdict": "unclassified"
   },
@@ -1354,6 +1613,11 @@
     "moe",
     "qk-norm"
    ],
+   "nearest": {
+    "arch": "openai-moe",
+    "extra": [],
+    "similarity": 0.929
+   },
    "tolerated": [],
    "verdict": "unclassified"
   },
@@ -1408,6 +1672,11 @@
     "moe",
     "qk-norm"
    ],
+   "nearest": {
+    "arch": "openai-moe",
+    "extra": [],
+    "similarity": 1.0
+   },
    "tolerated": [],
    "verdict": "unclassified"
   },
@@ -1421,6 +1690,14 @@
     "moe",
     "qk-norm"
    ],
+   "nearest": {
+    "arch": "smallthinker",
+    "extra": [
+     "build_inp_embd_h",
+     "ggml_build_forward_select"
+    ],
+    "similarity": 0.667
+   },
    "tolerated": [
     "NextN / MTP head"
    ],
@@ -1437,6 +1714,11 @@
     "router-bias",
     "sinks"
    ],
+   "nearest": {
+    "arch": "phi3",
+    "extra": [],
+    "similarity": 0.583
+   },
    "tolerated": [
     "NextN / MTP head"
    ],
@@ -1465,6 +1747,11 @@
    "implemented": [
     "mla"
    ],
+   "nearest": {
+    "arch": "plm",
+    "extra": [],
+    "similarity": 0.955
+   },
    "tolerated": [],
    "verdict": "unclassified"
   },
@@ -1478,6 +1765,19 @@
     "moe",
     "router-bias"
    ],
+   "nearest": {
+    "arch": "mistral3",
+    "extra": [
+     "build_rs",
+     "ggml_cpy",
+     "ggml_element_size",
+     "ggml_exp",
+     "ggml_reshape_4d",
+     "ggml_sigmoid",
+     "ggml_view_4d"
+    ],
+    "similarity": 0.417
+   },
    "tolerated": [],
    "verdict": "unclassified"
   },
@@ -1492,6 +1792,11 @@
     "qk-norm",
     "router-bias"
    ],
+   "nearest": {
+    "arch": "olmoe",
+    "extra": [],
+    "similarity": 1.0
+   },
    "tolerated": [],
    "verdict": "unclassified"
   },
@@ -1550,6 +1855,11 @@
    "explained": {},
    "file": "mistral4.cpp",
    "implemented": [],
+   "nearest": {
+    "arch": "phimoe",
+    "extra": [],
+    "similarity": 1.0
+   },
    "tolerated": [],
    "verdict": "unclassified"
   },
@@ -1560,6 +1870,14 @@
    "explained": {},
    "file": "modern-bert.cpp",
    "implemented": [],
+   "nearest": {
+    "arch": "xverse",
+    "extra": [
+     "build_decision_head",
+     "ggml_gelu_erf"
+    ],
+    "similarity": 0.579
+   },
    "tolerated": [],
    "verdict": "unclassified"
   },
@@ -1584,6 +1902,13 @@
    "implemented": [
     "qk-norm"
    ],
+   "nearest": {
+    "arch": "gemma2",
+    "extra": [
+     "ggml_sigmoid"
+    ],
+    "similarity": 0.789
+   },
    "tolerated": [],
    "verdict": "unclassified"
   },
@@ -1598,6 +1923,13 @@
     "qk-norm",
     "router-bias"
    ],
+   "nearest": {
+    "arch": "gemma2",
+    "extra": [
+     "ggml_sigmoid"
+    ],
+    "similarity": 0.636
+   },
    "tolerated": [],
    "verdict": "unclassified"
   },
@@ -1622,6 +1954,11 @@
     "router-bias",
     "shared-expert"
    ],
+   "nearest": {
+    "arch": "mistral3",
+    "extra": [],
+    "similarity": 0.522
+   },
    "tolerated": [
     "NextN / MTP head"
    ],
@@ -1639,6 +1976,13 @@
     "shared-expert",
     "ssm-mamba"
    ],
+   "nearest": {
+    "arch": "jamba",
+    "extra": [
+     "build_ffn_layer"
+    ],
+    "similarity": 0.667
+   },
    "tolerated": [],
    "verdict": "unclassified"
   },
@@ -1659,6 +2003,11 @@
    "explained": {},
    "file": "neo-bert.cpp",
    "implemented": [],
+   "nearest": {
+    "arch": "xverse",
+    "extra": [],
+    "similarity": 0.714
+   },
    "tolerated": [],
    "verdict": "unclassified"
   },
@@ -1669,6 +2018,11 @@
    "explained": {},
    "file": "nomic-bert-moe.cpp",
    "implemented": [],
+   "nearest": {
+    "arch": "phimoe",
+    "extra": [],
+    "similarity": 1.0
+   },
    "tolerated": [],
    "verdict": "unclassified"
   },
@@ -1679,6 +2033,11 @@
    "explained": {},
    "file": "nomic-bert.cpp",
    "implemented": [],
+   "nearest": {
+    "arch": "phimoe",
+    "extra": [],
+    "similarity": 1.0
+   },
    "tolerated": [],
    "verdict": "unclassified"
   },
@@ -1741,6 +2100,11 @@
    "implemented": [
     "qk-norm"
    ],
+   "nearest": {
+    "arch": "olmo2",
+    "extra": [],
+    "similarity": 0.812
+   },
    "tolerated": [],
    "verdict": "unclassified"
   },
@@ -1773,6 +2137,11 @@
    "explained": {},
    "file": "pangu-embed.cpp",
    "implemented": [],
+   "nearest": {
+    "arch": "xverse",
+    "extra": [],
+    "similarity": 1.0
+   },
    "tolerated": [],
    "verdict": "unclassified"
   },
@@ -1845,6 +2214,13 @@
    "implemented": [
     "qk-norm"
    ],
+   "nearest": {
+    "arch": "olmo2",
+    "extra": [
+     "ggml_element_size"
+    ],
+    "similarity": 0.765
+   },
    "tolerated": [],
    "verdict": "unclassified"
   },
@@ -1912,6 +2288,11 @@
    "implemented": [
     "mrope"
    ],
+   "nearest": {
+    "arch": "paddleocr",
+    "extra": [],
+    "similarity": 1.0
+   },
    "tolerated": [],
    "verdict": "unclassified"
   },
@@ -2012,6 +2393,11 @@
    "explained": {},
    "file": "qwen3tts.cpp",
    "implemented": [],
+   "nearest": {
+    "arch": "xverse",
+    "extra": [],
+    "similarity": 0.0
+   },
    "tolerated": [],
    "verdict": "unclassified"
   },
@@ -2075,6 +2461,11 @@
    "explained": {},
    "file": "refact.cpp",
    "implemented": [],
+   "nearest": {
+    "arch": "jais",
+    "extra": [],
+    "similarity": 1.0
+   },
    "tolerated": [],
    "verdict": "unclassified"
   },
@@ -2088,6 +2479,11 @@
     "moe",
     "qk-norm"
    ],
+   "nearest": {
+    "arch": "qwen3moe",
+    "extra": [],
+    "similarity": 0.857
+   },
    "tolerated": [],
    "verdict": "unclassified"
   },
@@ -2171,6 +2567,13 @@
    "implemented": [
     "qk-norm"
    ],
+   "nearest": {
+    "arch": "mistral3",
+    "extra": [
+     "ggml_reshape_4d"
+    ],
+    "similarity": 0.583
+   },
    "tolerated": [],
    "verdict": "unclassified"
   },
@@ -2203,6 +2606,13 @@
    "explained": {},
    "file": "spark2-5.cpp",
    "implemented": [],
+   "nearest": {
+    "arch": "olmo2",
+    "extra": [
+     "ggml_sigmoid"
+    ],
+    "similarity": 0.778
+   },
    "tolerated": [],
    "verdict": "unclassified"
   },
@@ -2250,6 +2660,13 @@
     "router-bias",
     "shared-expert"
    ],
+   "nearest": {
+    "arch": "mistral3",
+    "extra": [
+     "ggml_sigmoid"
+    ],
+    "similarity": 0.64
+   },
    "tolerated": [
     "NextN / MTP head"
    ],
@@ -2262,6 +2679,20 @@
    "explained": {},
    "file": "t5.cpp",
    "implemented": [],
+   "nearest": {
+    "arch": "mpt",
+    "extra": [
+     "build_attn_inp_cross",
+     "build_inp_cross_embd",
+     "build_inp_pos_bucket_dec",
+     "build_inp_pos_bucket_enc",
+     "build_pos_bias",
+     "ggml_cont_2d",
+     "ggml_soft_max_ext",
+     "ggml_transpose"
+    ],
+    "similarity": 0.464
+   },
    "tolerated": [],
    "verdict": "unclassified"
   },
@@ -2288,6 +2719,11 @@
    "implemented": [
     "qk-norm"
    ],
+   "nearest": {
+    "arch": "phi2",
+    "extra": [],
+    "similarity": 0.933
+   },
    "tolerated": [],
    "verdict": "unclassified"
   },
@@ -2298,6 +2734,16 @@
    "explained": {},
    "file": "vllm-decision2.cpp",
    "implemented": [],
+   "nearest": {
+    "arch": "mistral3",
+    "extra": [
+     "build_head",
+     "ggml_gelu_erf",
+     "ggml_pad",
+     "ggml_sum_rows"
+    ],
+    "similarity": 0.231
+   },
    "tolerated": [],
    "verdict": "unclassified"
   },

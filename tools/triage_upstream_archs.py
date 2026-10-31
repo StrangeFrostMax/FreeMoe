@@ -135,6 +135,41 @@ def graph_body(path: Path) -> str:
     return text[idx:] if idx >= 0 else text
 
 
+# Calls whose presence is structural: `build_*`/`ggml_*` entry points. A family
+# whose call set is a near-superset of a mapped family's is a candidate for a row
+# after one graph read, not a candidate for a capability; the `extra` calls are
+# exactly what that read has to account for.
+CALL = re.compile(r"\b((?:build|ggml)_[a-z0-9_]+)\s*\(")
+
+
+def signature(path: Path) -> set[str]:
+    return set(CALL.findall(graph_body(path)))
+
+
+def nearest(sig: set[str], mapped_sigs: dict[str, set[str]]) -> dict | None:
+    # `extra` is restricted to calls that appear in *no* mapped family: a call the
+    # tree already handles elsewhere is not something the read has to explain,
+    # and leaving `build_moe_ffn` in this column made every dense-neighbour row
+    # look unimplemented when the trunk is exactly what is implemented.
+    known = set().union(*mapped_sigs.values()) if mapped_sigs else set()
+    best: tuple[float, str] | None = None
+    for arch, other in mapped_sigs.items():
+        union = sig | other
+        if not union:
+            continue
+        score = len(sig & other) / len(union)
+        if best is None or (score, arch) > best:
+            best = (score, arch)
+    if best is None:
+        return None
+    score, arch = best
+    return {
+        "arch": arch,
+        "similarity": round(score, 3),
+        "extra": sorted(sig - known)[:8],
+    }
+
+
 def adapter_arches() -> list[str]:
     """Adapter rows from the built binary; falls back to parsing the table."""
     exe = ROOT / "build" / "freemoe"
@@ -185,8 +220,18 @@ def build(llama_dir: Path, pin: str) -> dict:
     if not models.is_dir():
         raise SystemExit(f"{models} is not a directory")
     mapped = set(adapter_arches())
-    rows = [classify(path.stem, path, mapped) for path in sorted(models.glob("*.cpp"))
-            if path.name != "models.cpp"]
+    files = [path for path in sorted(models.glob("*.cpp")) if path.name != "models.cpp"]
+    mapped_sigs = {}
+    for path in files:
+        arch = path.stem
+        if arch in mapped or ALIASES.get(arch) in mapped:
+            mapped_sigs[arch] = signature(path)
+    rows = []
+    for path in files:
+        row = classify(path.stem, path, mapped)
+        if row["verdict"] == "unclassified":
+            row["nearest"] = nearest(signature(path), mapped_sigs)
+        rows.append(row)
     counts: dict[str, int] = {}
     for row in rows:
         counts[row["verdict"]] = counts.get(row["verdict"], 0) + 1
@@ -231,6 +276,32 @@ def render_table(census: dict) -> str:
         "named capability.",
         "",
     ]
+    pending = [r for r in census["rows"] if r["verdict"] == "unclassified"]
+    near = [r for r in pending if (r.get("nearest") or {}).get("similarity", 0) >= 0.6]
+    far = [r for r in pending if r not in near]
+    if near:
+        lines += [
+            "The unclassified rows, ordered by how much of their call set is already in a",
+            "mapped family. Overlap is a Jaccard score over the `build_*`/`ggml_*` calls in",
+            "the file — a hint about which graph to read first, **not** a verdict: two files",
+            "can make the same calls and wire them differently. The last column is what the",
+            "read has to account for.",
+            "",
+            "| Family | Closest mapped | Overlap | Calls the read must explain |",
+            "|---|---|---:|---|",
+        ]
+        for row in sorted(near, key=lambda r: (-r["nearest"]["similarity"], r["arch"])):
+            near_row = row["nearest"]
+            extra = ", ".join(f"`{c}`" for c in near_row["extra"]) or "—"
+            lines.append(f"| `{row['arch']}` | `{near_row['arch']}` | {near_row['similarity']:.2f} "
+                         f"| {extra} |")
+        lines.append("")
+    if far:
+        names = ", ".join("`" + r["arch"] + "`" for r in sorted(far, key=lambda r: r["arch"]))
+        lines.append(f"The other {len(far)} unclassified rows share no mapped shape above 0.6 "
+                     f"and need a read from the top: {names}.")
+        lines.append("")
+
     if census["blocked_by_capability"]:
         lines += ["| Capability | Families | Of which |", "|---|---:|---|"]
         for cid, families in census["blocked_by_capability"].items():

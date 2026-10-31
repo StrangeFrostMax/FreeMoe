@@ -21,9 +21,9 @@
   "direct_fallbacks": 0,
   "source_changed_events": 0,
   "live_allocations": 0,
-  "peak_process_ram_bytes": 42762240,
-  "prefill_tokens_per_s": "23779.776853",
-  "decode_tokens_per_s": "13843.126660",
-  "p95_inter_token_ms": "0.120389",
+  "peak_process_ram_bytes": 42864640,
+  "prefill_tokens_per_s": "23798.380775",
+  "decode_tokens_per_s": "13645.644613",
+  "p95_inter_token_ms": "0.121588",
   "report_path": "results/final-dense-cpu/report.json"
 }

@@ -17,6 +17,26 @@ def load_json(path: Path):
         return None
 
 
+# A directory holding one of these *is* a run; a directory holding only
+# directories is a grouping directory (`results/benchmark/`, say) and used to be
+# listed as an incomplete run, which reads like a failure that never happened.
+RUN_MARKERS = ("stdout.json", "exit_code.txt", "report.json", "summary.json")
+
+
+def find_runs(root: Path) -> list[Path]:
+    if not root.exists():
+        return []
+    found: list[Path] = []
+    for child in sorted(root.iterdir(), key=lambda p: p.name):
+        if not child.is_dir():
+            continue
+        if any((child / marker).exists() for marker in RUN_MARKERS):
+            found.append(child)
+            continue
+        found.extend(find_runs(child))
+    return found
+
+
 def main() -> int:
     lines = [
         "# Results index",
@@ -31,7 +51,7 @@ def main() -> int:
         "| Run directory | Status | Exit | Model | Backend | Reader | Artefacts |",
         "|---|---|---:|---|---|---|---|",
     ]
-    runs = sorted([p for p in RESULTS.iterdir() if p.is_dir()], key=lambda p: p.name) if RESULTS.exists() else []
+    runs = sorted(find_runs(RESULTS), key=lambda p: p.as_posix())
     if not runs:
         lines.append("| _none_ | no recorded runs in this checkout | | | | | |")
         lines += ["", "Generated `results/` directories are ignored by Git. Create them with",
@@ -40,16 +60,36 @@ def main() -> int:
     for run in runs:
         stdout = load_json(run / "stdout.json") or {}
         exit_file = run / "exit_code.txt"
-        exit_code = exit_file.read_text().strip() if exit_file.exists() else ""
-        status = stdout.get("status", "incomplete")
+        target_file = run / "target_status.txt"
+        if exit_file.exists():
+            exit_code = exit_file.read_text().strip()
+        elif target_file.exists():
+            exit_code = target_file.read_text().strip()
+        else:
+            exit_code = ""
+        summary = load_json(run / "summary.json") or {}
+        protocol = run / "protocol.txt"
+        # Benchmark directories keep their identity in protocol.txt rather than in
+        # a per-run stdout.json.
+        fields = stdout
+        if not fields and protocol.exists():
+            text = protocol.read_text(encoding="utf-8", errors="replace")
+            for line in text.splitlines():
+                if line.startswith("model="):
+                    fields = dict(part.split("=", 1) for part in line.split() if "=" in part)
+                    break
+        status = stdout.get("status") or summary.get("target_status") or summary.get("status") \
+            or "incomplete"
         report = run / "report.json"
         metrics = run / "metrics.json"
         trace = run / "trace.jsonl"
-        artefacts = " ".join(f"`{p.name}`" for p in (report, metrics, trace) if p.exists()) or "_none_"
+        summary_file = run / "summary.json"
+        artefacts = " ".join(f"`{p.name}`" for p in (report, metrics, trace, summary_file, protocol)
+                             if p.exists()) or "_none_"
         lines.append(
             f"| `{run.relative_to(ROOT).as_posix()}` | {status} | {exit_code or '?'} | "
-            f"{stdout.get('model', '')} | {stdout.get('backend', '')} | "
-            f"{stdout.get('reader', '')} | {artefacts} |"
+            f"{fields.get('model', '')} | {fields.get('backend', '')} | "
+            f"{fields.get('reader', '')} | {artefacts} |"
         )
     lines += [
         "",

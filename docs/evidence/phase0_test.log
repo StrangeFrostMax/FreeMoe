@@ -93,7 +93,7 @@ Virtual NPU selftest (vnpu 1.0.0)
 [PASS] rope_inplace
 [PASS] mtp_head
 [PASS] async_events_and_trace
-  autotune: unit=VOODOO tiles=64x64x64 0.059 ms 8.87 GFLOP/s 4.13x scalar
+  autotune: unit=WILDCAT tiles=16x64x32 0.086 ms 6.10 GFLOP/s 3.04x scalar
 [PASS] autotune_small
 [PASS] local_cluster
 [PASS] stream_concurrency
@@ -250,3 +250,5 @@ python3 tools/quant_reference.py --check
 {"status": "pass", "fixture": "/home/user/FreeMoe/tests/fixtures/quant_reference.bin"}
 python3 tools/make_quant_fixtures.py --check
 quant fixtures are up to date (6 variants)
+python3 scripts/benchmark_table.py --check
+benchmark tables match docs/evidence/benchmark_zen3.json
