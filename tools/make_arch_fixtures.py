@@ -285,11 +285,12 @@ def arch_tensors(spec: dict[str, Any]) -> list[TensorSpec]:
             # tensor attn_post_norm; there is no ffn_norm of its own.
             out += [tensor(p + "attn_post_norm.weight", [h], 0.0, norm=True)]
         elif not spec.get("parallel_residual"):
+            norm_name = spec.get("ffn_norm_name", "ffn_norm")
             if not weightless:
-                out += [tensor(p + "ffn_norm.weight", [h], 0.0, norm=True)]
+                out += [tensor(p + norm_name + ".weight", [h], 0.0, norm=True)]
             if spec.get("layernorm") and not weightless:
                 if spec.get("norm_bias", True):
-                    out += [tensor(p + "ffn_norm.bias", [h], 0.05)]
+                    out += [tensor(p + norm_name + ".bias", [h], 0.05)]
         moe_here = (spec.get("experts") and layer >= spec.get("dense_lead", 0)
                     and layer in spec.get("moe_layers", range(layers)))
         if spec.get("experts") and not moe_here:
@@ -799,6 +800,26 @@ SPECS: list[dict[str, Any]] = [
         "experts": 4,
         "expert_top_k": 2,
         "shared_expert": True,
+    },
+    {
+        # baichuan 13B (llama.cpp src/models/baichuan.cpp): the block is chosen by
+        # layer count. 40 layers is the 13B file - no rotary at all, and ALiBi
+        # with max_bias 8.0, both hardcoded upstream. The fixture states neither,
+        # so the row is testing the rule rather than a metadata key.
+        "slug": "baichuan",
+        "arch": "baichuan",
+        "name": "FreeMoe synthetic baichuan 13B: 40 layers, ALiBi, no rope",
+        "layers": 40,
+        "no_rope": True,
+    },
+    {
+        # chatglm (llama.cpp src/models/chatglm.cpp): an RMSNorm llama block whose
+        # FFN keeps gate and up in one tensor and applies the gated activation
+        # sequentially (`LLM_FFN_SWIGLU` with `LLM_FFN_SEQ`).
+        "slug": "chatglm",
+        "arch": "chatglm",
+        "name": "FreeMoe synthetic chatglm with a fused gate/up FFN",
+        "fused_gate_up": True,
     },
     {
         # bloom (llama.cpp src/models/bloom.cpp): bias-carrying LayerNorm on the

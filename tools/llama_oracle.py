@@ -356,9 +356,16 @@ def load_model(path: Path) -> dict[str, Any]:
     # jamba applies no rotation at all: upstream's block never calls the rope, so
     # a file of that architecture is not rotated at head width by default.
     cfg["rope_disabled"] = arch in ("jamba", "jais")
+    # baichuan picks its block by layer count: 32 layers is the 7B file and
+    # rotates; anything else is the 13B file, which calls no rope at all and, at
+    # 40 layers, biases attention with ALiBi (both hardcoded upstream).
+    if arch == "baichuan":
+        if cfg["L"] != 32:
+            cfg["rope_disabled"] = True
+
     # ALiBi: `attention.max_alibi_bias`. bloom hardcodes 8.0 upstream, jais reads
     # the key, and everything with no bias keeps 0.0.
-    cfg["alibi_max_bias"] = (8.0 if arch == "bloom"
+    cfg["alibi_max_bias"] = (8.0 if (arch == "bloom" or (arch == "baichuan" and cfg["L"] == 40))
                              else float(key("attention.max_alibi_bias", 0.0)))
     # bloom normalises the embedding once before block 0. The tensor has no
     # `blk.N.` prefix, so `has()` (which prefixes) cannot see it.

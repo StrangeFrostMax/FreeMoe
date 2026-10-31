@@ -144,3 +144,34 @@ this workspace, so these rows are proven against synthetic checkpoints and an
 independent oracle, not against real weights. `granite.embedding_scale` is read
 by upstream's `load_arch_hparams` and used by no graph in `models/granite.cpp`,
 so it is recorded and not applied — the fixtures carry no such key.
+
+## Evidence for the batch that added baichuan and chatglm
+
+Gate: `./build/tests` → **3682 checks, 0 failures** (3644 before the batch);
+`architecture_parity` 490, `batched_prefill` 76, `adapter_binding` 602.
+
+| Mutation | Turns red |
+| --- | --- |
+| `baichuan` rotates its 40-layer file (the layer-count rule removed) | prefill logits and greedy ids |
+| `baichuan`'s 40-layer ALiBi bias removed | prefill logits and greedy ids |
+| chatglm's fused gate/up halves swapped | `chatglm` and `glm4`, worst abs 1.19 / 1.71 |
+
+The chatglm mutation had to be applied to the **batched** split as well as the
+sequential one: chatglm is dense, so a fixture run takes the batched path and the
+sequential-only mutation left it green. That is the same lesson as the granite
+batch, one direction further along.
+
+### Deferred with evidence, not silently
+
+`dbrx` was read from `src/models/dbrx.cpp`, implemented (fused qkv, LayerNorm,
+`attn_out_norm` as the FFN's input norm, `attention.clamp_kqv`, `norm_w = true`
+on the router) and then **not** landed: even with the clamp disabled on both
+sides, a dbrx file whose FFN norm is named `attn_out_norm` disagrees with the
+oracle from the very first projection (`q[0] = 0.881` in the engine against
+`-0.425` in the oracle), while an otherwise identical file that keeps the name
+`ffn_norm` agrees to 0.0. The rename is the only difference, so the fault is in
+how a renamed norm tensor is bound, not in dbrx's arithmetic. The row, its
+fixture and the `ffn_norm_tensor`/`clamp_kqv` config fields were reverted rather
+than shipped: an untested field is worse than a missing row. Next step is a
+fixture pair that differs *only* in that tensor name and a test that pins which
+vector the engine normalises.

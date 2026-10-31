@@ -123,6 +123,8 @@ const std::map<std::string, ArchFacts> &known_architectures() {
         {"command-r", {true, false}},
         {"olmo", {true, false}},
         {"phimoe", {true, false}},
+        {"baichuan", {true, false}},
+        {"chatglm", {true, false}},
         {"olmo2", {true, false}},
         {"olmoe", {true, false}},
         {"granite", {true, false}},
