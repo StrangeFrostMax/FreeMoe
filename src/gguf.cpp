@@ -395,6 +395,21 @@ bool parse_layer_suffix(const std::string &name, const std::string &suffix, uint
     return true;
 }
 
+// The layer index of a `blk.{n}.*` tensor, whatever follows it. The MTP head
+// needs this: its layers are ordinary blocks appended past the trunk, so the
+// index is the only thing that distinguishes them from an out-of-range block.
+bool parse_layer_index(const std::string &name, uint32_t &layer) {
+    const std::string prefix = "blk.";
+    if (name.rfind(prefix, 0) != 0) return false;
+    const size_t dot = name.find('.', prefix.size());
+    if (dot == std::string::npos) return false;
+    const std::string digits = name.substr(prefix.size(), dot - prefix.size());
+    if (digits.empty() || digits.size() > 9) return false;
+    for (char ch : digits) if (ch < '0' || ch > '9') return false;
+    layer = static_cast<uint32_t>(std::stoul(digits));
+    return true;
+}
+
 // `blk.{L}.{stem}.{E}.weight`: one tensor per routed expert. `parse_layer_suffix`
 // cannot express it, because the expert index sits between the stem and the
 // suffix. Recognising the name is what makes a per-expert file readable at all;
@@ -928,6 +943,12 @@ bool is_llama_family(const std::string &arch) {
         "chatglm",
         "olmo2",
         "olmoe",
+        // bailingmoe/bailingmoe2: the llama block with a softmax router, a shared
+        // expert that is added rather than gated, and (v2) a fused qkv with a
+        // per-head q/k norm, dense leading blocks and an optional selection bias.
+        // Every one of those is a flag the adapter already reads, so no code path
+        // is added for them.
+        "bailingmoe", "bailingmoe2",
         "granite",
         "granitemoe",
         "cohere2",
@@ -943,6 +964,23 @@ bool is_llama_family(const std::string &arch) {
         "xverse",
     };
     return family.count(arch) != 0;
+}
+
+// llama.cpp sizes its per-layer metadata arrays by `n_layer_all`, which is
+// `block_count` and therefore *includes* any NextN/MTP head layers. A reader that
+// runs only the trunk takes the first `cfg.layers` entries — but a length that
+// matches neither the trunk nor the declared block count is a real error, so this
+// refuses instead of silently accepting a truncated `head_count_kv` array.
+size_t trunk_entries(const MetadataValue &value, const ModelConfig &cfg, const std::string &key) {
+    const size_t count = value.array.size();
+    const size_t trunk = cfg.layers;
+    const size_t total = trunk + cfg.mtp_layers;
+    if (count != trunk && count != total)
+        fail(ErrorCode::METADATA_MISMATCH,
+             key + " has " + std::to_string(count) + " entries for " + std::to_string(trunk) +
+                 " trunk layers" +
+                 (cfg.mtp_layers ? " (+" + std::to_string(cfg.mtp_layers) + " MTP)" : ""));
+    return trunk;
 }
 
 // Maps a llama.cpp-family checkpoint onto the engine's canonical tensor names.
@@ -979,6 +1017,19 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
     };
 
     cfg.layers = static_cast<uint32_t>(require_key("block_count", "layer count"));
+    // A NextN/MTP head appends its layers to `block_count`: llama.cpp reads that
+    // key into `n_layer_all` and runs `n_layer_all - n_layer_nextn` trunk layers,
+    // building the head only when a loader asks for it (`ml.load_mtp`, false for
+    // inference). The head's weights are ordinary `blk.{n_layer + i}.*` blocks, so
+    // the count is subtracted here and the indices it covers are ignored below.
+    if (uint64_t head = 0; opt_u64(doc, keys("nextn_predict_layers"), &head) && head != 0) {
+        if (head >= cfg.layers)
+            fail(ErrorCode::METADATA_MISMATCH,
+                 arch + ".nextn_predict_layers is " + std::to_string(head) +
+                     " but " + arch + ".block_count is " + std::to_string(cfg.layers));
+        cfg.mtp_layers = static_cast<uint32_t>(head);
+        cfg.layers -= cfg.mtp_layers;
+    }
     cfg.hidden = static_cast<uint32_t>(require_key("embedding_length", "embedding length"));
 
     // --- recurrent (state-space) layers -------------------------------------
@@ -1003,7 +1054,7 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
             if (claimed.size() != cfg.layers)
                 fail(ErrorCode::METADATA_MISMATCH,
                      std::string(key) + " has " + std::to_string(claimed.size()) +
-                         " entries for " + std::to_string(cfg.layers) + " layers");
+                         " entries for " + std::to_string(cfg.layers) + " trunk layers");
             for (uint32_t l = 0; l < cfg.layers; ++l) {
                 if (claimed[l] != recurrence[l])
                     fail(ErrorCode::METADATA_MISMATCH,
@@ -1015,14 +1066,17 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
         };
         if (auto it = doc.metadata.find(arch + ".attention.recurrent_layers");
             it != doc.metadata.end() && it->second.is_array()) {
+            const size_t count = trunk_entries(it->second, cfg, arch + ".attention.recurrent_layers");
             std::vector<uint8_t> claimed;
-            for (const auto &entry : it->second.array) claimed.push_back(entry.as_bool() ? 1 : 0);
+            for (size_t i = 0; i < count; ++i)
+                claimed.push_back(it->second.array[i].as_bool() ? 1 : 0);
             apply_mask(claimed, (arch + ".attention.recurrent_layers").c_str());
         } else if (auto it = doc.metadata.find(arch + ".attention.head_count_kv");
                    it != doc.metadata.end() && it->second.is_array()) {
+            const size_t count = trunk_entries(it->second, cfg, arch + ".attention.head_count_kv");
             std::vector<uint8_t> claimed;
-            for (const auto &entry : it->second.array)
-                claimed.push_back(entry.as_u64() == 0 ? 1 : 0);
+            for (size_t i = 0; i < count; ++i)
+                claimed.push_back(it->second.array[i].as_u64() == 0 ? 1 : 0);
             apply_mask(claimed, (arch + ".attention.head_count_kv").c_str());
         }
     }
@@ -1209,13 +1263,10 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
         auto heads_it = doc.metadata.find(heads_key);
         if (heads_it != doc.metadata.end() && heads_it->second.is_array()) {
             const auto &entries = heads_it->second.array;
-            if (entries.size() != cfg.layers)
-                fail(ErrorCode::METADATA_MISMATCH,
-                     heads_key + " has " + std::to_string(entries.size()) + " entries for " +
-                         std::to_string(cfg.layers) + " layers");
+            const size_t per_layer = trunk_entries(heads_it->second, cfg, heads_key);
             uint64_t agreed = 0;
             bool set = false;
-            for (uint32_t l = 0; l < cfg.layers; ++l) {
+            for (uint32_t l = 0; l < per_layer; ++l) {
                 const uint64_t count = entries[l].as_u64();
                 if (count == 0) {
                     if (!recurrence[l])
@@ -1521,13 +1572,11 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
             it != doc.metadata.end()) {
             if (it->second.is_array()) {
                 const auto &entries = it->second.array;
-                if (!entries.empty() && entries.size() != cfg.layers)
-                    fail(ErrorCode::METADATA_MISMATCH,
-                         "attention.sliding_window_pattern has " +
-                             std::to_string(entries.size()) + " entries for " +
-                             std::to_string(cfg.layers) + " layers");
-                for (const auto &entry : entries)
-                    cfg.swa_layers.push_back(entry.as_bool() ? 1 : 0);
+                const size_t per_layer =
+                    entries.empty() ? 0 : trunk_entries(it->second, cfg,
+                                                        "attention.sliding_window_pattern");
+                for (size_t i = 0; i < per_layer; ++i)
+                    cfg.swa_layers.push_back(entries[i].as_bool() ? 1 : 0);
             } else {
                 const uint64_t period = it->second.as_u64();
                 if (period == 0)
@@ -2326,6 +2375,17 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
     }
     for (auto &tensor : m.doc.tensors) {
         if (!expected.count(tensor.name)) {
+            uint32_t tensor_layer = 0;
+            if (cfg.mtp_layers != 0 && parse_layer_index(tensor.name, tensor_layer) &&
+                tensor_layer >= cfg.layers && tensor_layer < cfg.layers + cfg.mtp_layers) {
+                tensor.role = TensorRole::IGNORED;
+                tensor.layer = -1;
+                tensor.canonical = tensor.name;
+                m.ignored_tensors.emplace_back(
+                    tensor.name, "multi-token-prediction head layer (declared by " + arch +
+                                     ".nextn_predict_layers), not part of the trunk");
+                continue;
+            }
             const char *reason = ignorable_reason(tensor.name);
             if (reason == nullptr)
                 fail(ErrorCode::UNKNOWN_TENSOR,

@@ -1,5 +1,5 @@
 {
- "adapter_rows": 67,
+ "adapter_rows": 69,
  "blocked_by_capability": {
   "C-ALTUP": [
    "gemma3n"
@@ -72,9 +72,9 @@
  },
  "counts": {
   "blocked": 36,
-  "mapped": 61,
+  "mapped": 63,
   "mapped-caveat": 2,
-  "unclassified": 72
+  "unclassified": 70
  },
  "files": 171,
  "method": "graph-marker scan; a verdict is not evidence a family runs",
@@ -176,13 +176,8 @@
     "moe",
     "shared-expert"
    ],
-   "nearest": {
-    "arch": "xverse",
-    "extra": [],
-    "similarity": 0.929
-   },
    "tolerated": [],
-   "verdict": "unclassified"
+   "verdict": "mapped"
   },
   {
    "arch": "bailingmoe2",
@@ -196,13 +191,8 @@
     "router-bias",
     "shared-expert"
    ],
-   "nearest": {
-    "arch": "xverse",
-    "extra": [],
-    "similarity": 0.929
-   },
    "tolerated": [],
-   "verdict": "unclassified"
+   "verdict": "mapped"
   },
   {
    "arch": "bailingmoe3",
@@ -461,9 +451,9 @@
     "shared-expert"
    ],
    "nearest": {
-    "arch": "xverse",
+    "arch": "bailingmoe2",
     "extra": [],
-    "similarity": 0.929
+    "similarity": 1.0
    },
    "tolerated": [],
    "verdict": "unclassified"
@@ -612,9 +602,9 @@
     "shared-expert"
    ],
    "nearest": {
-    "arch": "xverse",
+    "arch": "bailingmoe2",
     "extra": [],
-    "similarity": 0.929
+    "similarity": 1.0
    },
    "tolerated": [],
    "verdict": "unclassified"
@@ -677,9 +667,9 @@
     "shared-expert"
    ],
    "nearest": {
-    "arch": "xverse",
+    "arch": "bailingmoe2",
     "extra": [],
-    "similarity": 0.929
+    "similarity": 1.0
    },
    "tolerated": [],
    "verdict": "unclassified"
@@ -1200,9 +1190,9 @@
     "shared-expert"
    ],
    "nearest": {
-    "arch": "xverse",
+    "arch": "bailingmoe2",
     "extra": [],
-    "similarity": 0.929
+    "similarity": 1.0
    },
    "tolerated": [],
    "verdict": "unclassified"

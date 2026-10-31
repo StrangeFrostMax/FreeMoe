@@ -1,5 +1,5 @@
 {
-  "commit": "11339a4fb796aef0d24195dd762e0fd65ba6651f",
+  "commit": "8384bff0145c14168a028fe047043777ea9f0a03",
   "comparison": {
     "matching_tokens": 320,
     "max_abs_diff": "0.000000238",
@@ -22,50 +22,50 @@
   },
   "metrics": {
     "decode_tokens_per_s": {
-      "max": 3056.221,
-      "median": 3000.237,
-      "min": 2934.289
+      "max": 4078.311,
+      "median": 4048.171,
+      "min": 3959.869
     },
     "first_token_latency_ms": {
-      "max": 83.547,
-      "median": 83.003,
-      "min": 81.456
+      "max": 62.06,
+      "median": 60.292,
+      "min": 59.659
     },
     "median_inter_token_ms": {
-      "max": 0.336256,
-      "median": 0.329656,
-      "min": 0.321816
+      "max": 0.246055,
+      "median": 0.24199,
+      "min": 0.241547
     },
     "p95_inter_token_ms": {
-      "max": 0.445822,
-      "median": 0.413753,
-      "min": 0.402693
+      "max": 0.329282,
+      "median": 0.312023,
+      "min": 0.297976
     },
     "peak_process_ram_bytes": {
-      "max": 251822080.0,
-      "median": 251736064.0,
-      "min": 251654144.0
+      "max": 251834368.0,
+      "median": 251719680.0,
+      "min": 251666432.0
     },
     "prefill_tokens_per_s": {
-      "max": 3204.166,
-      "median": 3144.458,
-      "min": 3124.008
+      "max": 4374.9,
+      "median": 4328.964,
+      "min": 4205.603
     }
   },
   "prefill_bench": {
     "kernels": "zen3",
     "rows": [
       {
-        "batched_ms": 602.376059,
+        "batched_ms": 488.189548,
         "prompt_tokens": 185,
         "reps": 4,
-        "sequential_ms": 2646.06297
+        "sequential_ms": 2263.951594
       },
       {
-        "batched_ms": 1581.864325,
+        "batched_ms": 1608.61075,
         "prompt_tokens": 369,
         "reps": 8,
-        "sequential_ms": 5646.125689
+        "sequential_ms": 4617.520338
       }
     ],
     "shape": {

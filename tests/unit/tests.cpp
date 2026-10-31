@@ -3151,56 +3151,121 @@ void test_attention_sinks() {
 
 // C11 / C-MTP-HEAD: a checkpoint that carries a NextN (multi-token-prediction)
 // head. Upstream builds that head only when the loader asks for it
-// (`ml.load_mtp`, false in an inference run) and names its tensors
-// `blk.{n_layer}.nextn.*` / `nextn.*`, so a real file is a trunk plus a head the
-// trunk never reads. Two things therefore have to be true, and neither was
-// tested before: the file must load at all rather than being refused for names
-// the adapter cannot map, and the arithmetic must be *exactly* the trunk's.
+// (`ml.load_mtp`, false in an inference run), and the head is stored in the
+// block namespace: `n_layer_all` is `block_count`, the trunk is
+// `n_layer_all - n_layer_nextn` (`llama-model.cpp`), so a head layer's weights
+// are ordinary `blk.{n_layer}.*` tensors plus its own `nextn.*` ones. Three
+// things therefore have to be true, none of them tested before: the file must
+// load at all, the head must be ignored *by index* rather than by name, and the
+// arithmetic must be *exactly* the trunk's.
 void test_mtp_head_tolerated() {
     const std::string path = "tests/fixtures/qwen3moe-mtp-shape.gguf";
     const ModelManifest manifest = build_manifest(parse_gguf_file(path), path);
 
-    // Every head tensor is mapped as ignored, with a reason a reader can act on.
-    CHECK(manifest.ignored_tensors.size() == 5,
-          "the five head tensors are recorded as ignored, not silently dropped");
+    // 1. Both halves of the head are recorded as ignored, with a reason: the
+    //    `nextn.*` names the head owns, and every ordinary tensor of the declared
+    //    head layer. "Ignored" with no reason is the same defect as "supported"
+    //    with no test.
+    size_t named_head = 0;
+    size_t head_block = 0;
     for (const auto &entry : manifest.ignored_tensors) {
-        CHECK(entry.first.find("nextn") != std::string::npos,
-              "only NextN tensors are in the ignored list (" + entry.first + ")");
-        CHECK(entry.second.find("speculative") != std::string::npos,
+        const bool named = entry.first.find("nextn.") != std::string::npos;
+        const bool head_layer = entry.first.rfind("blk.2.", 0) == 0;
+        CHECK(named || head_layer,
+              "only head tensors are in the ignored list (" + entry.first + ")");
+        CHECK(entry.second.find("multi-token") != std::string::npos ||
+                  entry.second.find("next-token") != std::string::npos,
               "the reason names what the head is for (" + entry.second + ")");
+        if (named) ++named_head;
+        else ++head_block;
     }
-    for (const char *name : {"blk.2.nextn.eh_proj.weight", "nextn.pre_projection.weight"}) {
+    CHECK(named_head == 5, "the five `nextn.*` tensors are recorded as ignored");
+    CHECK(head_block >= 10,
+          "every tensor of the declared head layer is recorded too, not only the named ones");
+    for (const char *name : {"blk.2.nextn.eh_proj.weight", "nextn.pre_projection.weight",
+                             "blk.2.attn_q.weight", "blk.2.ffn_gate_exps.weight"}) {
         const TensorInfo *tensor = manifest.tensor(name);
         CHECK(tensor != nullptr, std::string(name) + " is in the manifest");
         if (tensor) CHECK(tensor->role == TensorRole::IGNORED, std::string(name) + " has no role");
     }
-    // The trunk's own tensors are untouched: two layers, four experts, and no
-    // extra layer invented for the head (whose index is past the block count).
-    CHECK(manifest.config.layers == 2, "the head does not add a block to the trunk");
-    CHECK(manifest.config.expert_count == 4, "the routed experts are unchanged");
-    CHECK(manifest.tensor("blk.2.attn_q.weight") == nullptr,
-          "nothing is expected at the head's layer index");
 
-    // The counterfactual: the tolerance is what lets the file load. Renaming one
-    // head tensor to a name no rule covers makes the same file a refusal, so the
-    // rule cannot be deleted without a real checkpoint failing.
+    // 2. The trunk is what runs: `block_count` is 3 and two of those blocks are
+    //    trunk, so the head neither adds a block nor changes the routed experts.
+    CHECK(manifest.config.layers == 2, "the head does not add a block to the trunk");
+    CHECK(manifest.config.mtp_layers == 1, "the file declares one head layer");
+    CHECK(manifest.config.expert_count == 4, "the routed experts are unchanged");
+
+    // Counterfactual 1: the key is what defines the trunk. Without it the file is
+    // simply a three-layer model — the head becomes a block and would execute —
+    // so the tolerance is not "ignore a high index".
     {
         GGUFDocument doc = parse_gguf_file(path);
-        const auto it = doc.tensor_by_name.find("blk.2.nextn.eh_proj.weight");
-        CHECK(it != doc.tensor_by_name.end(), "the head tensor is in the parsed document");
+        CHECK(doc.metadata.erase("qwen3moe.nextn_predict_layers") == 1,
+              "the fixture declares its head layer count");
+        const ModelManifest untrimmed = build_manifest(doc, path);
+        CHECK(untrimmed.config.layers == 3,
+              "without the key the head layer counts as a trunk layer");
+        CHECK(untrimmed.config.mtp_layers == 0, "and no head is reported");
+        const TensorInfo *head_q = untrimmed.tensor("blk.2.attn_q.weight");
+        CHECK(head_q != nullptr && head_q->role == TensorRole::ATTN_Q,
+              "the head layer's weights map to real roles, so they would execute");
+        // Only the `nextn.*` names are ignored in that reading; the head layer's
+        // block tensors become real roles, which is what makes removing the key a
+        // behaviour change rather than a cosmetic one.
+        CHECK(untrimmed.ignored_tensors.size() == 5,
+              "a three-layer file ignores only the five head tensors, not a block");
+    }
+    // Counterfactual 2: the tolerance stops at the declared head. An index past
+    // it is an error, not another ignored block.
+    {
+        GGUFDocument doc = parse_gguf_file(path);
+        const auto it = doc.tensor_by_name.find("blk.2.attn_q.weight");
+        CHECK(it != doc.tensor_by_name.end(), "the head layer tensor is in the document");
         if (it != doc.tensor_by_name.end()) {
             const size_t index = it->second;
             doc.tensor_by_name.erase(it);
-            doc.tensors[index].name = "blk.2.speculative_head.eh_proj.weight";
+            doc.tensors[index].name = "blk.4.attn_q.weight";
             doc.tensor_by_name[doc.tensors[index].name] = index;
             CHECK(throws_code(ErrorCode::UNKNOWN_TENSOR,
                               [&]() { (void)build_manifest(doc, path); }),
-                  "a head tensor with an unrecognised name is still refused");
+                  "a block past the declared head count is still an error");
+        }
+    }
+    // Counterfactual 3: a head larger than the block count is a metadata
+    // contradiction, not an invitation to ignore the trunk.
+    {
+        GGUFDocument doc = parse_gguf_file(path);
+        auto it = doc.metadata.find("qwen3moe.nextn_predict_layers");
+        CHECK(it != doc.metadata.end(), "the head layer count is in the metadata");
+        if (it != doc.metadata.end()) {
+            MetadataValue larger;
+            larger.type = GGUFValueType::UINT32;
+            larger.u = 3;
+            it->second = larger;
+            CHECK(throws_code(ErrorCode::METADATA_MISMATCH,
+                              [&]() { (void)build_manifest(doc, path); }),
+                  "a head larger than the block count is refused");
+        }
+    }
+    // Counterfactual 4: a head-layer tensor renamed out of the block namespace is
+    // refused — the index rule tolerates the head's *blocks*, not any name.
+    {
+        GGUFDocument doc = parse_gguf_file(path);
+        const auto it = doc.tensor_by_name.find("blk.2.attn_q.weight");
+        CHECK(it != doc.tensor_by_name.end(), "the head layer tensor is in the parsed document");
+        if (it != doc.tensor_by_name.end()) {
+            const size_t index = it->second;
+            doc.tensor_by_name.erase(it);
+            doc.tensors[index].name = "speculative_head.attn_q.weight";
+            doc.tensor_by_name[doc.tensors[index].name] = index;
+            CHECK(throws_code(ErrorCode::UNKNOWN_TENSOR,
+                              [&]() { (void)build_manifest(doc, path); }),
+                  "a tensor with an unrecognised name is still refused");
         }
     }
 
-    // End to end: same weights as `qwen3moe`, so it must reproduce that model's
-    // golden exactly — not merely produce logits of its own.
+    // 3. End to end: same weights as `qwen3moe`, so it must reproduce that
+    //    model's golden exactly — not merely produce logits of its own.
     ArchGolden golden = read_arch_golden("tests/golden/qwen3moe_reference.txt");
     RunConfig config;
     config.model_path = path;
@@ -3244,7 +3309,7 @@ void test_mtp_head_tolerated() {
                               " of " + std::to_string(base.prefill_logits.size()) + " differ)");
     CHECK(base.generated_ids == result.generated_ids, "both fixtures decode the same tokens");
 
-    // The probe reports the same list, so the CLI answer matches the engine's.
+    // The probe reports the ignored set, so the CLI answer matches the engine's.
     const Json probe = probe_model(parse_gguf_file(path), path);
     CHECK(probe.dump().find("nextn.eh_proj") != std::string::npos,
           "the probe names the ignored head tensors");
@@ -3389,6 +3454,7 @@ void test_architecture_parity() {
                                            "gpt2", "starcoder", "falcon", "mpt",
                                            "seed-oss", "plamo", "smallthinker", "command-r", "olmo", "phimoe",
                                            "olmo2", "olmoe", "granite", "granitemoe",
+                                           "bailingmoe", "bailingmoe2",
                                            "baichuan", "chatglm"};
     for (const std::string &slug : slugs) {
         const std::string model = "tests/fixtures/" + slug + "-shape.gguf";

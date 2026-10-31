@@ -8,7 +8,7 @@ verification. Hashes are SHA-256 of the exact redirected output file listed.
 | Command | Output file | SHA-256 |
 |---|---|---|
 | `make clean && make -j1` | `docs/evidence/phase0_build.log` | `02527494b9e6c5aba61eece33fc698146b2d706290de8276d028c4266f3653c4` |
-| `./build/tests` | `docs/evidence/phase0_unit.log` | `adab9e4946ead01b97280164ba129755ce5f4c0e4df0635fd67dee017aca7dca` |
+| `./build/tests` | `docs/evidence/phase0_unit.log` | `5a97aac341d1205e57927a41fcea9509dd3fc2b1a7effb317ba57d430195316e` |
 | `./build/freemoe inspect tests/fixtures/dense-fm.gguf --json` | `docs/evidence/inspect_dense.json` | `ca511e04444bc2954f737c00cfe09a4690f953f31d382ccd6afbfc42e3caa181` |
 | `./build/freemoe inspect tests/fixtures/moe-fm.gguf --json` | `docs/evidence/inspect_moe.json` | `13d6ef45ecc7aa58e06f9c58a39cc86db0e72c92040b97ddbf2768982468d653` |
 | `python3 tools/trace_replay.py --trace build/test-tmp/replay-trace.jsonl --metrics build/test-tmp/replay-metrics.json --check` | `docs/evidence/phase0_replay.json` | `02c8aed9a8de426328d25d923f4888ac40a1ff1c1bf4820557395aec60e2628b` |

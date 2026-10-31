@@ -432,19 +432,34 @@ activation, norm biases and FFN biases, and their fixtures pin the logits.
 6. ~~Architecture variants: `gemma`, `phi3`, `qwen2`, `qwen3`, `glm4`,
    `minicpm`, `qwen3moe`, `qwen2moe`, `phi2`.~~ **DONE**
    ~~MLA (`deepseek2`)~~ **DONE** — see the section above.
+   ~~`bailingmoe` / `bailingmoe2`~~ **DONE** — the softmax router's weight
+   renormalisation and scale are metadata, the shared expert is *added* rather
+   than gated (there is no gate tensor to read), and v2's fused qkv, per-head q/k
+   norm before the rope, dense leading blocks and router selection bias were all
+   flags this build already read. Two fixtures, two oracle goldens, three
+   mutations (below).
    Still open: `glm4-moe`, `minicpm3`, `olmo2` (its q/k norm is *not* per head,
    so it needs a second norm placement), `olmoe`/`mixtral` (MoE variants of the
-   same block), the MTP/`nextn` heads (parsed, reported as ignored in `inspect`,
-   and pinned by the `qwen3moe-mtp` fixture: the file loads, the head's five
-   tensors are mapped to `IGNORED` with the reason, and the logits are
-   bit-identical to the same checkpoint without the head), and the rest of
-   llama.cpp's `src/models/` tree.
+   same block), and the rest of llama.cpp's `src/models/` tree.
+   ~~MTP/`nextn` heads~~ **DONE** — a checkpoint's head is ignored in both of the
+   places upstream puts it: the loader subtracts `*.nextn_predict_layers` from
+   `block_count` (upstream's `n_layer_all`) and maps the head layers' ordinary
+   `blk.{n_layer}.*` tensors and their `nextn.*` names to `IGNORED`, with the
+   reason reported in `inspect`. Pinned by the `qwen3moe-mtp` fixture and the
+   `mtp_head_tolerated` test: the file loads, every head tensor is reported, the
+   logits are bit-identical to the same weights without a head, and removing
+   either half of the rule changes what runs.
 6b. ~~**Chat templates.**~~ **DONE** — restricted Jinja interpreter, 10 built-in
    templates, evidence-based selection, `--render-only` for inspection.
 7. **Ternary formats** (`PTQ1_0`/`TQ1_0`/`TQ2_0`) for #20 and #21.
 8. **Multimodal** (#8) is out of scope for this engine: the text decoder can be
    supported, the vision tower cannot, and pretending otherwise would be the
    exact kind of fake capability this project refuses.
+
+The census in `docs/GAP_ANALYSIS.md` §C11 is the durable version of this list:
+171 families at the pinned upstream commit, each mapped, blocked by a named
+capability, or queued for a graph read in a stated order. This page stays the
+narrative; that one is generated and gated.
 
 ## Acceptance rule
 

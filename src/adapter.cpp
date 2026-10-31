@@ -82,6 +82,17 @@ const AdapterRow kRows[] = {
      "scaled residual branches, logits divided by logit_scale"},
     {"granitemoe", "LLM_ARCH_GRANITE_MOE", "llama_model_granite::graph",
      "granite's block with routed and shared experts"},
+    // bailingmoe (src/models/bailingmoe.cpp): the llama block with routed
+    // experts, a sigmoid-free softmax router that may renormalise and rescale its
+    // weights, and a shared expert that is *added* rather than gated -- there is
+    // no `ffn_gate_inp_shexp` tensor in the file at all.
+    {"bailingmoe", "LLM_ARCH_BAILINGMOE", "llama_model_bailingmoe::build_arch_graph",
+     "softmax router with optional weight norm/scale plus an ungated shared expert"},
+    // bailingmoe2 (src/models/bailingmoe2.cpp): the same feed-forward with a fused
+    // q/k/v projection, a per-head RMSNorm on q and k before the rotary, dense
+    // leading blocks, an optional selection bias on the router and a real MTP head.
+    {"bailingmoe2", "LLM_ARCH_BAILINGMOE2", "llama_model_bailingmoe2::build_arch_graph",
+     "fused qkv, per-head q/k norm, dense lead, selection bias, MTP head"},
 
     {"bloom", "LLM_ARCH_BLOOM", "llama_model_bloom::build_arch_graph",
      "ALiBi attention, biased LayerNorm, embedding norm"},

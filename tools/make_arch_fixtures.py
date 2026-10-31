@@ -412,6 +412,16 @@ def arch_tensors(spec: dict[str, Any]) -> list[TensorSpec]:
                                 ("attn_output", 0.75), ("ffn_gate", 1.25),
                                 ("ffn_up", 0.5), ("ffn_down", 2.0)):
                 out += [tensor(p + name + ".scale", [1], 0.0, values=[value])]
+    if int(spec.get("mtp_layers", 0) or 0):
+        # A real head is a full extra block: llama.cpp allocates `n_layer_all`
+        # layers and fills the head's with the same tensor set under its own
+        # index. Copying block 0 is exactly that shape, and it keeps this fixture
+        # from drifting from the trunk block the engine actually runs.
+        trunk_block = [t for t in out if t.name.startswith("blk.0.")]
+        for head_layer in range(layers, layers + int(spec["mtp_layers"])):
+            for t in trunk_block:
+                out.append(TensorSpec(f"blk.{head_layer}." + t.name[len("blk.0."):],
+                                      list(t.dims), t.data, t.type_id))
     if spec.get("mtp_tensors"):
         # The NextN / MTP head. Upstream names it `blk.{n_layer}.nextn.*` and
         # skips it outright unless the loader is asked for MTP
@@ -444,13 +454,21 @@ def arch_tensors(spec: dict[str, Any]) -> list[TensorSpec]:
 def arch_metadata(spec: dict[str, Any]) -> dict[str, tuple[Any, ...]]:
     arch = spec["arch"]
     h = spec["hidden"]
+    # An MTP head's layers are part of `block_count` in llama.cpp: the key is read
+    # into `n_layer_all` and the trunk is `n_layer_all - n_layer_nextn`. A fixture
+    # that wrote only the trunk would not be shaped like a real checkpoint.
+    mtp_layers = int(spec.get("mtp_layers", 0) or 0)
+    blocks = spec["layers"] + mtp_layers
+    md_extra: dict[str, tuple[Any, ...]] = {}
+    if mtp_layers:
+        md_extra[f"{arch}.nextn_predict_layers"] = ("u32", mtp_layers)
     md: dict[str, tuple[Any, ...]] = {
         "general.architecture": ("string", arch),
         "general.name": ("string", spec["name"]),
         "general.alignment": ("u32", ALIGN),
         "general.file_type": ("u32", 0),
         "general.quantization_version": ("u32", 1),
-        f"{arch}.block_count": ("u32", spec["layers"]),
+        f"{arch}.block_count": ("u32", blocks),
         f"{arch}.embedding_length": ("u32", h),
         # A pure state-space file states none of these: llama.cpp's mamba
         # loader reads no head count, no feed-forward width and no rotary width,
@@ -568,6 +586,16 @@ def arch_metadata(spec: dict[str, Any]) -> dict[str, tuple[Any, ...]]:
         # multiple of the period is windowed.
         md[f"{arch}.attention.sliding_window_pattern"] = (
             "u32", spec["sliding_window_pattern"])
+    if mtp_layers:
+        # llama.cpp sizes per-layer arrays by `n_layer_all`, head layers included
+        # (`get_key_or_arr(..., hparams.n_layer_all)`). The array form is written
+        # here so the fixture proves the trunk truncates such an array instead of
+        # demanding one entry per trunk layer.
+        md[f"{arch}.attention.head_count_kv"] = (
+            "array_i32", [spec["kv_heads"]] * blocks)
+    for name, entry in (spec.get("arch_metadata") or {}).items():
+        md[f"{arch}.{name}"] = entry
+    md.update(md_extra)
     return md
 
 
@@ -842,6 +870,60 @@ SPECS: list[dict[str, Any]] = [
         "experts": 4,
         "expert_top_k": 2,
         "shared_expert": True,
+    },
+    {
+        # bailingmoe (llama.cpp src/models/bailingmoe.cpp): the llama block with
+        # routed experts, a softmax router whose weights may be renormalised and
+        # rescaled, and a shared expert that is *added* rather than gated -- there
+        # is no `ffn_gate_inp_shexp` tensor at all, which is the one thing that
+        # separates it from qwen2moe's shared expert. The three feed-forward
+        # widths differ (64 dense, 40 per expert, 24 shared) so a runtime that
+        # reuses one for another cannot match the golden, and the router knobs are
+        # in the file rather than assumed.
+        "slug": "bailingmoe",
+        "arch": "bailingmoe",
+        "name": "FreeMoe synthetic bailingmoe with an ungated shared expert",
+        "kv_heads": 2,
+        "experts": 4,
+        "expert_used": 2,
+        "expert_width": 40,
+        "shared_expert": True,
+        "shared_gate": False,
+        "shared_width": 24,
+        "arch_metadata": {
+            "expert_weights_norm": ("bool", True),
+            "expert_weights_scale": ("f32", 1.5),
+        },
+    },
+    {
+        # bailingmoe2 (llama.cpp src/models/bailingmoe2.cpp): the same feed-forward
+        # with four attention differences at once -- one fused q/k/v projection,
+        # a per-head RMSNorm on q and k *before* the rotary, one dense leading
+        # block, and an optional selection bias on the router (`ffn_exp_probs_b`,
+        # added to the logits before the gating function, which is sigmoid here).
+        # A head block rides along so the MTP rule is exercised on a family whose
+        # block is not qwen3moe's.
+        "slug": "bailingmoe2",
+        "arch": "bailingmoe2",
+        "name": "FreeMoe synthetic bailingmoe2: fused qkv, q/k norm, dense lead, MTP",
+        "kv_heads": 2,
+        "fused_qkv": True,
+        "qk_norm": True,
+        "dense_lead": 1,
+        "gating": 2,
+        "experts": 4,
+        "expert_used": 2,
+        "expert_width": 40,
+        "expert_bias": True,
+        "shared_expert": True,
+        "shared_gate": False,
+        "shared_width": 24,
+        "mtp_layers": 1,
+        "mtp_tensors": True,
+        "arch_metadata": {
+            "expert_weights_norm": ("bool", True),
+            "expert_weights_scale": ("f32", 1.5),
+        },
     },
     {
         # baichuan 13B (llama.cpp src/models/baichuan.cpp): the block is chosen by
@@ -1195,6 +1277,11 @@ SPECS: list[dict[str, Any]] = [
         "qk_norm": True,
         "experts": 4,
         "expert_used": 2,
+        # Both halves of a real head: `block_count` counts it and
+        # `nextn_predict_layers` says how many of those blocks are head, so the
+        # head layer's tensors are ordinary `blk.{n_layer}.*` blocks; plus the
+        # `nextn.*` names the head itself carries.
+        "mtp_layers": 1,
         "mtp_tensors": True,
     },
     {

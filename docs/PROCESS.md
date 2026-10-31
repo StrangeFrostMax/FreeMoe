@@ -233,3 +233,53 @@ profile did not dispatch, so the claim is enforced rather than trusted. What is
 still open is the hardware, not the software: the sandbox is a 2-vCPU Xeon KVM
 guest, so the numbers are from the target's *code path* and not from a Zen 3
 part (D1).
+
+## Evidence for census batch 1, slice A: `bailingmoe` and `bailingmoe2`
+
+Two families from the 14-row MoE-trunk queue, both read from upstream at the
+pinned commit (`src/models/bailingmoe.cpp`, `src/models/bailingmoe2.cpp`) and
+both landed as adapter rows with **no new forward-pass code**, because every
+difference they carry was already a flag the adapter reads:
+
+| Difference | Where it comes from | What reads it |
+|---|---|---|
+| softmax router, weights optionally renormalised and rescaled | `build_moe_ffn(..., LLM_FFN_SILU, expert_weights_norm, expert_weights_scale, SOFTMAX)` | `expert_weights_norm` / `expert_weights_scale` metadata |
+| shared expert **added**, not gated — no `ffn_gate_inp_shexp` tensor exists | two `build_ffn` calls, one `ggml_add` | shared-expert detection from tensors; the gate scalar is 1.0 when the input projection is absent |
+| one fused q/k/v projection (`attn_qkv`) | `create_tensor_qkv` with the fused layout | the fused-qkv path, already exercised by `phi3` |
+| per-head RMSNorm on q and k, **before** the rotary | `build_norm(Qcur, ...)` above both `ggml_rope_ext` calls | `attn_q_norm` / `attn_k_norm` with the default placement |
+| dense leading blocks, then MoE | `n_layer_dense_lead` | `leading_dense_block_count` |
+| selection bias added to router logits before the gating function | `ffn_exp_probs_b` | `ffn_exp_probs_b.bias` |
+| MTP head inside `block_count` | the `n_layer_all` loop with `TENSOR_SKIP` | the MTP rule from the previous batch |
+
+Gate: `./build/tests` → **3862 checks, 0 failures** (3824 before the batch; the
+two new fixtures add 19 checks each). `python3 tools/triage_upstream_archs.py
+--write` moved the census to **63 mapped, 2 with a caveat, 36 blocked, 70
+unclassified** (61 / 2 / 36 / 72 before), and the queue re-anchored itself on the
+new rows: `deepseek`, `dots1`, `ernie4-5-moe` and `hunyuan-moe` now name
+`bailingmoe2` as their closest mapped shape instead of `xverse`.
+
+The three mutations that make the new rows non-silent:
+
+| Mutation | Turns red |
+|---|---|
+| ignore `expert_weights_scale` when building the config | `prefill logits match the independent reference: bailingmoe` (worst abs 0.35) and the same check for `bailingmoe2` (0.20), plus both greedy checks |
+| drop the ungated shared-expert branch (`if (!shared_expert_gate) continue`) | the same four checks, worst abs 1.06 for `bailingmoe` |
+| normalise q and k **after** the rope for `bailingmoe2` only | `bailingmoe2`'s logits (0.16) and greedy ids; `bailingmoe` stays green, which is what proves the check is family-specific |
+
+A fourth property is structural rather than arithmetic: the two fixtures give the
+dense FFN (64), the routed experts (40) and the shared expert (24) three
+different widths, so a runtime that reuses one width for another cannot match
+either golden.
+
+Not verified, and stated rather than implied: no `bailingmoe`/`bailingmoe2`
+checkpoint exists in this sandbox, so the fixtures are shaped from the upstream
+loader's own rules rather than copied from a real file; the oracle is an
+independent implementation of the forward pass but it was written from the same
+reading of the same two files, so it proves the engine matches *that reading*,
+not that the reading is right; and the fixtures are two trunk layers, so nothing
+here tests a 20B file's memory behaviour.
+
+The other twelve rows of batch 1 — `deepseek`, `dots1`, `dbrx`, `ernie4-5-moe`,
+`exaone-moe`, `flint`, `glm4-moe`, `grovemoe`, `hunyuan-moe`, `maion-coder`,
+`maple`, `minimax-m2` — are still `unclassified`. They are the next slice, in
+that order.
