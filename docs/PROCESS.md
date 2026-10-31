@@ -88,8 +88,19 @@ family), the PR says so in a sentence and names the next permitted check:
 > checkpoint is in this workspace; a real `command-r` file must be run by
 > someone with weights before "Command R runs" is claimed outside the fixture.
 
-Numbers carry their environment: "2.72x on a 2-core sandbox, hidden 512,
-8 layers, median of 2" is evidence; "2.7x faster" is not.
+Numbers carry their environment: "3.40x on a 2-vCPU Xeon sandbox, hidden 512,
+8 layers, `--kernels zen3`, median of 3" is evidence; "3.4x faster" is not. The
+ISA is part of the environment, because a run that dispatched AVX-512 measured a
+path the Zen 3 target cannot execute.
+
+A number quoted in a document is rendered from the evidence file, not typed into
+it. `scripts/kernels_table.py` renders the measured tables in `docs/KERNELS.md`
+from `docs/evidence/kernels_bench.json`; `make test` and
+`scripts/collect_evidence.py` run it with `--check` and go red on any
+disagreement. The first revision of that section typed the numbers by hand, the
+archive was then replaced by a later run, and every hash-based check stayed green
+because nothing was comparing the two. A table that cannot be regenerated is a
+claim without an artefact.
 
 ## 7. Commits and PRs
 
@@ -197,6 +208,14 @@ End to end on `llama-gqa-shape.gguf`, all four are observable from the CLI:
 `--min-p 1.5`, `--logit-bias 9999:1` and `--logit-bias 3` are refused by name.
 
 Not verified, and stated rather than implied: DRY, grammar constraints,
-typical-p and XTC are **not** implemented. C10's code is verified but its
-*measurement* is not — the benchmark runs in `results/` predate `--kernels`, so
-they still describe an AVX-512 dispatch and must be re-run with `--kernels zen3`.
+typical-p and XTC are **not** implemented.
+
+C10 is verified end to end, measurement included. The benchmark was re-run with
+`--kernels zen3`, the run's `protocol.txt` records `extra_args=--kernels zen3`,
+and `scripts/archive_benchmark.py` re-derived the dispatch from the five reports
+into `docs/evidence/benchmark_zen3.json`: 637,100 of 637,100 compute operations
+ran `cpu-avx2_fma`, none ran AVX-512. That script exits non-zero if a pinned
+profile did not dispatch, so the claim is enforced rather than trusted. What is
+still open is the hardware, not the software: the sandbox is a 2-vCPU Xeon KVM
+guest, so the numbers are from the target's *code path* and not from a Zen 3
+part (D1).

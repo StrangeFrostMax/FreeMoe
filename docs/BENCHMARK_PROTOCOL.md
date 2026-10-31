@@ -11,8 +11,8 @@ support for production GGUF checkpoints.
 | Reference runtime | Independent scalar Python oracle, `tools/reference_oracle.py` |
 | D5 pinned tree | `deee8aa67b9615a0ef8cd73aaa4c8aca6469cfa5` |
 | Oracle file SHA-256 | `bd5af7463c47139e08d8a3ec07e0cf8f196d2aa4368b03b0dc9bd3e262b2dfa7` |
-| Fixture generator SHA-256 | `3b06ba80ae618074d6aefd1665ede19692be56b9c5f92cacbc3436868dea435c` |
-| Full reference manifest SHA-256 | `6b946e2c48097d5d55e945c4772db3e24dd847318d4ec9fa63c393a55d38158a` |
+| Fixture generator SHA-256 | `70953fe29a270b37a671a3bf6d9ffb75f48cde45055fc0ea3dcf7c8420631694` |
+| Full reference manifest SHA-256 | `cd06c2b4ffb038232b327836d0b37bc8fe5e752e309c3875488fdbc400da5528` |
 | Python | 3.11.2 standard library only |
 | Build command | none (Python source is executed directly) |
 | Compiler/build flags | not applicable |
@@ -66,6 +66,25 @@ The recorded profile is the deployment target's: `--kernels zen3`, i.e. dual
 AVX-512 requires an explicit request; a run that used it would not describe a
 Zen 3 machine.
 
+The profile is part of the record, not of the narrative. `benchmarks/run_repeats.sh`
+writes `extra_args` into the run's `protocol.txt`, every backend operation names
+the ISA it ran (`cpu-avx2_fma`), and
+
+```sh
+mkdir -p build
+python3 tools/bench_prefill.py --kernels zen3 --repeat 3 2>/dev/null | tail -1 \
+    > build/prefill_zen3.json
+python3 scripts/archive_benchmark.py \
+    --run-dir results/benchmark/synthetic-moe-buffered \
+    --prefill-json build/prefill_zen3.json
+```
+
+turns that run into `docs/evidence/benchmark_zen3.json` — summary medians and
+spreads, the reference comparison, the ISA tally and the `tools/bench_prefill.py`
+rows. It **fails** (non-zero exit, `status: fail` in the file) when a pinned
+profile did not dispatch, so an archive cannot claim the target's numbers for a
+run that fell back to another ISA.
+
 These are project inputs, not measured hardware claims. The exact target
 Zen 3 CPU model, RAM, storage, GPU/NPU SDK, driver and usable VRAM are **unknown
 (D1)**, so the performance-qualified release gate remains closed until a real
@@ -105,6 +124,7 @@ make fuzz FUZZ_SECONDS=72
 make soak
 bash scripts/run_record.sh configs/example.env
 bash benchmarks/run_repeats.sh configs/benchmark.env
+python3 scripts/archive_benchmark.py --run-dir results/benchmark/synthetic-moe-buffered
 ```
 
 ## D8 prompt and ID file hashes

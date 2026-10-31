@@ -1,0 +1,90 @@
+{
+  "commit": "31288ab8de68337cf115199eb8f7293fa832db05",
+  "comparison": {
+    "matching_tokens": 320,
+    "max_abs_diff": "0.000000238",
+    "max_rel_diff": "0.001430445",
+    "prompts": 20,
+    "prompts_routing_match": 20,
+    "prompts_token_match": 20,
+    "prompts_within_tolerance": 20,
+    "reference_tokens": 320,
+    "report": "results/benchmark/synthetic-moe-buffered/synthetic-moe-buffered_r1/report.json",
+    "status": "pass"
+  },
+  "host": {
+    "cpu": "Intel(R) Xeon(R) Processor @ 2.60GHz",
+    "note": ""
+  },
+  "isa_dispatch": {
+    "cpu-avx2_fma": 637100,
+    "scalar-control": 638705
+  },
+  "metrics": {
+    "decode_tokens_per_s": {
+      "max": 3599.57,
+      "median": 3520.388,
+      "min": 3484.093
+    },
+    "first_token_latency_ms": {
+      "max": 71.818,
+      "median": 70.693,
+      "min": 68.344
+    },
+    "median_inter_token_ms": {
+      "max": 0.28299,
+      "median": 0.279076,
+      "min": 0.272232
+    },
+    "p95_inter_token_ms": {
+      "max": 0.356715,
+      "median": 0.350522,
+      "min": 0.33656
+    },
+    "peak_process_ram_bytes": {
+      "max": 251764736.0,
+      "median": 251731968.0,
+      "min": 251604992.0
+    },
+    "prefill_tokens_per_s": {
+      "max": 3818.908,
+      "median": 3692.037,
+      "min": 3634.172
+    }
+  },
+  "prefill_bench": {
+    "kernels": "zen3",
+    "rows": [
+      {
+        "batched_ms": 542.0013,
+        "reps": 4,
+        "sequential_ms": 1841.295831
+      },
+      {
+        "batched_ms": 1477.609544,
+        "reps": 8,
+        "sequential_ms": 4410.274774
+      }
+    ],
+    "shape": {
+      "heads": 8,
+      "hidden": 512,
+      "intermediate": 2048,
+      "layers": 8
+    },
+    "status": "ok"
+  },
+  "problems": [],
+  "protocol": {
+    "extra_args": "--kernels zen3",
+    "min_prefill_tps": 1000.0,
+    "model": "tests/fixtures/moe-fm.gguf backend=cpu reader=buffered cache_slots=1",
+    "repetitions": 5,
+    "requested_profile": "zen3",
+    "target_p95_ms": 50.0
+  },
+  "schema": "freemoe.benchmark-archive.v1",
+  "source_run": "results/benchmark/synthetic-moe-buffered",
+  "status": "pass",
+  "target_status": "pass"
+}

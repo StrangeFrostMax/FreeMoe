@@ -71,6 +71,19 @@ Swap:             0B          0B          0B
 The GPU placeholder reports `dedicated_vram_bytes=0` and `backend="not
 implemented"`. This is not a successful physical GPU query.
 
+### Benchmark record on this sandbox
+
+| Field | Value |
+|---|---|
+| Command | `bash benchmarks/run_repeats.sh configs/benchmark.env` |
+| Profile | `--kernels zen3` (AVX2 + FMA3), recorded in the run's `protocol.txt` |
+| Dispatch observed | 637,100 `cpu-avx2_fma` compute operations, 0 `cpu-avx512` |
+| Record | `docs/evidence/benchmark_zen3.json` (`scripts/archive_benchmark.py`) |
+
+The host *has* AVX-512 (see the `lscpu` flags above); the run pinned it off, so
+the numbers describe the code path the Zen 3 target executes. They are still not
+target numbers: this is a 2-vCPU KVM guest, not a Zen 3 part.
+
 ## Target profile
 
 The user identified the target CPU family as **Zen 3** and correctly noted

@@ -1,8 +1,8 @@
 {
   "iterations": 72000,
-  "typed_errors": 35561,
-  "accepted": 36803,
-  "elapsed_ms": 72000,
+  "typed_errors": 35365,
+  "accepted": 37027,
+  "elapsed_ms": 72001,
   "seed": 16707086,
   "sanitizers": "address,undefined"
 }

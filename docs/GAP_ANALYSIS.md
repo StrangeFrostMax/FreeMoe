@@ -83,28 +83,47 @@ Every claim below is either a result produced in this tree or a citation into
 | Upstream architectures with an adapter | **61 of the 171** files in upstream `src/models/` match an adapter row by name, plus five that upstream spells differently (`gpt-oss`→`openai-moe`, `granitemoe`→`granite-moe`, `smollm`, `smollm2`, `tinyllama`→the `llama` block) |
 | Quantisation types decodable | **26** (`src/quant.cpp`) |
 | Error codes | **28** non-OK codes (`include/fm/common.hpp:27`) |
-| Benchmark vs declared targets | **pass** on the synthetic fixture; the recorded runs predate `--kernels` and so were dispatched on AVX-512 (C10) |
+| Benchmark vs declared targets | **pass** on the synthetic fixture with `--kernels zen3`: 637,100 of 637,100 compute operations dispatched `cpu-avx2_fma` and none on AVX-512 (C10, `docs/evidence/benchmark_zen3.json`) |
 
 ### The one benchmark that exists
 
 `bash benchmarks/run_repeats.sh configs/benchmark.env` → `results/benchmark/synthetic-moe-buffered/`
 (git-ignored), 5 process-cold repetitions, 20 prompts × 16 tokens, model
 `tests/fixtures/moe-fm.gguf` (native 2-layer fixture, vocab 258), buffered
-reader, `CACHE_SLOTS=1`:
+reader, `CACHE_SLOTS=1`, **`--kernels zen3`** (recorded in the run's
+`protocol.txt`, which now carries `extra_args`):
 
 | Metric | Median | Range | Declared target | Verdict |
 | --- | --- | --- | --- | --- |
-| Prefill | 3051 tok/s | 2991–3072 | ≥ 1000 | pass |
-| p95 inter-token | 0.41 ms | 0.39–0.58 | ≤ 50 ms | pass |
-| First token | 85.5 ms | 84.9–87.2 | — | — |
-| Peak process RAM | 251 MB | ±78 kB | — | — |
-| Reference comparison | 20/20 prompts, 320/320 tokens, 0 routing mismatches, max rel diff 4.3e-4 | — | 20/20 | pass |
+| Prefill | 3692 tok/s | 3634–3819 | ≥ 1000 | pass |
+| p95 inter-token | 0.351 ms | 0.337–0.357 | ≤ 50 ms | pass |
+| First token | 70.7 ms | 68.3–71.8 | — | — |
+| Peak process RAM | 251.7 MB | ±78 kB | — | — |
+| Reference comparison | 20/20 prompts, 320/320 tokens, 0 routing mismatches, max rel diff 1.4e-3 | — | 20/20 | pass |
 
-Two things this does **not** establish, both already noted in
-`docs/BENCHMARK_PROTOCOL.md`: the model is a 2-layer synthetic fixture, so
-3051 tok/s says nothing about a real MoE checkpoint or about disk paging
-(`cache_hit_rate` is 0.0 because there is one slot and no eviction); and the
-run dispatched `cpu-avx512` kernels, which is not the Zen 3 profile. See C10.
+The ISA is now part of the record rather than an assumption. Every one of the
+637,100 compute operations in the five reports names `cpu-avx2_fma`; there is no
+`cpu-avx512` operation anywhere in the logs. `python3 scripts/archive_benchmark.py`
+re-derives that from the reports into `docs/evidence/benchmark_zen3.json` and
+**exits non-zero** if a pinned profile did not dispatch, so a future run cannot
+quietly fall back to AVX-512 and still be archived as the target's numbers.
+
+Three things this does **not** establish, all noted in
+`docs/BENCHMARK_PROTOCOL.md`:
+
+* the model is a 2-layer synthetic fixture, so 3692 tok/s says nothing about a
+  real MoE checkpoint, and `cache_hit_rate` is 0.0 because there is one slot and
+  no eviction, so it says nothing about disk paging either;
+* the host is a 2-vCPU KVM guest on an Intel Xeon that *does* have AVX-512. The
+  code path measured is the target's (AVX2 + FMA3), but the microarchitecture is
+  not a Zen 3 part, so these are not target cycle counts — D1's exact machine is
+  still unknown;
+* the AVX-512-dispatched figures that stood here previously (3051 tok/s, p95
+  0.41 ms, first token 85.5 ms) were a measurement of a path the target cannot
+  execute; they are replaced, not compared. The two records cannot be read as an
+  ISA comparison in either direction: the code changed between them (C2's
+  prefill ordering, C3's cache), and a 2-vCPU guest has enough variance that a
+  single pair of medians would not separate the causes.
 
 ---
 
@@ -278,18 +297,27 @@ test against a real vocabulary.
 > takes that path whenever `supports_batched_prefill()` accepts the block, and
 > `--prefill sequential` (`BackendConfig::batched_prefill = false`) keeps the
 > token-at-a-time path for comparison. Both paths are pinned against each other
-> by `batched_prefill` (62 checks) — identical tokenisation, logits and greedy
+> by `batched_prefill` (76 checks) — identical tokenisation, logits and greedy
 > ids — and the seven block features the batch path does not model yet are
 > pinned by name, so a family cannot silently take a path that ignores its
 > detail.
 >
-> Measured here (`tools/bench_prefill.py`, synthetic dense llama, hidden 512 /
-> intermediate 2048 / 8 layers, 2-core host, `--prefill` toggled, median of 2):
+> Measured here (`tools/bench_prefill.py --kernels zen3`, synthetic dense llama,
+> hidden 512 / intermediate 2048 / 8 layers, 2-vCPU Xeon sandbox, `--prefill`
+> toggled, median of 3 per mode; the same run is archived as `prefill_bench` in
+> `docs/evidence/benchmark_zen3.json`):
 >
-> | prompt | sequential | batched | speedup |
-> | --- | --- | --- | --- |
-> | 185 tokens (x4) | 1443.1 ms | 491.4 ms | **2.94x** |
-> | 369 tokens (x8) | 3765.5 ms | 1382.2 ms | **2.72x** |
+> | prompt | sequential | batched | speedup | repeated invocations |
+> | --- | --- | --- | --- | --- |
+> | 185 tokens (x4) | 1841.3 ms | 542.0 ms | **3.40x** | 3.1–3.7x |
+> | 369 tokens (x8) | 4410.3 ms | 1477.6 ms | **2.98x** | 2.6–3.0x |
+>
+> The two right-hand columns are the archived run and what five separate
+> invocations of the same command produced. Batched prefill is stable to a few
+> percent (539–568 ms at x4, 1460–1503 ms at x8); sequential prefill is not
+> (1775–2086 ms and 3854–4410 ms on this guest), which is why the ratio is given
+> as a range rather than a point. These are AVX2 numbers: the 2.94x / 2.72x this
+> section used to carry came from runs that dispatched AVX-512 (C10).
 >
 > The original finding follows. `run_prompt` fed prompt tokens one at a time.
 > Correct, but it cost N forward passes instead of one GEMM-heavy pass, and it
@@ -534,21 +562,38 @@ Evidence: `bloom` and `jais` fixtures, oracle goldens, parity rows. Mutating the
 bias away fails by 0.077 (bloom) and 0.444 (jais); mutating the embedding norm
 away fails bloom by 1.440.
 
-### C10. ~~Benchmarks run on an ISA the target CPU does not have~~ — **FIXED (code); re-run still owed**
+### C10. ~~Benchmarks run on an ISA the target CPU does not have~~ — **FIXED; measured**
 
-The knob exists now: `--kernels auto|scalar|avx2|zen3|avx512` selects the CPU
-backend's ISA, `resolve_kernel_isa` applies the Zen 3 policy (`zen3` and `avx2`
-pin AVX2/FMA3, and `auto` **never** selects AVX-512 because the target cannot
-execute it), and each backend operation reports the ISA it actually ran
-(`record_operation(..., "cpu-" + kernel_isa_name(...))`). `device-info` prints
-`resolved_isa`. Pinned by the `kernel_isa` checks: scalar stays scalar, `zen3`
-parses to `avx2_fma`, an unknown profile is refused.
+The knob: `--kernels auto|scalar|avx2|zen3|avx512` selects the CPU backend's ISA,
+`resolve_kernel_isa` applies the Zen 3 policy (`zen3` and `avx2` pin AVX2/FMA3,
+and `auto` **never** selects AVX-512 because the target cannot execute it), and
+each backend operation reports the ISA it actually ran
+(`record_operation(..., "cpu-" + kernel_isa_name(...))`). `freemoe bench --json`
+reports `resolved_isa` for the host's `auto` policy; the per-run record is the
+operation log, not that summary line. Pinned by the `kernel_isa` checks: scalar
+stays scalar, `zen3` parses to `avx2_fma`, an unknown profile is refused.
 
-What is still owed is the **measurement**, not the code: the benchmark reports
-in `results/` were produced before the knob, and re-running
-`benchmarks/run_repeats.sh` with `--kernels zen3` on this host is what turns
-"the numbers describe the target" from a claim into a record. Until that run is
-pasted here, treat the AVX-512-dispatched figures as historical.
+The **measurement** was the part owed, and it is now recorded:
+
+* `configs/benchmark.env` pins `EXTRA_ARGS="--kernels zen3"`, and
+  `benchmarks/run_repeats.sh` writes `extra_args` into the run's `protocol.txt`.
+  A run record that does not say which profile ran cannot be re-checked; the old
+  records did not.
+* `python3 scripts/archive_benchmark.py` reads the five reports of that run,
+  tallies `backend.operations[].backend`, and writes
+  `docs/evidence/benchmark_zen3.json`. Result: **637,100 `cpu-avx2_fma`
+  operations, zero `cpu-avx512`**. The script exits non-zero if a pinned profile
+  did not dispatch, so "the numbers describe the target" is now enforced at
+  archive time rather than asserted in prose.
+* The re-run numbers replace the AVX-512 ones in the baseline section above:
+  prefill 3692 tok/s (was 3051), p95 0.351 ms (was 0.41 ms), first token
+  70.7 ms (was 85.5 ms). That is not an ISA comparison — different code, and a
+  2-vCPU guest — it is simply the record of the path the target can execute.
+
+Still open, and not something a re-run on this host can close: the sandbox is a
+2-vCPU KVM guest on an Intel Xeon, not a Zen 3 machine. The *code path* is the
+target's, the *microarchitecture* is not, so these are not target cycle counts.
+That needs the D1 hardware record (`docs/TEST_MACHINE.md`) to exist.
 
 ---
 
@@ -577,7 +622,7 @@ fabricating a capability.
 | 3 | **YaRN / `rope_freqs`** (C4) | +14 models, one rotary change, already isolated behind `rope_dim` | S |
 | 4 | **CPU ISA override + AVX2-only re-benchmark** (C10) | Today's only performance evidence is from an ISA the target lacks | S |
 | 5 | **Eviction-exercising benchmark config** (§A Phase 5/6) | Without it the cache-policy and prefetch gates cannot be evaluated at all | S |
-| 6 | ~~**Batched prefill** (C2)~~ **done** (2.72-2.94x measured) | Largest throughput win at prompt length > 32; makes §10.2 metrics honest | L |
+| 6 | ~~**Batched prefill** (C2)~~ **done** (3.4x at 185 tokens, 3.0x at 369, `--kernels zen3`) | Largest throughput win at prompt length > 32; makes §10.2 metrics honest | L |
 | 7 | ~~**IQ1–IQ4 / MXFP4 decoders** (C7)~~ **done** | Unlocks quantised checkpoints of MoE families that are already supported | M |
 | 8 | ~~**GEGLU_ERF**~~ **done**; **SITU** (C9 remainder) | `gelu_erf` is reachable through `mistral3`; `SITU` is unimplemented upstream too (`GGML_ABORT`), so no file can be checked against it | S |
 | 9 | ~~**mamba/mamba2**~~ **done**; **gated delta-net** | The mamba scan, its state layout and the `dt_b_c_rms` norms now run with fixtures and goldens. Delta-net is a different scan (per-head matrix state) and is what `qwen35`, `qwen3next` and `kimi-linear` still need | L |

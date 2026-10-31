@@ -1,14 +1,19 @@
 g++ -Iinclude -Ithird_party/vnpu/include -Ithird_party/vnpu/src -std=c++17 -O2 -pthread -ffp-contract=fast -Wall -Wextra -Werror -Wno-unused-parameter -Wno-missing-field-initializers -MMD -MP -c tests/unit/tests.cpp -o build/obj/tests.o
-g++ -std=c++17 -O2 -pthread -ffp-contract=fast -Wall -Wextra -Werror -Wno-unused-parameter -Wno-missing-field-initializers -MMD -MP build/obj/freemoe/common.o build/obj/freemoe/gguf.o build/obj/freemoe/io.o build/obj/freemoe/backend.o build/obj/freemoe/kernels.o build/obj/freemoe/quant.o build/obj/freemoe/support.o build/obj/freemoe/residency.o build/obj/freemoe/engine.o build/obj/tests.o build/obj/vnpu/cluster/cluster.o build/obj/vnpu/cluster/net.o build/obj/vnpu/cluster/node.o build/obj/vnpu/compat/compat.o build/obj/vnpu/core/autotune.o build/obj/vnpu/core/backend.o build/obj/vnpu/core/runtime.o build/obj/vnpu/core/scheduler.o build/obj/vnpu/kernels/kernels.o build/obj/vnpu/kernels/llm.o -o build/tests -pthread
+g++ -std=c++17 -O2 -pthread -ffp-contract=fast -Wall -Wextra -Werror -Wno-unused-parameter -Wno-missing-field-initializers -MMD -MP build/obj/freemoe/common.o build/obj/freemoe/gguf.o build/obj/freemoe/io.o build/obj/freemoe/backend.o build/obj/freemoe/kernels.o build/obj/freemoe/quant.o build/obj/freemoe/quant_tables.o build/obj/freemoe/rope.o build/obj/freemoe/adapter.o build/obj/freemoe/support.o build/obj/freemoe/tokenizer.o build/obj/freemoe/unicode.o build/obj/freemoe/chat_template.o build/obj/freemoe/residency.o build/obj/freemoe/engine.o build/obj/tests.o build/obj/vnpu/cluster/cluster.o build/obj/vnpu/cluster/net.o build/obj/vnpu/cluster/node.o build/obj/vnpu/compat/compat.o build/obj/vnpu/core/autotune.o build/obj/vnpu/core/backend.o build/obj/vnpu/core/runtime.o build/obj/vnpu/core/scheduler.o build/obj/vnpu/kernels/kernels.o build/obj/vnpu/kernels/llm.o -o build/tests -pthread
 g++ -Iinclude -Ithird_party/vnpu/include -Ithird_party/vnpu/src -std=c++17 -O2 -pthread -ffp-contract=fast -Wall -Wextra -Werror -Wno-unused-parameter -Wno-missing-field-initializers -MMD -MP -c third_party/vnpu/tools/selftest_main.cpp -o build/obj/vnpu-selftest-main.o
 g++ -Iinclude -Ithird_party/vnpu/include -Ithird_party/vnpu/src -std=c++17 -O2 -pthread -ffp-contract=fast -Wall -Wextra -Werror -Wno-unused-parameter -Wno-missing-field-initializers -MMD -MP -c third_party/vnpu/tools/selftest.cpp -o build/obj/vnpu-selftest.o
 g++ -std=c++17 -O2 -pthread -ffp-contract=fast -Wall -Wextra -Werror -Wno-unused-parameter -Wno-missing-field-initializers -MMD -MP build/obj/vnpu-selftest-main.o build/obj/vnpu-selftest.o build/obj/vnpu/cluster/cluster.o build/obj/vnpu/cluster/net.o build/obj/vnpu/cluster/node.o build/obj/vnpu/compat/compat.o build/obj/vnpu/core/autotune.o build/obj/vnpu/core/backend.o build/obj/vnpu/core/runtime.o build/obj/vnpu/core/scheduler.o build/obj/vnpu/kernels/kernels.o build/obj/vnpu/kernels/llm.o -o build/vnpu-selftest -pthread
-g++ -std=c++17 -O1 -g -pthread -fno-omit-frame-pointer -fsanitize=address,undefined -Wall -Wextra -Werror -Iinclude -Ithird_party/vnpu/include -Ithird_party/vnpu/src tests/fuzz_gguf.cpp src/common.cpp src/gguf.cpp src/quant.cpp src/kernels.cpp src/backend.cpp third_party/vnpu/src/cluster/cluster.cpp third_party/vnpu/src/cluster/net.cpp third_party/vnpu/src/cluster/node.cpp third_party/vnpu/src/compat/compat.cpp third_party/vnpu/src/core/autotune.cpp third_party/vnpu/src/core/backend.cpp third_party/vnpu/src/core/runtime.cpp third_party/vnpu/src/core/scheduler.cpp third_party/vnpu/src/kernels/kernels.cpp third_party/vnpu/src/kernels/llm.cpp -o build/fuzz_gguf -pthread
+g++ -std=c++17 -O1 -g -pthread -fno-omit-frame-pointer -fsanitize=address,undefined -Wall -Wextra -Werror -Iinclude -Ithird_party/vnpu/include -Ithird_party/vnpu/src tests/fuzz_gguf.cpp src/common.cpp src/gguf.cpp src/quant.cpp src/quant_tables.cpp src/rope.cpp src/adapter.cpp src/kernels.cpp src/backend.cpp third_party/vnpu/src/cluster/cluster.cpp third_party/vnpu/src/cluster/net.cpp third_party/vnpu/src/cluster/node.cpp third_party/vnpu/src/compat/compat.cpp third_party/vnpu/src/core/autotune.cpp third_party/vnpu/src/core/backend.cpp third_party/vnpu/src/core/runtime.cpp third_party/vnpu/src/core/scheduler.cpp third_party/vnpu/src/kernels/kernels.cpp third_party/vnpu/src/kernels/llm.cpp -o build/fuzz_gguf -pthread
+src/gguf.cpp: In function 'fm::ModelManifest fm::build_manifest_llama(const GGUFDocument&, const std::string&, const std::string&)':
+src/gguf.cpp:955:15: note: variable tracking size limit exceeded with '-fvar-tracking-assignments', retrying without
+  955 | ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &source_path,
+      |               ^~~~~~~~~~~~~~~~~~~~
 ./build/tests
 [fallback] explicit_fallback_test executed on scalar CPU (explicit --allow-cpu-fallback)
 [PASS] gguf_parser_and_golden
 [PASS] malformed_fixtures
 [PASS] slot_state_machine
+[PASS] sliding_window_cache
 [PASS] budget_calculator
 [PASS] io_scheduler_and_readers
 [PASS] backends_and_gpu_placeholder
@@ -16,17 +21,55 @@ g++ -std=c++17 -O1 -g -pthread -fno-omit-frame-pointer -fsanitize=address,undefi
 [PASS] quant_reference_decode
 [PASS] quant_gemv
 [PASS] quant_model_parity
+[PASS] quant_expert_mixed_types
 [PASS] model_probe
 [PASS] cpu_kernels
+[PASS] thread_dispatch_policy
 [PASS] generic_inspect_and_roundtrip
+[PASS] sampling_bias
 [PASS] sampling_and_detokenize
 [PASS] residency_manager
 [PASS] dense_cpu_reference_and_operation_log
 [PASS] moe_readers_and_cache_sizes
+[PASS] per_expert_layout
 [PASS] traces_and_replay_inputs
 [PASS] vnpu_reference_backend
+[PASS] tokenizer_real_vocabularies
+[PASS] tokenizer_bpe_merges
+[PASS] tokenizer_bpe_families
+[PASS] tokenizer_sentencepiece
+[PASS] unicode_classes
+[PASS] model_map_and_tied_output
+[PASS] rope_mrope
+[PASS] rope_scaling
+[PASS] activation_clamp_forms
+[PASS] pointwise_activations
+[PASS] ffn_variants
+[PASS] gate_free_families
+[PASS] adapter_tags
+[PASS] attention_sinks
+[PASS] architecture_parity
+[PASS] batched_prefill
+[PASS] bitnet_sub_norms
+[PASS] refusal_paths
+[PASS] adapter_binding
+[PASS] rotated_and_ternary_blockers
+[PASS] minicpm_scales
+[PASS] shared_expert
+[PASS] phi2_block
+[PASS] deepseek2_mla
+[PASS] gpt_oss_block
+[PASS] plm_block
+[PASS] mistral3_block
+[PASS] mrope_families
+[PASS] metadata_array_forms
+[PASS] unmodelled_structures
+[PASS] recurrent_families
+[PASS] chat_template_rendering
+[PASS] chat_template_constructs
+[PASS] chat_template_engine
 [PASS] soak_sessions
-858 checks, 0 failures
+3758 checks, 0 failures
 VNPU_FORCE_ISA=avx2_dual ./build/vnpu-selftest
 Virtual NPU selftest (vnpu 1.0.0)
 ==========================================
@@ -49,12 +92,13 @@ Virtual NPU selftest (vnpu 1.0.0)
 [PASS] rope_inplace
 [PASS] mtp_head
 [PASS] async_events_and_trace
-  autotune: unit=WILDCAT tiles=32x64x64 0.048 ms 10.89 GFLOP/s 5.70x scalar
+  autotune: unit=WILDCAT tiles=16x64x32 0.064 ms 8.22 GFLOP/s 3.06x scalar
 [PASS] autotune_small
 [PASS] local_cluster
+[PASS] stream_concurrency
 [PASS] speculative_step
 ==========================================
-19 tests, 0 failures
+20 tests, 0 failures
 ASAN_OPTIONS=quarantine_size_mb=16:detect_leaks=1:allocator_may_return_null=1 UBSAN_OPTIONS=halt_on_error=1 ./build/fuzz_gguf 2 0xFEEE0E > build/test-tmp/fuzz-quick.json
 python3 tools/trace_replay.py --trace build/test-tmp/replay-trace.jsonl --metrics build/test-tmp/replay-metrics.json --check
 {
@@ -120,6 +164,7 @@ python3 tools/check_trace.py build/test-tmp/replay-trace.jsonl build/test-tmp/pr
     "shutdown",
     "source_verify",
     "token",
+    "tokenizer_ready",
     "upload_complete",
     "upload_queued",
     "weights_uploaded"
@@ -129,9 +174,11 @@ python3 tools/check_trace.py build/test-tmp/replay-trace.jsonl build/test-tmp/pr
 python3 scripts/check_architecture.py
 {
   "status": "pass",
-  "exists_rows": 22,
+  "exists_rows": 38,
   "src_files": [
+    "src/adapter.cpp",
     "src/backend.cpp",
+    "src/chat_template.cpp",
     "src/common.cpp",
     "src/engine.cpp",
     "src/gguf.cpp",
@@ -139,8 +186,13 @@ python3 scripts/check_architecture.py
     "src/kernels.cpp",
     "src/main.cpp",
     "src/quant.cpp",
+    "src/quant_tables.cpp",
     "src/residency.cpp",
-    "src/support.cpp"
+    "src/rope.cpp",
+    "src/support.cpp",
+    "src/tokenizer.cpp",
+    "src/unicode.cpp",
+    "src/unicode_tables.inc"
   ],
   "missing_paths": [],
   "src_files_not_listed": []
@@ -158,7 +210,7 @@ python3 scripts/check_dependencies.py
     },
     {
       "name": "C++17 standard library",
-      "version": "GCC 12.2 libstdc++ on D1 sandbox",
+      "version": "whichever libstdc++ the system compiler ships; built and tested with GCC 12 and GCC 13",
       "licence": "compiler runtime",
       "build_reference": "implicit",
       "found_in_build": true
@@ -169,7 +221,27 @@ python3 scripts/check_dependencies.py
       "licence": "OS licence",
       "build_reference": "`Threads::Threads`",
       "found_in_build": true
+    },
+    {
+      "name": "Python 3",
+      "version": "3.8 or newer, standard library only, for the generators and checkers",
+      "licence": "PSF-2.0",
+      "build_reference": "implicit",
+      "found_in_build": true
     }
   ],
   "vnpu_license_present": true
 }
+python3 scripts/zen3_fallback_check.py --check
+zen3 fallback evidence is up to date (pass, 64 unit checks)
+python3 tools/gen_unicode_tables.py --check
+SKIP src/unicode_tables.inc: generated from Unicode 15.1.0, this interpreter has 14.0.0
+     verify with: pip install "unicodedata2==15.1.0" && FREEMOE_REQUIRE_UNICODE=15.1.0 python3 tools/gen_unicode_tables.py --check
+python3 tools/make_arch_fixtures.py --check
+architecture fixtures are up to date
+python3 tools/gen_quant_tables.py --check
+src/quant_tables.cpp passes the structural check (9 tables, upstream not present)
+python3 tools/quant_reference.py --check
+{"status": "pass", "fixture": "/home/user/FreeMoe/tests/fixtures/quant_reference.bin"}
+python3 tools/make_quant_fixtures.py --check
+quant fixtures are up to date (6 variants)

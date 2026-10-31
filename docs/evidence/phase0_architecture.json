@@ -1,8 +1,10 @@
 {
   "status": "pass",
-  "exists_rows": 22,
+  "exists_rows": 38,
   "src_files": [
+    "src/adapter.cpp",
     "src/backend.cpp",
+    "src/chat_template.cpp",
     "src/common.cpp",
     "src/engine.cpp",
     "src/gguf.cpp",
@@ -10,8 +12,13 @@
     "src/kernels.cpp",
     "src/main.cpp",
     "src/quant.cpp",
+    "src/quant_tables.cpp",
     "src/residency.cpp",
-    "src/support.cpp"
+    "src/rope.cpp",
+    "src/support.cpp",
+    "src/tokenizer.cpp",
+    "src/unicode.cpp",
+    "src/unicode_tables.inc"
   ],
   "missing_paths": [],
   "src_files_not_listed": []

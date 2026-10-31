@@ -107,6 +107,7 @@ test: all $(BUILD)/tests $(BUILD)/vnpu-selftest $(BUILD)/fuzz_gguf
 	python3 tools/gen_unicode_tables.py --check
 	python3 tools/make_arch_fixtures.py --check
 	python3 tools/gen_quant_tables.py --check
+	python3 scripts/kernels_table.py --check
 	python3 tools/quant_reference.py --check
 	python3 tools/make_quant_fixtures.py --check
 
@@ -131,6 +132,7 @@ soak: all
 bench: all
 	@mkdir -p docs/evidence
 	$(BUILD)/freemoe bench --iterations 20 --out docs/evidence/kernels_bench.json > /dev/null
+	@python3 scripts/kernels_table.py --write
 	@python3 -c "import json;d=json.load(open('docs/evidence/kernels_bench.json'));print('kernel bench: isa=%s threads=%d rows=%d' % (d['resolved_isa'], d['resolved_threads'], len(d['results'])))"
 
 benchmark: all

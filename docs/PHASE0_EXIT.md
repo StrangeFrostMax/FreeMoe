@@ -7,16 +7,15 @@ verification. Hashes are SHA-256 of the exact redirected output file listed.
 
 | Command | Output file | SHA-256 |
 |---|---|---|
-| `make clean && make -j1` | `docs/evidence/phase0_build.log` | `13f07709c4cedc9c8e155b95ffb93e8078a463780c6502d15a8dceec031fb9ab` |
-| `./build/tests` | `docs/evidence/phase0_unit.log` | `ab0745cf80c001e9cbe5bec0de4ebddf7a89825bc35b4571ddbe04e9ee04fa73` |
-| `./build/freemoe inspect tests/fixtures/dense-fm.gguf --json` | `docs/evidence/inspect_dense.json` | `3f4c9cd5d9602c616a0d67da81b9b82702712bb2116066985c300e171a710359` |
-| `./build/freemoe inspect tests/fixtures/moe-fm.gguf --json` | `docs/evidence/inspect_moe.json` | `04813e7681bab5842efd851cdc058e0efad4553732f8abc8bc92f6f44c20781e` |
+| `make clean && make -j1` | `docs/evidence/phase0_build.log` | `02527494b9e6c5aba61eece33fc698146b2d706290de8276d028c4266f3653c4` |
+| `./build/tests` | `docs/evidence/phase0_unit.log` | `b6307a2f8bc26194d7b9a9006dc109fac564e0c3494d289920c0b02fc3923a57` |
+| `./build/freemoe inspect tests/fixtures/dense-fm.gguf --json` | `docs/evidence/inspect_dense.json` | `eca59a94df60d3e7103ad0b40d371138074814a5a36e5247b44dbe31ffe6b07a` |
+| `./build/freemoe inspect tests/fixtures/moe-fm.gguf --json` | `docs/evidence/inspect_moe.json` | `22ead1c381783ddff3db545b60cc43e1312447b08cbc82b5e189fcc8ed5b924e` |
 | `python3 tools/trace_replay.py --trace build/test-tmp/replay-trace.jsonl --metrics build/test-tmp/replay-metrics.json --check` | `docs/evidence/phase0_replay.json` | `02c8aed9a8de426328d25d923f4888ac40a1ff1c1bf4820557395aec60e2628b` |
-| `python3 tools/check_trace.py build/test-tmp/replay-trace.jsonl build/test-tmp/prefetch-trace.jsonl build/test-tmp/cachehit-trace.jsonl` | `docs/evidence/phase0_trace_events.json` | `17ea47c013f0f7d4f41cd9988867efeaedb72bf6653c088314e7fd9acf10aecf` |
-| `python3 scripts/check_architecture.py` | `docs/evidence/phase0_architecture.json` | `b258780f840c97a88132dcce18147288fcfac29ec53ac885c38dbd50b6818e44` |
-| `python3 scripts/check_dependencies.py` | `docs/evidence/phase0_dependencies.json` | `c21ba1262af523fd8c0173c53fa67b8d3750f55acf26fe6550b44918252e2a58` |
-| `python3 scripts/zen3_fallback_check.py` | `docs/evidence/zen3_fallback.json` | `69b967173f722eada794242e2c35b9fda96ec885457f861ce2f53dcf054c7790` |
-| `./build/freemoe bench --iterations 20 --out build/phase0/bench.json` | `docs/evidence/phase0_bench.json` | `e4fe67d56187d56c207a411a9f7e318c078c74d0c625df2fe7c9800c84f23df6` |
+| `python3 tools/check_trace.py build/test-tmp/replay-trace.jsonl build/test-tmp/prefetch-trace.jsonl build/test-tmp/cachehit-trace.jsonl` | `docs/evidence/phase0_trace_events.json` | `567935e7ab9befc3217760b2614819a067885964dbf5faced342776ed922e23f` |
+| `python3 scripts/check_architecture.py` | `docs/evidence/phase0_architecture.json` | `759c69d0d2f30582f94886de44e4f50a8fa2c7eefe8b6b7995b36eaa704412e1` |
+| `python3 scripts/check_dependencies.py` | `docs/evidence/phase0_dependencies.json` | `36aad89099e4f30b5ea76b8b6ff12d7d3c8f4b35070d437168b4f32334770890` |
+| `python3 scripts/zen3_fallback_check.py` | `docs/evidence/zen3_fallback.json` | `0529a11fa1ea40ffc0bfaed640ceae6f1604e82f33dbb3788683c0d0ffef85ca` |
 
 These commands are deterministic in a clean checkout with the same compiler
 and source tree. Re-run them in the recorded order to reproduce each hash.
@@ -31,6 +30,13 @@ and summarised in `docs/evidence/test_summary.json` and
 - `make test` -> `docs/evidence/phase0_test.log`
 - `make fuzz FUZZ_SECONDS=72` -> `docs/evidence/phase0_fuzz.log`
 - `make soak` -> `docs/evidence/phase0_soak.log`
+- `./build/freemoe bench --iterations 20 --out build/phase0/bench.json` -> `docs/evidence/kernels_bench.json` (kernel timings; also
+  records the ISA `auto` resolved to, and `scripts/archive_benchmark.py` gates a
+  benchmark run on that). Every number this file quotes into `docs/KERNELS.md`
+  is rendered from it by `scripts/kernels_table.py`, and
+  `scripts/kernels_table.py --check` is part of the gate below, so a record that
+  is replaced without re-rendering the document fails here instead of leaving a
+  stale table in place.
 
 ## P0 items
 
