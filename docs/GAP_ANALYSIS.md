@@ -175,24 +175,21 @@ non-synthetic model.
 
 ### The census
 
-**171** model files upstream (`src/models/*.cpp`, counted this change). The
-table below is set arithmetic against that count, not an estimate: the 110 files
-with no adapter row were listed by name, then partitioned into the three groups
-under it.
+The partition is not written here. It is `docs/evidence/arch_census.json`,
+rendered into §C11 by `tools/triage_upstream_archs.py` from a **pinned** llama.cpp
+tree (`0ec4027a2a01…`): **171** `src/models/*.cpp`, of which **61** have an
+adapter row and a graph that names nothing this build lacks, **2** have a row
+and also build a block the row does not model, **43** are blocked by a marker
+for a capability in the table below, and **65** need a graph read before
+anything at all is claimed.
 
-| Bucket | Count | Meaning |
-| --- | --- | --- |
-| Adapter today | **61** | Files in upstream `src/models/` whose name matches an adapter row. `freemoe adapters` reports **66** rows: the extra five are upstream aliases (`gpt-oss`→`openai-moe`, `granitemoe`→`granite-moe`) and block renames (`smollm`, `smollm2`, `tinyllama`→`llama`). `docs/MODEL_COVERAGE_STATUS.md` groups them by capability |
-| **Unmapped** | **110** | `comm` between `freemoe adapters` and the upstream file list |
-| — not a causal text decoder | 24 | `bert` `nomic-bert` `nomic-bert-moe` `jina-bert-v2` `jina-bert-v3` `eurobert` `modern-bert` `neo-bert` `gemma-embedding` `gemma-embedding2` `pangu-embed` `t5` `t5encoder` `clip` `cogvlm` `qwen3tts` `wavtokenizer-dec` `llada` `llada-moe` `rnd1` `dream` `dflash` `deepseek2ocr` `vllm-decision2` — pooling/no-causal-mask encoders, diffusion, audio or vision |
-| — recurrent, linear attention or MTP | 30 | `rwkv6` `rwkv6-base` `rwkv6qwen2` `rwkv7` `rwkv7-base` `arwkv7` `mamba-base` `bailingmoe` `bailingmoe2` `bailingmoe3` `qwen35` `qwen35moe` `qwen3next` `kimi-linear` `kimi-k3` `falcon-h1` `nemotron-h` `nemotron-h-moe` `granite-hybrid` `granite-switch` `hy-v3` `hy-v4` `delta-net-base` `lfm-base` `lfm2` `lfm2moe` `lfm3` `hrm-text` `spark2-5` `k2-horizon` — a new cache shape and kernel, not a row |
-| — a different causal block | 56 | `afmoe` `apertus` `arctic` `beam` `chameleon` `clef` `cohere2moe` `dbrx` `deepseek` `deepseek32` `dots1` `dots3note` `eagle3` `ernie4-5` `ernie4-5-moe` `exaone-moe` `exaone4` `flint` `gemma3n` `gemma4` `gemma4-assistant` `glm-dsa` `glm4-moe` `glm5-next` `granite-moe` `granite-swa` `grok` `grovemoe` `hunyuan-moe` `hunyuan-vl` `kolibri1` `laguna` `limite` `llama4` `maion-coder` `maple` `mellum` `mimo2` `minicpm3` `minimax-01` `minimax-m2` `minimax-m3` `mistral-large4` `mistral4` `muse-glimmer` `muse-spark` `openai-moe` `openelm` `plamo2` `plamo3` `qwen2vl` `qwen4exp` `refact` `sensenova-u1` `step35` `talkie` — two of these are aliases already covered (`granite-moe`, `openai-moe`), so **54** distinct blocks |
-
-The earlier version of this table said "169 files" and split the remainder into
-"needs only a row" and "needs one more primitive" by hand. That split was not
-reproducible, so it is gone: what is reproducible is the three groups above, and
-each row in the 54 is claimed only after its upstream file has been read — which
-is the rule the last three batches followed.
+An earlier revision partitioned the 110 unmapped files by hand into
+"not a causal text decoder / recurrent, linear attention or MTP / a different
+causal block" (24 / 30 / 56) and its own first version was off by two files. A
+hand-kept count with no artefact behind it is how the previous 81/90 split
+survived a whole review, so it is gone. `blocked` is now the only bucket that
+assigns a cause, because it is the only one that can point at a marker in the
+file; everything else has to be read.
 
 ### What one capability unlocks
 
@@ -482,14 +479,66 @@ No `attn_sinks`, no `SWIGLU_OAI_MOE` (clamped SwiGLU), no `SITU`, no
 `GEGLU_ERF`. Small self-contained kernels — but they are what `gpt-oss`,
 `minimax-*`, `deepseek4/41` and `kimi-k3` need.
 
-### C11. Architecture census: 171 upstream families, 48 mapped — the rest need named work
+### C11. Architecture census — every upstream family classified, the rest need named work
 
-`tools/triage_upstream_archs.py` classifies every `src/models/*.cpp` in a
-llama.cpp checkout by what its graph *calls*, not by its tensor names: 171 files,
-81 whose graph body is a llama-shaped block and 90 that build something else
-(mamba, delta-net, AltUp, MTP, vision towers). A marker scan is only a first
-pass, so each candidate then went through three further checks, and a row was
-added only when all three passed:
+`tools/triage_upstream_archs.py` classifies every `src/models/*.cpp` in a pinned
+llama.cpp checkout by what its graph *calls*, not by its tensor names. The
+artefact is committed (`docs/evidence/arch_census.json`), the table below is
+rendered from it, and `--check` re-derives both from the pinned tree.
+
+The numbers this section used to quote — "81 llama-shaped, 90 need a block" —
+were wrong in both directions, because the tool's capability list had drifted
+from the engine: it treated `build_moe_ffn(` as a missing block, so `llama`,
+`granite`, `phi3`, `qwen3moe` and twelve other **mapped** families were counted
+as blocked, while `t5`, `llada` and the BERT/embedding encoders were counted as
+one-row-away because their files name no primitive the engine lacks — their
+difference is structural. A census whose capability list is not derived from the
+engine measures the list, not the engine.
+
+<!-- arch-census:begin (generated by tools/triage_upstream_archs.py; do not edit by hand) -->
+
+Upstream `ggml-org/llama.cpp` at `0ec4027a2a01…`, `src/models/*.cpp`: **171 families**.
+This build has **67 adapter rows**. The partition:
+
+| Verdict | Families | Meaning |
+|---|---:|---|
+| mapped | 61 | adapter row, and the graph names nothing this build lacks |
+| mapped, with a caveat | 2 | adapter row, but the file also builds a block the row does not model |
+| blocked | 43 | no row; the graph calls a primitive this build has no implementation of |
+| unclassified | 65 | no row and no marker hit — needs the graph read before a row can be claimed |
+
+`unclassified` is not a polite word for "almost supported". Upstream can differ
+structurally without naming a missing primitive (an encoder stack, a pooling
+head, post-norm placement), so a family only leaves that bucket once its block
+has been read and it has either a row with a fixture and an oracle golden, or a
+named capability.
+
+| Capability | Families | Of which |
+|---|---:|---|
+| `C-ALTUP` — AltUp / per-layer token embeddings | 1 | `gemma3n` |
+| `C-DSA-INDEXER` — sparse-attention (DSA) indexer | 4 | `dots3note`, `hy-v4`, `minimax-m3`, `mistral-large4` |
+| `C-DUAL-FFN` — dense and MoE FFN summed in one layer | 1 | `arctic` |
+| `C-ENC-DEC` — encoder/decoder cross-attention stack | 2 | `eagle3`, `t5encoder` |
+| `C-HYPERCONN` — hyper-connections (per-layer residual streams) | 1 | `limite` |
+| `C-LINEAR-ATTN` — linear/recurrent attention layer | 2 | `delta-net-base`, `rwkv6-base` |
+| `C-MTP-HEAD` — multi-token-prediction head | 16 | `bailingmoe3`, `cohere2moe`, `deepseek32`, `dflash`, `glm-dsa`, `glm4-moe`, `glm5-next`, `hy-v3`, `mellum`, `mimo2`, `nemotron-h-moe`, `qwen35`, `qwen35moe`, `qwen3next`, `qwen4exp`, `step35` |
+| `C-MULTIMODAL` — vision tower / multimodal projector | 1 | `clip` |
+| `C-RWKV` — RWKV scan | 5 | `arwkv7`, `rwkv6`, `rwkv6qwen2`, `rwkv7`, `rwkv7-base` |
+| `C-SHORTCONV` — short convolution / conv1d in the block | 10 | `clef`, `kimi-k3`, `kimi-linear`, `lfm-base`, `lfm2`, `lfm2moe`, `lfm3`, `mamba-base`, `plamo2`, `wavtokenizer-dec` |
+
+Mapped rows whose file also builds a block the row does not model:
+
+- `deepseek4` — `C-MTP-HEAD`, `C-HYPERCONN`, `C-TID2EID`
+- `deepseek41` — `C-HYPERCONN`, `C-MULTIMODAL`
+
+Known false positives of the marker scan, each with its reason:
+
+- `mamba2` / `C-SHORTCONV` — the `conv1d` in this file is `ssm_conv1d`, the SSM short convolution the mamba2 block already implements — not a generic shortconv layer.
+
+<!-- arch-census:end -->
+
+A marker scan is only a first pass, so a family only becomes a row after three
+further checks, and a row was added only when all three passed:
 
 1. **Tensor roles.** Every `LLM_TENSOR_*` the architecture's file names is
    resolved through `LLM_TENSOR_NAMES` and looked up in `role_from_name`. A
@@ -502,7 +551,14 @@ added only when all three passed:
    golden; the engine must match it, or the row does not stay.
 
 Fourteen rows survived (see `docs/MODEL_COVERAGE_STATUS.md`); this is what the
-other candidates are blocked on, in the terms of the file that blocks them:
+other candidates are blocked on, in the terms of the file that blocks them.
+
+> The table below is **hand-read detail, not the partition**: it was written by
+> reading the graphs of the families that were candidates at the time, several of
+> which have since been mapped (`falcon`, `mpt`, `olmo`, `command-r`, `bloom`,
+> `jais` are struck through for that reason). The generated table above is the
+> authoritative statement of where each family stands; this one says what each
+> *capability* costs. Where the two disagree, the generated table is right.
 
 | Blocking fact | Architectures | What it needs |
 | --- | --- | --- |
@@ -646,22 +702,26 @@ do not present the synthetic-fixture benchmark as a performance qualification.
   specifications. Section B's per-model claims are static signatures, not runs.
 * **No target-hardware numbers.** The host is an Intel Xeon KVM guest with
   2 vCPUs; Zen 3 has never run this code. The GPU path does not exist.
-* **Upstream is a moving target.** The census is `master` on 2026-10-28;
-  upstream adds model files monthly, so "169" has a shelf life.
+* **Upstream is a moving target.** The census is pinned to
+  `0ec4027a2a01…`; upstream adds model files monthly. Bumping the pin is a
+  deliberate commit (`make census LLAMA_DIR=…`) that regenerates the artefact
+  and the §C11 table, so the count cannot drift silently.
 
 ---
 
 ## Appendix: reproduce
 
 ```sh
-make -j2 test                                   # 1338 checks
-./build/tests architecture                      # 17-architecture parity
+make -j2 test                                   # unit, fuzz, traces, census, docs
+./build/tests architecture                      # adapter parity rows
 ./build/freemoe probe --model <file.gguf>       # per-file capability report
 bash benchmarks/run_repeats.sh configs/benchmark.env   # the numbers in §Baseline
 python3 tools/make_arch_fixtures.py --check     # fixtures up to date
 
-# census (needs the upstream tree)
-curl -sSL https://codeload.github.com/ggml-org/llama.cpp/tar.gz/refs/heads/master \
-  | tar -xz --wildcards 'llama.cpp-master/src/*'
-ls llama.cpp-master/src/models/*.cpp | wc -l    # 169
+# census (needs the upstream tree, at the pinned commit)
+git clone --filter=blob:none --sparse --depth 1 \
+    https://github.com/ggml-org/llama.cpp /tmp/llama-census
+git -C /tmp/llama-census sparse-checkout set src/models
+git -C /tmp/llama-census checkout 0ec4027a2a0183de87c007069adddc06e665f7de
+make census LLAMA_DIR=/tmp/llama-census
 ```

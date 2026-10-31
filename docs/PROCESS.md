@@ -93,6 +93,17 @@ Numbers carry their environment: "3.40x on a 2-vCPU Xeon sandbox, hidden 512,
 ISA is part of the environment, because a run that dispatched AVX-512 measured a
 path the Zen 3 target cannot execute.
 
+A census of what upstream contains is held to the same rule. `tools/
+triage_upstream_archs.py --write` over a checkout at a **pinned** commit
+regenerates `docs/evidence/arch_census.json` and the partition table in
+`docs/GAP_ANALYSIS.md` §C11; `scripts/check_arch_census.py` runs offline in
+`make test` and fails when a family with an adapter row is recorded as blocked,
+when a blocked family names no capability, or when the document is not what the
+artefact renders. The census this replaces listed `build_moe_ffn(` as an
+unimplemented block, so `llama`, `granite`, `phi3`, `qwen3moe` and thirteen
+other **mapped** families were counted as needing one — a capability list that
+is not derived from the engine measures the list, not the engine.
+
 A number quoted in a document is rendered from the evidence file, not typed into
 it. `scripts/kernels_table.py` renders the measured tables in `docs/KERNELS.md`
 from `docs/evidence/kernels_bench.json`; `make test` and
