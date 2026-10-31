@@ -885,6 +885,8 @@ bool is_llama_family(const std::string &arch) {
         "command-r",
         "olmo",
         "phimoe",
+        "baichuan",
+        "chatglm",
         "olmo2",
         "olmoe",
         "granite",
@@ -1250,6 +1252,14 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
     if (arch == "jais") cfg.rope_disabled = true;
     // gpt2 and starcoder carry a learned position table and rotate nothing.
     if (arch == "gpt2" || arch == "starcoder" || arch == "mpt") cfg.rope_disabled = true;
+    // baichuan picks its block from the layer count (`load_arch_hparams`):
+    // 32 layers is the 7B file and rotates; every other count is the 13B file,
+    // which calls no rope at all and, at exactly 40 layers, biases attention
+    // with ALiBi. Neither fact is metadata, so both come from the count.
+    if (arch == "baichuan") {
+        if (cfg.layers != 32) cfg.rope_disabled = true;
+        if (cfg.layers == 40) cfg.alibi_max_bias = 8.0;
+    }
     uint64_t vocab = 0;
     if (!opt_u64(doc, keys("vocab_size"), &vocab)) {
         MetadataValue tokens;

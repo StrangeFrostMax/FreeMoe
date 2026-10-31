@@ -2937,7 +2937,8 @@ void test_architecture_parity() {
                                            "bloom", "jais",
                                            "gpt2", "starcoder", "falcon", "mpt",
                                            "seed-oss", "plamo", "smallthinker", "command-r", "olmo", "phimoe",
-                                           "olmo2", "olmoe", "granite", "granitemoe"};
+                                           "olmo2", "olmoe", "granite", "granitemoe",
+                                           "baichuan", "chatglm"};
     for (const std::string &slug : slugs) {
         const std::string model = "tests/fixtures/" + slug + "-shape.gguf";
         ArchGolden golden = read_arch_golden("tests/golden/" + slug + "_reference.txt");

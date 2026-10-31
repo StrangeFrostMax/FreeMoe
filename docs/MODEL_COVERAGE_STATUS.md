@@ -46,11 +46,11 @@ Supported architecture strings today (each has a fixture unless noted):
 `qwen`, `codeshell`, `starcoder2`, `pockettts`, `cohere2`, `paddleocr`,
 `hunyuan-dense`, `llama-embed`, `bloom`, `jais`, `gpt2`, `starcoder`, `falcon`,
 `mpt`, `seed-oss`, `plamo`, `smallthinker`, `command-r`, `olmo`, `phimoe`,
-`olmo2`, `olmoe`, `granite`, `granitemoe`,
+`olmo2`, `olmoe`, `granite`, `granitemoe`, `baichuan`, `chatglm`,
 plus the native `freemoe-tiny`. `smollm`/`smollm2`/`tinyllama` are the same llama
 block. The three lists that decide this — the adapter table, the loader's family
 list and the probe's known-architecture table — are bound to each other by the
-`adapter_binding` test (584 checks), which is what caught `smollm3` and `bitnet`
+`adapter_binding` test (602 checks), which is what caught `smollm3` and `bitnet`
 missing from the probe's table while their adapters existed.
 
 ## The requested list
@@ -77,6 +77,8 @@ missing from the probe's table while their adapters existed.
 | GPT-NeoX-independent Llama-shaped variants: seed-oss, plamo | `seed-oss`, `plamo` | **WORKS**: seed-oss normalises after the attention residual and feeds *that* to the FFN (`attn_post_norm`); plamo has no `ffn_norm` at all — the FFN reads the attention's own normalised input and both branches are added to the residual separately |
 | phimoe | `phimoe` | **WORKS**: upstream declares `using graph = llama_model_phi3::graph`, so it is phi3's block (fused qkv with a bias, biased LayerNorm, biased attention output and logits) with routed experts. The row exists because a file must be loadable, and its golden is phi3's arithmetic with a router |
 | olmo | `olmo` | **WORKS**: every norm is `build_norm(x, NULL, NULL, ...)`, so the file carries no norm scale at all. The runtime normalises and does not scale. Defining the weightless norm away fails olmo's greedy decode |
+| baichuan 7B / 13B | `baichuan` | **WORKS**: the block is chosen by layer count, not by metadata — 32 layers is the 7B file (RMSNorm, rotary, SwiGLU) and anything else is the 13B file, which calls **no rope at all** and, at exactly 40 layers, biases attention with ALiBi `max_bias = 8.0`. Both facts are hardcoded upstream, so a 40-layer fixture that states neither tests the rule itself: applying the rope fails the golden, and dropping the ALiBi bias fails it too |
+| chatglm | `chatglm` | **WORKS**: an RMSNorm llama block whose FFN keeps gate and up in one tensor and applies the gated activation sequentially (`build_ffn(..., LLM_FFN_SWIGLU, LLM_FFN_SEQ, ...)`). Swapping the two halves of that projection fails the golden by 1.19 (abs) / 5464 (rel) |
 | olmo2 | `olmo2` | **WORKS**: the block has **no pre-norms at all** — attention and the FFN both read the raw residual stream — and each branch output is normalised afterwards (`attn_post_norm`, `ffn_post_norm`), with q and k normalised as one vector each. Reading the post-norms as pre-norms fails olmo2's greedy decode; the loader refuses the file rather than inventing an `attn_norm` |
 | olmoe | `olmoe` | **WORKS**: an ordinary pre-norm MoE block whose q/k norm is one scale as wide as the whole projection (`{heads*head_dim}`), not one row per head. Treating it as the per-head form fails the golden by 0.397 (abs) / 31.7 (rel) |
 | granite | `granite` | **WORKS**: each branch output is multiplied by `granite.residual_scale` **before** the residual add, the logits are divided by `granite.logit_scale` after the head (`ggml_scale(ctx0, cur, 1.0f / hparams.f_logit_scale)`) — the same key command-r multiplies by — and `granite.attention.scale`, when present, replaces `1/sqrt(head_dim)` in the softmax. Recording the scale without applying it fails on both rows; multiplying by `logit_scale` instead of dividing fails by 19.6 (abs); ignoring `attention.scale` fails by rel 60/78. A `granite.deepstack_mapping` naming a layer that reads the vision projector stream is refused (`DEEPSTACK_UNMODELLED`) rather than run as text |
