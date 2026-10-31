@@ -175,3 +175,28 @@ fixture and the `ffn_norm_tensor`/`clamp_kqv` config fields were reverted rather
 than shipped: an untested field is worse than a missing row. Next step is a
 fixture pair that differs *only* in that tensor name and a test that pins which
 vector the engine normalises.
+
+## Evidence for the audit batch (C6 sampling, C10 recorded, census re-derived)
+
+Gate: `./build/tests` → **3702 checks, 0 failures** (3682 before the batch);
+`sampling_bias` 20 checks.
+
+| Mutation | Turns red |
+| --- | --- |
+| min-p truncation removed | "min-p 0.9 keeps only tokens within 10% of the leader's probability" |
+| repetition penalty inverted (multiply where upstream divides) | three checks: the ordering, the positive case, the negative case |
+| presence penalty applied per occurrence instead of once | "presence penalty applies once per distinct token" |
+| logit bias ignored | "a logit bias moves the greedy choice" |
+| `n_probs` never reported | three checks: the count, the normalisation, the leader |
+| penalty window ignored | "a token outside the penalty window keeps its logit" |
+
+End to end on `llama-gqa-shape.gguf`, all four are observable from the CLI:
+`--repetition-penalty 4` turns `65 65 65 65 65 65 65 65` into
+`65 93 230 16 29 71 126 15`; `--logit-bias 3:9` turns `65 65 65` into `3 3 3`;
+`--n-probs 3` returns three descending normalised alternatives per token; and
+`--min-p 1.5`, `--logit-bias 9999:1` and `--logit-bias 3` are refused by name.
+
+Not verified, and stated rather than implied: DRY, grammar constraints,
+typical-p and XTC are **not** implemented. C10's code is verified but its
+*measurement* is not — the benchmark runs in `results/` predate `--kernels`, so
+they still describe an AVX-512 dispatch and must be re-run with `--kernels zen3`.

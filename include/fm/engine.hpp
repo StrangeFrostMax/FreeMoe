@@ -21,19 +21,58 @@ constexpr double DEFAULT_REL_TOL = 5e-3;
 constexpr uint32_t DEFAULT_N_GREEDY = 16;
 
 // Greedy is the default: temperature 0 reproduces the reference comparison
-// behaviour exactly. Non-zero temperature enables top-k/top-p sampling.
+// behaviour exactly. Non-zero temperature enables top-k/top-p/min-p sampling.
+//
+// The penalties act on the *logits* and need to know which tokens have already
+// been produced, which is why `apply_sampling_bias` takes the history rather
+// than living inside the sampler: a sampler that guessed at history would be
+// untestable against llama.cpp's own ordering.
 struct SamplingConfig {
     double temperature = 0.0;
     uint32_t top_k = 0;
     double top_p = 1.0;
+    // Keep the smallest set of tokens whose probability is at least
+    // `min_p` times the most likely token's. 0 disables it.
+    double min_p = 0.0;
+    // > 1 divides a repeated token's positive logit (and multiplies a negative
+    // one); 1.0 is the identity.
+    double repetition_penalty = 1.0;
+    // Additive, once per distinct token in the window / once per occurrence.
+    double presence_penalty = 0.0;
+    double frequency_penalty = 0.0;
+    // How many tokens back the three penalties look. 0 = the whole history,
+    // which is what llama.cpp's `penalty_last_n = -1` means.
+    uint32_t penalty_window = 0;
+    // A static per-token bias, applied after the penalties and before the
+    // temperature. Sorted for a deterministic report.
+    std::map<uint32_t, double> logit_bias;
+    // How many alternatives to report alongside each sampled token.
+    uint32_t n_probs = 0;
     uint64_t seed = 0;
     bool greedy() const { return temperature <= 0.0; }
+};
+
+// The bias stage of sampling, as a pure function of the logits and the tokens
+// produced so far: repetition (multiplicative), presence and frequency
+// (additive), then the static per-token bias. Returns a copy; the caller keeps
+// the raw logits for reporting.
+std::vector<float> apply_sampling_bias(const std::vector<float> &logits,
+                                       const SamplingConfig &config,
+                                       const std::vector<int32_t> &history);
+
+// One token and, when `n_probs` asks for them, the alternatives with their
+// probabilities after truncation.
+struct SampledToken {
+    uint32_t id = 0;
+    std::vector<std::pair<uint32_t, double>> alternatives;
 };
 
 // Pure sampler, independent of the engine so it can be unit tested directly.
 // temperature <= 0 means greedy argmax (lowest token id wins ties).
 uint32_t sample_from_logits(const std::vector<float> &logits, const SamplingConfig &config,
                             std::mt19937_64 &rng);
+SampledToken sample_detailed(const std::vector<float> &logits, const SamplingConfig &config,
+                             std::mt19937_64 &rng);
 
 struct RunConfig {
     std::string model_path;
@@ -74,6 +113,9 @@ struct PromptResult {
     std::vector<int32_t> input_ids;
     std::vector<float> prefill_logits;
     std::vector<int32_t> generated_ids;
+    // One row per generated token when `--n-probs` asks for it: the alternatives
+    // that survived truncation, most likely first.
+    std::vector<std::vector<std::pair<uint32_t, double>>> alternatives;
     std::vector<RoutingEvent> routing;
     std::vector<double> inter_token_ms;
     double prefill_ms = 0.0;

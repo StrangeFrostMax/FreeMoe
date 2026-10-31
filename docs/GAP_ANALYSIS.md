@@ -1,11 +1,12 @@
 # Gap analysis: design vs code vs model codes
 
-> **Status of this document.** Section C's findings C1, C4, C7, C9 (activation
+> **Status of this document.** Section C's findings C1, C4, C6, C7, C9 (activation
 > half) and C10 are fixed:
 > BPE and SentencePiece are real encoders now (12 vocabularies at 46/46,
 > `tools/tokenizer_parity.py`), linear/YaRN/`rope_freqs` context extension and
-> attention sinks are implemented, and `auto` no longer dispatches AVX-512 on a
-> Zen 3 target. The measurements below are the state at `f704e4b` and are kept
+> attention sinks are implemented, `auto` no longer dispatches AVX-512 on a
+> Zen 3 target, and the sampler has min-p, the three penalties, per-token logit
+> bias and `--n-probs`. The measurements below are the state at `f704e4b` and are kept
 > as the baseline this work is measured against; current numbers live in
 > `docs/MODEL_COVERAGE_STATUS.md` (3241 checks, 55 architecture fixtures).
 >
@@ -76,13 +77,13 @@ Every claim below is either a result produced in this tree or a citation into
 
 | Measurement | Value |
 | --- | --- |
-| Unit / parity / fuzz checks | **3682, 0 failures** (`./build/tests`) |
+| Unit / parity / fuzz checks | **3702, 0 failures** (`./build/tests`) |
 | Architecture parity fixtures | **70** slugs in `architecture_parity`, 91 `.gguf` fixtures (31 MB) — compared against `tools/llama_oracle.py` goldens, not against this engine |
 | Model adapters | **67** entries = 66 real architectures + native `freemoe-tiny` (`src/support.cpp`, `freemoe adapters`) |
 | Upstream architectures with an adapter | **61 of the 171** files in upstream `src/models/` match an adapter row by name, plus five that upstream spells differently (`gpt-oss`→`openai-moe`, `granitemoe`→`granite-moe`, `smollm`, `smollm2`, `tinyllama`→the `llama` block) |
 | Quantisation types decodable | **26** (`src/quant.cpp`) |
 | Error codes | **28** non-OK codes (`include/fm/common.hpp:27`) |
-| Benchmark vs declared targets | **pass** — but on the synthetic fixture, and on the wrong ISA (below) |
+| Benchmark vs declared targets | **pass** on the synthetic fixture; the recorded runs predate `--kernels` and so were dispatched on AVX-512 (C10) |
 
 ### The one benchmark that exists
 
@@ -155,16 +156,24 @@ non-synthetic model.
 
 ### The census
 
-169 model files upstream. Requirement signatures were extracted statically
-(which tensors and `build_ffn`/`build_norm` constants each file uses) and
-intersected with what this engine implements.
+**171** model files upstream (`src/models/*.cpp`, counted this change). The
+table below is set arithmetic against that count, not an estimate: the 110 files
+with no adapter row were listed by name, then partitioned into the three groups
+under it.
 
 | Bucket | Count | Meaning |
 | --- | --- | --- |
-| Adapter today | **66** | `freemoe adapters` is the authoritative list; `docs/MODEL_COVERAGE_STATUS.md` groups them by capability. This census row is from the original audit and its named subset (`llama qwen2 qwen3 gemma gemma2 gemma3 phi3 minicpm qwen3moe glm4 qwen2moe phi2 internlm2 orion exaone gptneox stablelm deepseek2`) is where the table started |
-| Not a causal text decoder | **24** | BERT/Nomic/Jina/EuroBERT/ModernBERT/NeoBERT encoders, `llama-embed`, `gemma-embedding*`, `t5`/`t5encoder`, `clip`, `pockettts`, `qwen3tts`, `wavtokenizer-dec`, `paddleocr`, `llada`, `llada-moe`, `rnd1`, `dream`, `dflash`, `vllm-decision2` — no-causal-mask attention and pooling, or diffusion/audio/vision |
-| **Needs only an adapter row** | **38** | Every primitive already exists: stacked-expert MoE, shared experts with/without a scalar gate, group-limited routing, per-head q/k norm, post-norms, sliding window, partial RoPE, fused q/k/v, LayerNorm, silu/gelu/relu/relu², MLA. `bloom starcoder2 phimoe dbrx arctic grok minimax-01 minimax-m2 qwen mistral4 cohere2 …` (`gpt2`, `starcoder`, `falcon`, `mpt`, `olmo2`, `olmoe`, `granite` and `granitemoe` moved to mapped, the last four in the batch that added the no-pre-norm block, the whole-vector q/k norm and the scaled residual/logit branches) |
-| Needs one more primitive | 71 | below |
+| Adapter today | **61** | Files in upstream `src/models/` whose name matches an adapter row. `freemoe adapters` reports **66** rows: the extra five are upstream aliases (`gpt-oss`→`openai-moe`, `granitemoe`→`granite-moe`) and block renames (`smollm`, `smollm2`, `tinyllama`→`llama`). `docs/MODEL_COVERAGE_STATUS.md` groups them by capability |
+| **Unmapped** | **110** | `comm` between `freemoe adapters` and the upstream file list |
+| — not a causal text decoder | 24 | `bert` `nomic-bert` `nomic-bert-moe` `jina-bert-v2` `jina-bert-v3` `eurobert` `modern-bert` `neo-bert` `gemma-embedding` `gemma-embedding2` `pangu-embed` `t5` `t5encoder` `clip` `cogvlm` `qwen3tts` `wavtokenizer-dec` `llada` `llada-moe` `rnd1` `dream` `dflash` `deepseek2ocr` `vllm-decision2` — pooling/no-causal-mask encoders, diffusion, audio or vision |
+| — recurrent, linear attention or MTP | 30 | `rwkv6` `rwkv6-base` `rwkv6qwen2` `rwkv7` `rwkv7-base` `arwkv7` `mamba-base` `bailingmoe` `bailingmoe2` `bailingmoe3` `qwen35` `qwen35moe` `qwen3next` `kimi-linear` `kimi-k3` `falcon-h1` `nemotron-h` `nemotron-h-moe` `granite-hybrid` `granite-switch` `hy-v3` `hy-v4` `delta-net-base` `lfm-base` `lfm2` `lfm2moe` `lfm3` `hrm-text` `spark2-5` `k2-horizon` — a new cache shape and kernel, not a row |
+| — a different causal block | 56 | `afmoe` `apertus` `arctic` `beam` `chameleon` `clef` `cohere2moe` `dbrx` `deepseek` `deepseek32` `dots1` `dots3note` `eagle3` `ernie4-5` `ernie4-5-moe` `exaone-moe` `exaone4` `flint` `gemma3n` `gemma4` `gemma4-assistant` `glm-dsa` `glm4-moe` `glm5-next` `granite-moe` `granite-swa` `grok` `grovemoe` `hunyuan-moe` `hunyuan-vl` `kolibri1` `laguna` `limite` `llama4` `maion-coder` `maple` `mellum` `mimo2` `minicpm3` `minimax-01` `minimax-m2` `minimax-m3` `mistral-large4` `mistral4` `muse-glimmer` `muse-spark` `openai-moe` `openelm` `plamo2` `plamo3` `qwen2vl` `qwen4exp` `refact` `sensenova-u1` `step35` `talkie` — two of these are aliases already covered (`granite-moe`, `openai-moe`), so **54** distinct blocks |
+
+The earlier version of this table said "169 files" and split the remainder into
+"needs only a row" and "needs one more primitive" by hand. That split was not
+reproducible, so it is gone: what is reproducible is the three groups above, and
+each row in the 54 is claimed only after its upstream file has been read — which
+is the rule the last three batches followed.
 
 ### What one capability unlocks
 
@@ -182,9 +191,9 @@ capability that completes the most models given everything before it.
 | RWKV | **+4** | arwkv7 rwkv6 rwkv6-base rwkv7 rwkv7-base (5 files, 4 complete) |
 | short-conv (LFM) | **+4** | lfm-base lfm2 lfm2moe lfm3 |
 
-Cost-effectiveness ordering is therefore: the 56 adapter rows first (no engine
-code), then YaRN (+14, one rotary change), then the two recurrent families
-(+17 together), then the small token-level primitives.
+Cost-effectiveness ordering is therefore: the 54 causal blocks first (mostly no
+engine code), then the recurrent families together (one cache shape shared by
+many files), then the small token-level primitives.
 
 Three of those buckets have since been closed and the table above is kept as the
 baseline it was measured at: **mRoPE** (`qwen3vl`, `qwen3vlmoe`), **attention
@@ -319,11 +328,34 @@ and guards with `total > 0.0f`, with no clamp and no per-architecture rule.
   `openai-moe` alone, which is not supported here. So the bug is **latent, not
   reachable today**; it must be fixed in the same change that adds that family.
 
-### C6. Sampling is thin
+### C6. ~~Sampling is thin~~ — **FIXED; verified by mutation**
 
-`SamplingConfig` (`include/fm/engine.hpp:24`) has temperature, top-k, top-p,
-seed. No min-p, no repetition/presence/frequency penalty, no DRY, no grammar or
-logit-bias constraints, no `n_probs`. Fine for parity tests, wrong for chat.
+`SamplingConfig` had temperature, top-k, top-p and a seed: enough for parity
+runs, wrong for chat. It now also carries **min-p**, **repetition**,
+**presence** and **frequency** penalties with a bounded penalty window, a
+**per-token logit bias** (`--logit-bias 12:+4,900:-2.5`), and `--n-probs N`,
+which reports the alternatives that survived truncation next to each sampled
+token.
+
+Two details are load-bearing. The penalties are applied to the logits from a
+pure function, `apply_sampling_bias(logits, config, history)`, rather than
+inside the sampler: they need the tokens already produced, and a sampler that
+guessed at history would be untestable against upstream's ordering. And the
+penalty direction is upstream's, not the obvious one — a **positive** logit is
+divided by the repetition penalty and a **negative** one multiplied, so the
+penalty always moves a repeated token *down*.
+
+Evidence: `sampling_bias` (20 checks). Six mutations each turn it red —
+min-p truncation removed, repetition direction inverted, presence applied per
+occurrence instead of once, logit bias ignored, `n_probs` unreported, penalty
+window ignored. End to end on a fixture, `--repetition-penalty 4` turns the
+greedy loop `65 65 65 65 …` into `65 93 230 16 …`, and `--n-probs 3` returns
+three normalised, descending alternatives per token.
+
+**Not** implemented, and not claimed: DRY sampling, grammar constraints,
+typical-p, XTC and `xtc_probability`. `n_probs` reports the post-truncation
+distribution, so it cannot describe the full softmax the way llama.cpp's
+`n_probs` does when truncation is off.
 
 ### C7. ~~Quantisation coverage has holes~~ — **FIXED at `f704e4b`; verified at `main`**
 
@@ -435,18 +467,21 @@ Evidence: `bloom` and `jais` fixtures, oracle goldens, parity rows. Mutating the
 bias away fails by 0.077 (bloom) and 0.444 (jais); mutating the embedding norm
 away fails bloom by 1.440.
 
-### C10. Benchmarks run on an ISA the target CPU does not have
+### C10. ~~Benchmarks run on an ISA the target CPU does not have~~ — **FIXED (code); re-run still owed**
 
-`host_has_avx512()` (`src/kernels.cpp:60`) probes the *host*, so on this Xeon
-the CPU backend dispatches `cpu-avx512` kernels — confirmed by every matmul row
-in `results/benchmark/synthetic-moe-buffered/*/report.json`. `docs/TEST_MACHINE.md:13`
-states "AVX2 + FMA3 forced; AVX-512 disabled for FreeMoe backend tests", but
-nothing forces it: `VNPU_FORCE_ISA` governs the Java NPU device only, and there
-is no CPU-backend equivalent.
+The knob exists now: `--kernels auto|scalar|avx2|zen3|avx512` selects the CPU
+backend's ISA, `resolve_kernel_isa` applies the Zen 3 policy (`zen3` and `avx2`
+pin AVX2/FMA3, and `auto` **never** selects AVX-512 because the target cannot
+execute it), and each backend operation reports the ISA it actually ran
+(`record_operation(..., "cpu-" + kernel_isa_name(...))`). `device-info` prints
+`resolved_isa`. Pinned by the `kernel_isa` checks: scalar stays scalar, `zen3`
+parses to `avx2_fma`, an unknown profile is refused.
 
-So the one benchmark we have was measured on an ISA the stated target (Zen 3, no
-AVX-512) cannot execute. Fix: an ISA-selection knob for the CPU backend plus a
-config that pins `avx2`, then re-run `benchmarks/run_repeats.sh`.
+What is still owed is the **measurement**, not the code: the benchmark reports
+in `results/` were produced before the knob, and re-running
+`benchmarks/run_repeats.sh` with `--kernels zen3` on this host is what turns
+"the numbers describe the target" from a claim into a record. Until that run is
+pasted here, treat the AVX-512-dispatched figures as historical.
 
 ---
 

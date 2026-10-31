@@ -48,12 +48,25 @@ documented operations.
 These are deterministic synthetic conformance fixtures, not pretrained models.
 They contain no third-party weights and are safe to redistribute under MIT.
 
-## Explicitly unsupported
+## Scope of this page
 
-- arbitrary Llama, Mixtral, DeepSeek, Qwen, Gemma or other GGUF architectures;
-- F16, BF16, Q4/Q5/Q8, K-quant or imatrix quantised inference;
-- grouped-query attention, sliding-window attention, ALiBi, YaRN, multimodal
-  towers, LoRA, speculative decoding, continuous batching or multi-GPU;
+This page describes the **native** `freemoe-tiny` adapter and its conformance
+fixtures. It is not a statement about which llama.cpp architectures run: those
+are listed by `freemoe adapters` (66 rows today) and described in
+`docs/MODEL_COVERAGE_STATUS.md`, which is the file to read for "does model X
+work". The list below is about this page's own scope only.
+
+## Explicitly unsupported *by the native adapter*
+
+- arbitrary GGUF architectures through the native adapter — the published
+  adapters are the supported path, one row each;
+- F16, BF16, Q4/Q5/Q8, K-quant or imatrix quantised inference through the
+  *native* fixture path (the standard adapters do decode 26 quant types);
+- grouped-query attention, sliding-window attention, ALiBi, YaRN and multimodal
+  towers in the *native* block — the standard adapters implement GQA, windowed
+  attention, ALiBi and YaRN, and
+- LoRA, speculative decoding, continuous batching or multi-GPU anywhere in this
+  build;
 - per-expert GGUF tensor names, fused gate-up experts, shared experts or
   architecture-specific router scaling not documented above (the standard
   adapters do implement a fused gate-up FFN and `qwen2moe`'s shared expert;

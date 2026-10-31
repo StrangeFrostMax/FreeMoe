@@ -35,6 +35,20 @@ Json PromptResult::to_json(bool include_logits) const {
     for (int32_t id : generated_ids) generated.push(Json::integer(id));
     j.set("generated_ids", std::move(generated));
     j.set("routing_events", static_cast<uint64_t>(routing.size()));
+    if (!alternatives.empty()) {
+        Json rows = Json::array();
+        for (const auto &row : alternatives) {
+            Json entry = Json::array();
+            for (const auto &[id, prob] : row) {
+                Json pair = Json::object();
+                pair.set("id", static_cast<int64_t>(id));
+                pair.set("prob", Json::string(fixed_double(prob, 9)));
+                entry.push(std::move(pair));
+            }
+            rows.push(std::move(entry));
+        }
+        j.set("alternatives", std::move(rows));
+    }
     if (include_logits) {
         Json logits = Json::array();
         for (float v : prefill_logits) logits.push(Json::string(fixed_double(v, 9)));
@@ -458,15 +472,66 @@ uint32_t Engine::sample(const std::vector<float> &logits) {
     return sample_from_logits(logits, config_.sampling, rng_);
 }
 
-uint32_t sample_from_logits(const std::vector<float> &logits, const SamplingConfig &sampling,
-                            std::mt19937_64 &rng) {
+std::vector<float> apply_sampling_bias(const std::vector<float> &logits,
+                                       const SamplingConfig &config,
+                                       const std::vector<int32_t> &history) {
+    std::vector<float> biased = logits;
+    const bool any_penalty = config.repetition_penalty != 1.0 ||
+                             config.presence_penalty != 0.0 ||
+                             config.frequency_penalty != 0.0;
+    if (any_penalty && !history.empty()) {
+        // A window of 0 is llama.cpp's `penalty_last_n = -1`: the whole history.
+        size_t first = 0;
+        if (config.penalty_window > 0 && history.size() > config.penalty_window)
+            first = history.size() - config.penalty_window;
+        std::map<uint32_t, uint32_t> counts;
+        for (size_t i = first; i < history.size(); ++i) {
+            if (history[i] < 0) continue;
+            ++counts[static_cast<uint32_t>(history[i])];
+        }
+        for (const auto &[token, count] : counts) {
+            if (token >= biased.size()) continue;  // a prompt token outside this vocabulary
+            float &value = biased[token];
+            if (config.repetition_penalty != 1.0) {
+                // Upstream divides the positive logits and multiplies the
+                // negative ones, so the penalty always moves a token *down*.
+                value = value > 0.0f
+                            ? static_cast<float>(value / config.repetition_penalty)
+                            : static_cast<float>(value * config.repetition_penalty);
+            }
+            if (config.presence_penalty != 0.0)
+                value = static_cast<float>(value - config.presence_penalty);
+            if (config.frequency_penalty != 0.0)
+                value = static_cast<float>(value - config.frequency_penalty * count);
+        }
+    }
+    for (const auto &[token, bias] : config.logit_bias) {
+        if (token >= biased.size())
+            fail(ErrorCode::INVALID_ARGUMENT,
+                 "logit bias names token " + std::to_string(token) + " outside a vocabulary of " +
+                     std::to_string(biased.size()));
+        biased[token] = static_cast<float>(static_cast<double>(biased[token]) + bias);
+    }
+    return biased;
+}
+
+namespace {
+
+// One sampling pass over already-biased logits. Shared by the two public
+// entry points so the greedy rule, the truncation order and the reported
+// probabilities cannot drift apart.
+SampledToken sample_core(const std::vector<float> &logits, const SamplingConfig &sampling,
+                         std::mt19937_64 &rng) {
     if (logits.empty()) fail(ErrorCode::INVALID_ARGUMENT, "cannot sample from empty logits");
+    SampledToken out;
     if (sampling.greedy()) {
         // Greedy inside the sampler: highest logit, lowest id on ties.
         uint32_t best = 0;
         for (uint32_t i = 1; i < logits.size(); ++i)
             if (logits[i] > logits[best]) best = i;
-        return best;
+        out.id = best;
+        if (sampling.n_probs > 0) out.alternatives.emplace_back(best, 1.0);
+        return out;
     }
     const double temperature = sampling.temperature;
 
@@ -499,6 +564,20 @@ uint32_t sample_from_logits(const std::vector<float> &logits, const SamplingConf
     if (!(total > 0.0)) fail(ErrorCode::INTERNAL_ERROR, "sampling probability underflow");
     for (double &p : probs) p /= total;
 
+    // min-p keeps the tokens whose probability is at least `min_p` times the
+    // most likely token's. It runs before the nucleus cut, as upstream's
+    // sampler chain does, and always keeps one candidate.
+    if (sampling.min_p > 0.0 && !probs.empty()) {
+        const double floor_prob = sampling.min_p * probs.front();
+        size_t keep = 1;
+        while (keep < probs.size() && probs[keep] >= floor_prob) ++keep;
+        scored.resize(keep);
+        probs.resize(keep);
+        total = 0.0;
+        for (double p : probs) total += p;
+        for (double &p : probs) p /= total;
+    }
+
     // Nucleus truncation, keeping at least one candidate.
     if (sampling.top_p > 0.0 && sampling.top_p < 1.0) {
         double cumulative = 0.0;
@@ -520,12 +599,35 @@ uint32_t sample_from_logits(const std::vector<float> &logits, const SamplingConf
 
     std::uniform_real_distribution<double> uniform(0.0, 1.0);
     const double target = uniform(rng);
+    size_t chosen = probs.size() - 1;
     double cumulative = 0.0;
     for (size_t i = 0; i < probs.size(); ++i) {
         cumulative += probs[i];
-        if (target <= cumulative || i + 1 == probs.size()) return scored[i].second;
+        if (target <= cumulative) {
+            chosen = i;
+            break;
+        }
     }
-    return scored.back().second;
+    out.id = scored[chosen].second;
+    if (sampling.n_probs > 0) {
+        const size_t report = std::min<size_t>(sampling.n_probs, scored.size());
+        out.alternatives.reserve(report);
+        for (size_t i = 0; i < report; ++i)
+            out.alternatives.emplace_back(scored[i].second, probs[i]);
+    }
+    return out;
+}
+
+}  // namespace
+
+uint32_t sample_from_logits(const std::vector<float> &logits, const SamplingConfig &sampling,
+                            std::mt19937_64 &rng) {
+    return sample_core(logits, sampling, rng).id;
+}
+
+SampledToken sample_detailed(const std::vector<float> &logits, const SamplingConfig &sampling,
+                             std::mt19937_64 &rng) {
+    return sample_core(logits, sampling, rng);
 }
 
 std::string Engine::detokenize(const std::vector<int32_t> &ids) const {
@@ -2299,10 +2401,19 @@ PromptResult Engine::run_prompt(const std::string &prompt, uint32_t generated_to
     result.first_token_ms = result.prefill_ms;
 
     Timer decode_timer;
+    // The penalties need to know what has already been produced, so the history
+    // starts as the prompt and grows with each sampled token. `--n-probs` rides
+    // on the same pass rather than sampling twice.
+    std::vector<int32_t> sampling_history(result.input_ids.begin(), result.input_ids.end());
     for (uint32_t i = 0; i < generated_tokens; ++i) {
         Timer step_timer;
-        int32_t token = static_cast<int32_t>(sample(logits));
+        const std::vector<float> biased =
+            apply_sampling_bias(logits, config_.sampling, sampling_history);
+        const SampledToken sampled = sample_detailed(biased, config_.sampling, rng_);
+        const int32_t token = static_cast<int32_t>(sampled.id);
         result.generated_ids.push_back(token);
+        if (config_.sampling.n_probs > 0) result.alternatives.push_back(sampled.alternatives);
+        sampling_history.push_back(token);
         backend_->record_control(config_.sampling.greedy() ? "greedy_sampling" : "sampled_sampling",
                                  logits.size() * sizeof(float), sizeof(int32_t));
         // Generation ends at the checkpoint's end-of-sequence token. Emitting it

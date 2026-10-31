@@ -1679,6 +1679,120 @@ void test_thread_dispatch_policy() {
                               std::to_string(worst) + ")");
 }
 
+// The bias stage of sampling: repetition, presence, frequency and the static
+// per-token bias, plus min-p truncation and the reported alternatives. Each
+// check is an ordering claim, so it can be read without knowing the fixture.
+void test_sampling_bias() {
+    // repetition_penalty: a token that just appeared drops below its rival.
+    {
+        std::vector<float> logits = {3.0f, 2.9f, 0.0f};
+        SamplingConfig cfg;
+        cfg.repetition_penalty = 2.0;
+        const std::vector<int32_t> history = {0};
+        const std::vector<float> biased = apply_sampling_bias(logits, cfg, history);
+        CHECK(biased[0] < biased[1], "a repeated token is pushed below its rival");
+        CHECK(biased[0] == 1.5f, "a positive repeated logit is divided by the penalty");
+        CHECK(biased[1] == 2.9f, "an unseen token keeps its logit");
+        // Negative logits are multiplied, so the penalty still moves them down.
+        std::vector<float> negatives = {-3.0f, 0.0f};
+        const std::vector<int32_t> see_zero = {0};
+        CHECK(apply_sampling_bias(negatives, cfg, see_zero)[0] == -6.0f,
+              "a negative repeated logit is multiplied by the penalty");
+    }
+    // The identity penalty changes nothing, so the default path is untouched.
+    {
+        SamplingConfig cfg;
+        const std::vector<float> logits = {1.0f, -2.0f, 0.5f};
+        CHECK(apply_sampling_bias(logits, cfg, {0, 0, 1}) == logits,
+              "penalty 1.0 with no other bias is the identity");
+    }
+    // presence and frequency: presence subtracts once, frequency per occurrence.
+    {
+        std::vector<float> logits = {1.0f, 1.0f, 1.0f};
+        SamplingConfig cfg;
+        cfg.presence_penalty = 0.5;
+        const std::vector<float> present = apply_sampling_bias(logits, cfg, {0, 0, 0});
+        CHECK(present[0] == 0.5f, "presence penalty applies once per distinct token");
+        cfg.presence_penalty = 0.0;
+        cfg.frequency_penalty = 0.25;
+        const std::vector<float> frequent = apply_sampling_bias(logits, cfg, {0, 0, 0});
+        CHECK(frequent[0] == 0.25f, "frequency penalty scales with the count");
+        CHECK(frequent[1] == 1.0f, "an absent token is untouched by the frequency penalty");
+    }
+    // The window bounds the history the penalties look at.
+    {
+        std::vector<float> logits = {1.0f, 1.0f};
+        SamplingConfig cfg;
+        cfg.presence_penalty = 1.0;
+        cfg.penalty_window = 1;
+        const std::vector<float> windowed = apply_sampling_bias(logits, cfg, {0, 1});
+        CHECK(windowed[0] == 1.0f, "a token outside the penalty window keeps its logit");
+        CHECK(windowed[1] == 0.0f, "the last token is inside the window");
+    }
+    // A static bias moves the argmax, and an out-of-vocabulary id is refused.
+    {
+        std::vector<float> logits = {1.0f, 2.0f};
+        SamplingConfig cfg;
+        cfg.logit_bias[0] = 5.0;
+        std::mt19937_64 rng(3);
+        CHECK(sample_from_logits(apply_sampling_bias(logits, cfg, {}), cfg, rng) == 0,
+              "a logit bias moves the greedy choice");
+        cfg.logit_bias[9] = 1.0;
+        CHECK(throws_code(ErrorCode::INVALID_ARGUMENT,
+                          [&]() { (void)apply_sampling_bias(logits, cfg, {}); }),
+              "a bias for a token outside the vocabulary is refused");
+    }
+    // min-p: a high floor leaves only the most likely token, so sampling
+    // collapses onto it even at a non-zero temperature.
+    {
+        std::vector<float> logits = {4.0f, 3.0f, 2.0f, 1.0f};
+        SamplingConfig cfg;
+        cfg.temperature = 1.0;
+        cfg.min_p = 0.9;
+        std::mt19937_64 rng(11);
+        bool only_top = true;
+        for (int i = 0; i < 200; ++i)
+            only_top = only_top && sample_from_logits(logits, cfg, rng) == 0;
+        CHECK(only_top, "min-p 0.9 keeps only tokens within 10% of the leader's probability");
+        cfg.min_p = 0.0;
+        std::mt19937_64 rng2(11);
+        bool saw_other = false;
+        for (int i = 0; i < 200; ++i) saw_other = saw_other || sample_from_logits(logits, cfg, rng2) != 0;
+        CHECK(saw_other, "without min-p the same distribution reaches other tokens");
+    }
+    // n_probs: the reported alternatives are sorted, normalised and start with
+    // the token that was chosen when greedy.
+    {
+        std::vector<float> logits = {2.0f, 1.5f, 1.0f, 0.5f, 0.0f};
+        SamplingConfig cfg;
+        cfg.temperature = 1.0;
+        cfg.n_probs = 3;
+        std::mt19937_64 rng(5);
+        const SampledToken sampled = sample_detailed(logits, cfg, rng);
+        CHECK(sampled.alternatives.size() == 3, "n_probs reports exactly that many alternatives");
+        bool sorted = true;
+        double sum = 0.0;
+        for (size_t i = 0; i < sampled.alternatives.size(); ++i) {
+            sum += sampled.alternatives[i].second;
+            if (i > 0) sorted = sorted && sampled.alternatives[i].second <= sampled.alternatives[i - 1].second;
+        }
+        CHECK(sorted, "alternatives are reported most likely first");
+        CHECK(sum > 0.0 && sum <= 1.0 + 1e-9, "alternative probabilities are normalised");
+        CHECK(sampled.alternatives.front().first == 0, "the leader is the highest logit");
+    }
+    // Greedy with n_probs reports the single choice at probability 1.
+    {
+        std::vector<float> logits = {0.0f, 3.0f};
+        SamplingConfig cfg;
+        cfg.n_probs = 4;
+        std::mt19937_64 rng(5);
+        const SampledToken sampled = sample_detailed(logits, cfg, rng);
+        CHECK(sampled.id == 1 && sampled.alternatives.size() == 1,
+              "greedy reports one alternative at probability 1");
+        CHECK(sampled.alternatives[0].second == 1.0, "its probability is exactly 1");
+    }
+}
+
 void test_sampling_and_detokenize() {
     // Greedy sampler: highest logit wins, lower id breaks ties.
     std::vector<float> logits = {0.1f, 2.5f, 2.5f, -1.0f};
@@ -4622,6 +4736,7 @@ int main(int argc, char **argv) {
     maybe_run("cpu_kernels", test_cpu_kernels);
     maybe_run("thread_dispatch_policy", test_thread_dispatch_policy);
     maybe_run("generic_inspect_and_roundtrip", test_generic_inspect_and_roundtrip);
+    maybe_run("sampling_bias", test_sampling_bias);
     maybe_run("sampling_and_detokenize", test_sampling_and_detokenize);
     maybe_run("residency_manager", test_residency_manager);
     maybe_run("dense_cpu_reference_and_operation_log", test_dense_cpu_reference_and_operation_log);
