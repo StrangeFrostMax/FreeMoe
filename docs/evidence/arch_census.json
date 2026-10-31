@@ -1,0 +1,2162 @@
+{
+ "adapter_rows": 67,
+ "blocked_by_capability": {
+  "C-ALTUP": [
+   "gemma3n"
+  ],
+  "C-DSA-INDEXER": [
+   "dots3note",
+   "hy-v4",
+   "minimax-m3",
+   "mistral-large4"
+  ],
+  "C-DUAL-FFN": [
+   "arctic"
+  ],
+  "C-ENC-DEC": [
+   "eagle3",
+   "t5encoder"
+  ],
+  "C-HYPERCONN": [
+   "limite"
+  ],
+  "C-LINEAR-ATTN": [
+   "delta-net-base",
+   "rwkv6-base"
+  ],
+  "C-MTP-HEAD": [
+   "bailingmoe3",
+   "cohere2moe",
+   "deepseek32",
+   "dflash",
+   "glm-dsa",
+   "glm4-moe",
+   "glm5-next",
+   "hy-v3",
+   "mellum",
+   "mimo2",
+   "nemotron-h-moe",
+   "qwen35",
+   "qwen35moe",
+   "qwen3next",
+   "qwen4exp",
+   "step35"
+  ],
+  "C-MULTIMODAL": [
+   "clip"
+  ],
+  "C-RWKV": [
+   "arwkv7",
+   "rwkv6",
+   "rwkv6qwen2",
+   "rwkv7",
+   "rwkv7-base"
+  ],
+  "C-SHORTCONV": [
+   "clef",
+   "kimi-k3",
+   "kimi-linear",
+   "lfm-base",
+   "lfm2",
+   "lfm2moe",
+   "lfm3",
+   "mamba-base",
+   "plamo2",
+   "wavtokenizer-dec"
+  ]
+ },
+ "capabilities": {
+  "C-ALTUP": "AltUp / per-layer token embeddings",
+  "C-ATTN-COMP": "attention compressor",
+  "C-DELTA-NET": "gated delta-net scan",
+  "C-DSA-INDEXER": "sparse-attention (DSA) indexer",
+  "C-DUAL-FFN": "dense and MoE FFN summed in one layer",
+  "C-ENC-DEC": "encoder/decoder cross-attention stack",
+  "C-HYPERCONN": "hyper-connections (per-layer residual streams)",
+  "C-LINEAR-ATTN": "linear/recurrent attention layer",
+  "C-MTP-HEAD": "multi-token-prediction head",
+  "C-MULTIMODAL": "vision tower / multimodal projector",
+  "C-RWKV": "RWKV scan",
+  "C-SHORTCONV": "short convolution / conv1d in the block",
+  "C-TID2EID": "token-id expert routing"
+ },
+ "counts": {
+  "blocked": 43,
+  "mapped": 61,
+  "mapped-caveat": 2,
+  "unclassified": 65
+ },
+ "files": 171,
+ "method": "graph-marker scan; a verdict is not evidence a family runs",
+ "rows": [
+  {
+   "arch": "afmoe",
+   "blocking": [],
+   "capability": "",
+   "explained": {},
+   "file": "afmoe.cpp",
+   "implemented": [
+    "moe",
+    "qk-norm",
+    "router-bias",
+    "shared-expert"
+   ],
+   "verdict": "unclassified"
+  },
+  {
+   "arch": "apertus",
+   "blocking": [],
+   "capability": "",
+   "explained": {},
+   "file": "apertus.cpp",
+   "implemented": [
+    "qk-norm"
+   ],
+   "verdict": "unclassified"
+  },
+  {
+   "arch": "arcee",
+   "blocking": [],
+   "capability": "",
+   "explained": {},
+   "file": "arcee.cpp",
+   "implemented": [],
+   "verdict": "mapped"
+  },
+  {
+   "arch": "arctic",
+   "blocking": [
+    "C-DUAL-FFN"
+   ],
+   "capability": "C-DUAL-FFN",
+   "explained": {},
+   "file": "arctic.cpp",
+   "implemented": [
+    "moe"
+   ],
+   "verdict": "blocked"
+  },
+  {
+   "arch": "arwkv7",
+   "blocking": [
+    "C-RWKV"
+   ],
+   "capability": "C-RWKV",
+   "explained": {},
+   "file": "arwkv7.cpp",
+   "implemented": [],
+   "verdict": "blocked"
+  },
+  {
+   "arch": "baichuan",
+   "blocking": [],
+   "capability": "",
+   "explained": {},
+   "file": "baichuan.cpp",
+   "implemented": [],
+   "verdict": "mapped"
+  },
+  {
+   "arch": "bailingmoe",
+   "blocking": [],
+   "capability": "",
+   "explained": {},
+   "file": "bailingmoe.cpp",
+   "implemented": [
+    "moe",
+    "shared-expert"
+   ],
+   "verdict": "unclassified"
+  },
+  {
+   "arch": "bailingmoe2",
+   "blocking": [],
+   "capability": "",
+   "explained": {},
+   "file": "bailingmoe2.cpp",
+   "implemented": [
+    "moe",
+    "qk-norm",
+    "router-bias",
+    "shared-expert"
+   ],
+   "verdict": "unclassified"
+  },
+  {
+   "arch": "bailingmoe3",
+   "blocking": [
+    "C-MTP-HEAD",
+    "C-SHORTCONV",
+    "C-LINEAR-ATTN",
+    "C-DELTA-NET"
+   ],
+   "capability": "C-MTP-HEAD",
+   "explained": {},
+   "file": "bailingmoe3.cpp",
+   "implemented": [
+    "mla",
+    "moe",
+    "mrope",
+    "router-bias",
+    "shared-expert"
+   ],
+   "verdict": "blocked"
+  },
+  {
+   "arch": "beam",
+   "blocking": [],
+   "capability": "",
+   "explained": {},
+   "file": "beam.cpp",
+   "implemented": [
+    "moe",
+    "qk-norm",
+    "router-bias"
+   ],
+   "verdict": "unclassified"
+  },
+  {
+   "arch": "bert",
+   "blocking": [],
+   "capability": "",
+   "explained": {},
+   "file": "bert.cpp",
+   "implemented": [
+    "moe",
+    "qk-norm"
+   ],
+   "verdict": "unclassified"
+  },
+  {
+   "arch": "bitnet",
+   "blocking": [],
+   "capability": "",
+   "explained": {},
+   "file": "bitnet.cpp",
+   "implemented": [],
+   "verdict": "mapped"
+  },
+  {
+   "arch": "bloom",
+   "blocking": [],
+   "capability": "",
+   "explained": {},
+   "file": "bloom.cpp",
+   "implemented": [],
+   "verdict": "mapped"
+  },
+  {
+   "arch": "chameleon",
+   "blocking": [],
+   "capability": "",
+   "explained": {},
+   "file": "chameleon.cpp",
+   "implemented": [
+    "qk-norm"
+   ],
+   "verdict": "unclassified"
+  },
+  {
+   "arch": "chatglm",
+   "blocking": [],
+   "capability": "",
+   "explained": {},
+   "file": "chatglm.cpp",
+   "implemented": [],
+   "verdict": "mapped"
+  },
+  {
+   "arch": "clef",
+   "blocking": [
+    "C-SHORTCONV",
+    "C-LINEAR-ATTN",
+    "C-DELTA-NET",
+    "C-ENC-DEC"
+   ],
+   "capability": "C-SHORTCONV",
+   "explained": {},
+   "file": "clef.cpp",
+   "implemented": [
+    "mrope",
+    "qk-norm",
+    "ssm-mamba"
+   ],
+   "verdict": "blocked"
+  },
+  {
+   "arch": "clip",
+   "blocking": [
+    "C-MULTIMODAL"
+   ],
+   "capability": "C-MULTIMODAL",
+   "explained": {},
+   "file": "clip.cpp",
+   "implemented": [],
+   "verdict": "blocked"
+  },
+  {
+   "arch": "codeshell",
+   "blocking": [],
+   "capability": "",
+   "explained": {},
+   "file": "codeshell.cpp",
+   "implemented": [],
+   "verdict": "mapped"
+  },
+  {
+   "arch": "cogvlm",
+   "blocking": [],
+   "capability": "",
+   "explained": {},
+   "file": "cogvlm.cpp",
+   "implemented": [],
+   "verdict": "unclassified"
+  },
+  {
+   "arch": "cohere2",
+   "blocking": [],
+   "capability": "",
+   "explained": {},
+   "file": "cohere2.cpp",
+   "implemented": [],
+   "verdict": "mapped"
+  },
+  {
+   "arch": "cohere2moe",
+   "blocking": [
+    "C-MTP-HEAD"
+   ],
+   "capability": "C-MTP-HEAD",
+   "explained": {},
+   "file": "cohere2moe.cpp",
+   "implemented": [
+    "fused-gate-up",
+    "moe",
+    "shared-expert"
+   ],
+   "verdict": "blocked"
+  },
+  {
+   "arch": "command-r",
+   "blocking": [],
+   "capability": "",
+   "explained": {},
+   "file": "command-r.cpp",
+   "implemented": [
+    "qk-norm"
+   ],
+   "verdict": "mapped"
+  },
+  {
+   "arch": "dbrx",
+   "blocking": [],
+   "capability": "",
+   "explained": {},
+   "file": "dbrx.cpp",
+   "implemented": [
+    "moe"
+   ],
+   "verdict": "unclassified"
+  },
+  {
+   "arch": "deci",
+   "blocking": [],
+   "capability": "",
+   "explained": {},
+   "file": "deci.cpp",
+   "implemented": [],
+   "verdict": "mapped"
+  },
+  {
+   "arch": "deepseek",
+   "blocking": [],
+   "capability": "",
+   "explained": {},
+   "file": "deepseek.cpp",
+   "implemented": [
+    "moe",
+    "shared-expert"
+   ],
+   "verdict": "unclassified"
+  },
+  {
+   "arch": "deepseek2",
+   "blocking": [],
+   "capability": "",
+   "explained": {},
+   "file": "deepseek2.cpp",
+   "implemented": [
+    "attn-temperature",
+    "fused-gate-up",
+    "mla",
+    "moe",
+    "router-bias",
+    "shared-expert"
+   ],
+   "verdict": "mapped"
+  },
+  {
+   "arch": "deepseek2ocr",
+   "blocking": [],
+   "capability": "",
+   "explained": {},
+   "file": "deepseek2ocr.cpp",
+   "implemented": [
+    "fused-gate-up",
+    "router-bias",
+    "shared-expert",
+    "tied-output"
+   ],
+   "verdict": "unclassified"
+  },
+  {
+   "arch": "deepseek32",
+   "blocking": [
+    "C-MTP-HEAD",
+    "C-DSA-INDEXER"
+   ],
+   "capability": "C-MTP-HEAD",
+   "explained": {},
+   "file": "deepseek32.cpp",
+   "implemented": [
+    "fused-gate-up",
+    "mla",
+    "moe",
+    "router-bias",
+    "shared-expert"
+   ],
+   "verdict": "blocked"
+  },
+  {
+   "arch": "deepseek4",
+   "blocking": [
+    "C-MTP-HEAD",
+    "C-HYPERCONN",
+    "C-TID2EID"
+   ],
+   "capability": "",
+   "explained": {},
+   "file": "deepseek4.cpp",
+   "implemented": [
+    "moe",
+    "router-bias",
+    "shared-expert"
+   ],
+   "verdict": "mapped-caveat"
+  },
+  {
+   "arch": "deepseek41",
+   "blocking": [
+    "C-HYPERCONN",
+    "C-MULTIMODAL"
+   ],
+   "capability": "",
+   "explained": {},
+   "file": "deepseek41.cpp",
+   "implemented": [
+    "moe",
+    "router-bias",
+    "shared-expert"
+   ],
+   "verdict": "mapped-caveat"
+  },
+  {
+   "arch": "delta-net-base",
+   "blocking": [
+    "C-LINEAR-ATTN",
+    "C-DELTA-NET"
+   ],
+   "capability": "C-LINEAR-ATTN",
+   "explained": {},
+   "file": "delta-net-base.cpp",
+   "implemented": [],
+   "verdict": "blocked"
+  },
+  {
+   "arch": "dflash",
+   "blocking": [
+    "C-MTP-HEAD",
+    "C-ENC-DEC",
+    "C-HYPERCONN"
+   ],
+   "capability": "C-MTP-HEAD",
+   "explained": {},
+   "file": "dflash.cpp",
+   "implemented": [
+    "embedding-scale",
+    "mla",
+    "moe",
+    "mrope",
+    "qk-norm",
+    "router-bias",
+    "shared-expert",
+    "sinks",
+    "sliding-window"
+   ],
+   "verdict": "blocked"
+  },
+  {
+   "arch": "dots1",
+   "blocking": [],
+   "capability": "",
+   "explained": {},
+   "file": "dots1.cpp",
+   "implemented": [
+    "moe",
+    "qk-norm",
+    "router-bias",
+    "shared-expert"
+   ],
+   "verdict": "unclassified"
+  },
+  {
+   "arch": "dots3note",
+   "blocking": [
+    "C-DSA-INDEXER"
+   ],
+   "capability": "C-DSA-INDEXER",
+   "explained": {},
+   "file": "dots3note.cpp",
+   "implemented": [
+    "fused-gate-up",
+    "mla",
+    "moe",
+    "qk-norm",
+    "router-bias",
+    "shared-expert"
+   ],
+   "verdict": "blocked"
+  },
+  {
+   "arch": "dream",
+   "blocking": [],
+   "capability": "",
+   "explained": {},
+   "file": "dream.cpp",
+   "implemented": [],
+   "verdict": "unclassified"
+  },
+  {
+   "arch": "eagle3",
+   "blocking": [
+    "C-ENC-DEC"
+   ],
+   "capability": "C-ENC-DEC",
+   "explained": {},
+   "file": "eagle3.cpp",
+   "implemented": [],
+   "verdict": "blocked"
+  },
+  {
+   "arch": "ernie4-5-moe",
+   "blocking": [],
+   "capability": "",
+   "explained": {},
+   "file": "ernie4-5-moe.cpp",
+   "implemented": [
+    "moe",
+    "router-bias",
+    "shared-expert"
+   ],
+   "verdict": "unclassified"
+  },
+  {
+   "arch": "ernie4-5",
+   "blocking": [],
+   "capability": "",
+   "explained": {},
+   "file": "ernie4-5.cpp",
+   "implemented": [],
+   "verdict": "unclassified"
+  },
+  {
+   "arch": "eurobert",
+   "blocking": [],
+   "capability": "",
+   "explained": {},
+   "file": "eurobert.cpp",
+   "implemented": [],
+   "verdict": "unclassified"
+  },
+  {
+   "arch": "exaone-moe",
+   "blocking": [],
+   "capability": "",
+   "explained": {},
+   "file": "exaone-moe.cpp",
+   "implemented": [
+    "moe",
+    "qk-norm",
+    "router-bias",
+    "shared-expert"
+   ],
+   "verdict": "unclassified"
+  },
+  {
+   "arch": "exaone",
+   "blocking": [],
+   "capability": "",
+   "explained": {},
+   "file": "exaone.cpp",
+   "implemented": [],
+   "verdict": "mapped"
+  },
+  {
+   "arch": "exaone4",
+   "blocking": [],
+   "capability": "",
+   "explained": {},
+   "file": "exaone4.cpp",
+   "implemented": [
+    "qk-norm"
+   ],
+   "verdict": "unclassified"
+  },
+  {
+   "arch": "falcon-h1",
+   "blocking": [],
+   "capability": "",
+   "explained": {},
+   "file": "falcon-h1.cpp",
+   "implemented": [
+    "ssm-mamba"
+   ],
+   "verdict": "unclassified"
+  },
+  {
+   "arch": "falcon",
+   "blocking": [],
+   "capability": "",
+   "explained": {},
+   "file": "falcon.cpp",
+   "implemented": [],
+   "verdict": "mapped"
+  },
+  {
+   "arch": "flint",
+   "blocking": [],
+   "capability": "",
+   "explained": {},
+   "file": "flint.cpp",
+   "implemented": [
+    "moe",
+    "qk-norm",
+    "router-bias",
+    "shared-expert",
+    "sinks"
+   ],
+   "verdict": "unclassified"
+  },
+  {
+   "arch": "gemma-embedding",
+   "blocking": [],
+   "capability": "",
+   "explained": {},
+   "file": "gemma-embedding.cpp",
+   "implemented": [
+    "qk-norm"
+   ],
+   "verdict": "unclassified"
+  },
+  {
+   "arch": "gemma-embedding2",
+   "blocking": [],
+   "capability": "",
+   "explained": {},
+   "file": "gemma-embedding2.cpp",
+   "implemented": [
+    "qk-norm"
+   ],
+   "verdict": "unclassified"
+  },
+  {
+   "arch": "gemma",
+   "blocking": [],
+   "capability": "",
+   "explained": {},
+   "file": "gemma.cpp",
+   "implemented": [],
+   "verdict": "mapped"
+  },
+  {
+   "arch": "gemma2",
+   "blocking": [],
+   "capability": "",
+   "explained": {},
+   "file": "gemma2.cpp",
+   "implemented": [],
+   "verdict": "mapped"
+  },
+  {
+   "arch": "gemma3",
+   "blocking": [],
+   "capability": "",
+   "explained": {},
+   "file": "gemma3.cpp",
+   "implemented": [
+    "qk-norm"
+   ],
+   "verdict": "mapped"
+  },
+  {
+   "arch": "gemma3n",
+   "blocking": [
+    "C-ALTUP"
+   ],
+   "capability": "C-ALTUP",
+   "explained": {},
+   "file": "gemma3n.cpp",
+   "implemented": [
+    "qk-norm"
+   ],
+   "verdict": "blocked"
+  },
+  {
+   "arch": "gemma4-assistant",
+   "blocking": [],
+   "capability": "",
+   "explained": {},
+   "file": "gemma4-assistant.cpp",
+   "implemented": [
+    "qk-norm"
+   ],
+   "verdict": "unclassified"
+  },
+  {
+   "arch": "gemma4",
+   "blocking": [],
+   "capability": "",
+   "explained": {},
+   "file": "gemma4.cpp",
+   "implemented": [
+    "fused-gate-up",
+    "moe",
+    "qk-norm",
+    "router-bias"
+   ],
+   "verdict": "unclassified"
+  },
+  {
+   "arch": "glm-dsa",
+   "blocking": [
+    "C-MTP-HEAD",
+    "C-DSA-INDEXER"
+   ],
+   "capability": "C-MTP-HEAD",
+   "explained": {},
+   "file": "glm-dsa.cpp",
+   "implemented": [
+    "fused-gate-up",
+    "mla",
+    "moe",
+    "router-bias",
+    "shared-expert"
+   ],
+   "verdict": "blocked"
+  },
+  {
+   "arch": "glm4-moe",
+   "blocking": [
+    "C-MTP-HEAD"
+   ],
+   "capability": "C-MTP-HEAD",
+   "explained": {},
+   "file": "glm4-moe.cpp",
+   "implemented": [
+    "moe",
+    "mrope",
+    "qk-norm",
+    "router-bias",
+    "shared-expert"
+   ],
+   "verdict": "blocked"
+  },
+  {
+   "arch": "glm4",
+   "blocking": [],
+   "capability": "",
+   "explained": {},
+   "file": "glm4.cpp",
+   "implemented": [
+    "mrope"
+   ],
+   "verdict": "mapped"
+  },
+  {
+   "arch": "glm5-next",
+   "blocking": [
+    "C-MTP-HEAD",
+    "C-SHORTCONV",
+    "C-LINEAR-ATTN",
+    "C-DELTA-NET",
+    "C-DSA-INDEXER",
+    "C-HYPERCONN"
+   ],
+   "capability": "C-MTP-HEAD",
+   "explained": {},
+   "file": "glm5-next.cpp",
+   "implemented": [
+    "mla",
+    "moe",
+    "router-bias",
+    "shared-expert"
+   ],
+   "verdict": "blocked"
+  },
+  {
+   "arch": "gpt2",
+   "blocking": [],
+   "capability": "",
+   "explained": {},
+   "file": "gpt2.cpp",
+   "implemented": [],
+   "verdict": "mapped"
+  },
+  {
+   "arch": "gptneox",
+   "blocking": [],
+   "capability": "",
+   "explained": {},
+   "file": "gptneox.cpp",
+   "implemented": [],
+   "verdict": "mapped"
+  },
+  {
+   "arch": "granite-hybrid",
+   "blocking": [],
+   "capability": "",
+   "explained": {},
+   "file": "granite-hybrid.cpp",
+   "implemented": [
+    "moe",
+    "shared-expert",
+    "ssm-mamba"
+   ],
+   "verdict": "unclassified"
+  },
+  {
+   "arch": "granite-moe",
+   "blocking": [],
+   "capability": "",
+   "explained": {},
+   "file": "granite-moe.cpp",
+   "implemented": [
+    "embedding-scale",
+    "shared-expert",
+    "tied-output"
+   ],
+   "verdict": "mapped"
+  },
+  {
+   "arch": "granite-swa",
+   "blocking": [],
+   "capability": "",
+   "explained": {},
+   "file": "granite-swa.cpp",
+   "implemented": [
+    "fused-gate-up",
+    "moe",
+    "shared-expert",
+    "sinks"
+   ],
+   "verdict": "unclassified"
+  },
+  {
+   "arch": "granite-switch",
+   "blocking": [],
+   "capability": "",
+   "explained": {},
+   "file": "granite-switch.cpp",
+   "implemented": [
+    "embedding-scale"
+   ],
+   "verdict": "unclassified"
+  },
+  {
+   "arch": "granite",
+   "blocking": [],
+   "capability": "",
+   "explained": {},
+   "file": "granite.cpp",
+   "implemented": [
+    "moe",
+    "shared-expert"
+   ],
+   "verdict": "mapped"
+  },
+  {
+   "arch": "grok",
+   "blocking": [],
+   "capability": "",
+   "explained": {},
+   "file": "grok.cpp",
+   "implemented": [
+    "moe"
+   ],
+   "verdict": "unclassified"
+  },
+  {
+   "arch": "grovemoe",
+   "blocking": [],
+   "capability": "",
+   "explained": {},
+   "file": "grovemoe.cpp",
+   "implemented": [
+    "moe",
+    "qk-norm"
+   ],
+   "verdict": "unclassified"
+  },
+  {
+   "arch": "hrm-text",
+   "blocking": [],
+   "capability": "",
+   "explained": {},
+   "file": "hrm-text.cpp",
+   "implemented": [
+    "embedding-scale"
+   ],
+   "verdict": "unclassified"
+  },
+  {
+   "arch": "hunyuan-dense",
+   "blocking": [],
+   "capability": "",
+   "explained": {},
+   "file": "hunyuan-dense.cpp",
+   "implemented": [],
+   "verdict": "mapped"
+  },
+  {
+   "arch": "hunyuan-moe",
+   "blocking": [],
+   "capability": "",
+   "explained": {},
+   "file": "hunyuan-moe.cpp",
+   "implemented": [
+    "moe",
+    "qk-norm",
+    "shared-expert"
+   ],
+   "verdict": "unclassified"
+  },
+  {
+   "arch": "hunyuan-vl",
+   "blocking": [],
+   "capability": "",
+   "explained": {},
+   "file": "hunyuan-vl.cpp",
+   "implemented": [
+    "mrope",
+    "qk-norm"
+   ],
+   "verdict": "unclassified"
+  },
+  {
+   "arch": "hy-v3",
+   "blocking": [
+    "C-MTP-HEAD"
+   ],
+   "capability": "C-MTP-HEAD",
+   "explained": {},
+   "file": "hy-v3.cpp",
+   "implemented": [
+    "fused-gate-up",
+    "moe",
+    "qk-norm",
+    "router-bias",
+    "shared-expert"
+   ],
+   "verdict": "blocked"
+  },
+  {
+   "arch": "hy-v4",
+   "blocking": [
+    "C-DSA-INDEXER",
+    "C-HYPERCONN"
+   ],
+   "capability": "C-DSA-INDEXER",
+   "explained": {},
+   "file": "hy-v4.cpp",
+   "implemented": [
+    "moe",
+    "router-bias",
+    "shared-expert"
+   ],
+   "verdict": "blocked"
+  },
+  {
+   "arch": "internlm2",
+   "blocking": [],
+   "capability": "",
+   "explained": {},
+   "file": "internlm2.cpp",
+   "implemented": [],
+   "verdict": "mapped"
+  },
+  {
+   "arch": "jais",
+   "blocking": [],
+   "capability": "",
+   "explained": {},
+   "file": "jais.cpp",
+   "implemented": [],
+   "verdict": "mapped"
+  },
+  {
+   "arch": "jais2",
+   "blocking": [],
+   "capability": "",
+   "explained": {},
+   "file": "jais2.cpp",
+   "implemented": [],
+   "verdict": "mapped"
+  },
+  {
+   "arch": "jamba",
+   "blocking": [],
+   "capability": "",
+   "explained": {},
+   "file": "jamba.cpp",
+   "implemented": [
+    "moe",
+    "ssm-mamba"
+   ],
+   "verdict": "mapped"
+  },
+  {
+   "arch": "jina-bert-v2",
+   "blocking": [],
+   "capability": "",
+   "explained": {},
+   "file": "jina-bert-v2.cpp",
+   "implemented": [
+    "qk-norm"
+   ],
+   "verdict": "unclassified"
+  },
+  {
+   "arch": "jina-bert-v3",
+   "blocking": [],
+   "capability": "",
+   "explained": {},
+   "file": "jina-bert-v3.cpp",
+   "implemented": [],
+   "verdict": "unclassified"
+  },
+  {
+   "arch": "k2-horizon",
+   "blocking": [],
+   "capability": "",
+   "explained": {},
+   "file": "k2-horizon.cpp",
+   "implemented": [
+    "moe",
+    "qk-norm",
+    "router-bias",
+    "shared-expert"
+   ],
+   "verdict": "unclassified"
+  },
+  {
+   "arch": "kimi-k3",
+   "blocking": [
+    "C-SHORTCONV",
+    "C-LINEAR-ATTN",
+    "C-DELTA-NET"
+   ],
+   "capability": "C-SHORTCONV",
+   "explained": {},
+   "file": "kimi-k3.cpp",
+   "implemented": [
+    "mla",
+    "moe",
+    "router-bias",
+    "shared-expert",
+    "ssm-mamba"
+   ],
+   "verdict": "blocked"
+  },
+  {
+   "arch": "kimi-linear",
+   "blocking": [
+    "C-SHORTCONV",
+    "C-DELTA-NET"
+   ],
+   "capability": "C-SHORTCONV",
+   "explained": {},
+   "file": "kimi-linear.cpp",
+   "implemented": [
+    "mla",
+    "moe",
+    "router-bias",
+    "shared-expert"
+   ],
+   "verdict": "blocked"
+  },
+  {
+   "arch": "kolibri1",
+   "blocking": [],
+   "capability": "",
+   "explained": {},
+   "file": "kolibri1.cpp",
+   "implemented": [
+    "moe",
+    "qk-norm",
+    "router-bias",
+    "shared-expert"
+   ],
+   "verdict": "unclassified"
+  },
+  {
+   "arch": "laguna",
+   "blocking": [],
+   "capability": "",
+   "explained": {},
+   "file": "laguna.cpp",
+   "implemented": [
+    "moe",
+    "qk-norm",
+    "router-bias",
+    "shared-expert",
+    "sliding-window"
+   ],
+   "verdict": "unclassified"
+  },
+  {
+   "arch": "lfm-base",
+   "blocking": [
+    "C-SHORTCONV"
+   ],
+   "capability": "C-SHORTCONV",
+   "explained": {},
+   "file": "lfm-base.cpp",
+   "implemented": [
+    "moe",
+    "router-bias",
+    "ssm-mamba"
+   ],
+   "verdict": "blocked"
+  },
+  {
+   "arch": "lfm2",
+   "blocking": [
+    "C-SHORTCONV"
+   ],
+   "capability": "C-SHORTCONV",
+   "explained": {},
+   "file": "lfm2.cpp",
+   "implemented": [
+    "qk-norm"
+   ],
+   "verdict": "blocked"
+  },
+  {
+   "arch": "lfm2moe",
+   "blocking": [
+    "C-SHORTCONV"
+   ],
+   "capability": "C-SHORTCONV",
+   "explained": {},
+   "file": "lfm2moe.cpp",
+   "implemented": [
+    "qk-norm",
+    "router-bias",
+    "tied-output"
+   ],
+   "verdict": "blocked"
+  },
+  {
+   "arch": "lfm3",
+   "blocking": [
+    "C-SHORTCONV"
+   ],
+   "capability": "C-SHORTCONV",
+   "explained": {},
+   "file": "lfm3.cpp",
+   "implemented": [
+    "qk-norm"
+   ],
+   "verdict": "blocked"
+  },
+  {
+   "arch": "limite",
+   "blocking": [
+    "C-HYPERCONN"
+   ],
+   "capability": "C-HYPERCONN",
+   "explained": {},
+   "file": "limite.cpp",
+   "implemented": [],
+   "verdict": "blocked"
+  },
+  {
+   "arch": "llada-moe",
+   "blocking": [],
+   "capability": "",
+   "explained": {},
+   "file": "llada-moe.cpp",
+   "implemented": [
+    "moe",
+    "qk-norm"
+   ],
+   "verdict": "unclassified"
+  },
+  {
+   "arch": "llada",
+   "blocking": [],
+   "capability": "",
+   "explained": {},
+   "file": "llada.cpp",
+   "implemented": [],
+   "verdict": "unclassified"
+  },
+  {
+   "arch": "llama-embed",
+   "blocking": [],
+   "capability": "",
+   "explained": {},
+   "file": "llama-embed.cpp",
+   "implemented": [],
+   "verdict": "mapped"
+  },
+  {
+   "arch": "llama",
+   "blocking": [],
+   "capability": "",
+   "explained": {},
+   "file": "llama.cpp",
+   "implemented": [
+    "moe"
+   ],
+   "verdict": "mapped"
+  },
+  {
+   "arch": "llama4",
+   "blocking": [],
+   "capability": "",
+   "explained": {},
+   "file": "llama4.cpp",
+   "implemented": [
+    "moe",
+    "shared-expert"
+   ],
+   "verdict": "unclassified"
+  },
+  {
+   "arch": "maincoder",
+   "blocking": [],
+   "capability": "",
+   "explained": {},
+   "file": "maincoder.cpp",
+   "implemented": [
+    "qk-norm"
+   ],
+   "verdict": "mapped"
+  },
+  {
+   "arch": "maion-coder",
+   "blocking": [],
+   "capability": "",
+   "explained": {},
+   "file": "maion-coder.cpp",
+   "implemented": [
+    "moe",
+    "qk-norm"
+   ],
+   "verdict": "unclassified"
+  },
+  {
+   "arch": "mamba-base",
+   "blocking": [
+    "C-SHORTCONV",
+    "C-LINEAR-ATTN"
+   ],
+   "capability": "C-SHORTCONV",
+   "explained": {},
+   "file": "mamba-base.cpp",
+   "implemented": [
+    "ssm-mamba"
+   ],
+   "verdict": "blocked"
+  },
+  {
+   "arch": "mamba",
+   "blocking": [],
+   "capability": "",
+   "explained": {},
+   "file": "mamba.cpp",
+   "implemented": [
+    "ssm-mamba"
+   ],
+   "verdict": "mapped"
+  },
+  {
+   "arch": "mamba2",
+   "blocking": [],
+   "capability": "",
+   "explained": {
+    "C-SHORTCONV": "the `conv1d` in this file is `ssm_conv1d`, the SSM short convolution the mamba2 block already implements \u2014 not a generic shortconv layer"
+   },
+   "file": "mamba2.cpp",
+   "implemented": [
+    "tied-output"
+   ],
+   "verdict": "mapped"
+  },
+  {
+   "arch": "maple",
+   "blocking": [],
+   "capability": "",
+   "explained": {},
+   "file": "maple.cpp",
+   "implemented": [
+    "moe",
+    "qk-norm"
+   ],
+   "verdict": "unclassified"
+  },
+  {
+   "arch": "mellum",
+   "blocking": [
+    "C-MTP-HEAD"
+   ],
+   "capability": "C-MTP-HEAD",
+   "explained": {},
+   "file": "mellum.cpp",
+   "implemented": [
+    "moe",
+    "qk-norm"
+   ],
+   "verdict": "blocked"
+  },
+  {
+   "arch": "mimo2",
+   "blocking": [
+    "C-MTP-HEAD"
+   ],
+   "capability": "C-MTP-HEAD",
+   "explained": {},
+   "file": "mimo2.cpp",
+   "implemented": [
+    "moe",
+    "router-bias",
+    "sinks"
+   ],
+   "verdict": "blocked"
+  },
+  {
+   "arch": "minicpm",
+   "blocking": [],
+   "capability": "",
+   "explained": {},
+   "file": "minicpm.cpp",
+   "implemented": [
+    "embedding-scale",
+    "shared-expert",
+    "tied-output"
+   ],
+   "verdict": "mapped"
+  },
+  {
+   "arch": "minicpm3",
+   "blocking": [],
+   "capability": "",
+   "explained": {},
+   "file": "minicpm3.cpp",
+   "implemented": [
+    "mla"
+   ],
+   "verdict": "unclassified"
+  },
+  {
+   "arch": "minimax-01",
+   "blocking": [],
+   "capability": "",
+   "explained": {},
+   "file": "minimax-01.cpp",
+   "implemented": [
+    "moe",
+    "router-bias"
+   ],
+   "verdict": "unclassified"
+  },
+  {
+   "arch": "minimax-m2",
+   "blocking": [],
+   "capability": "",
+   "explained": {},
+   "file": "minimax-m2.cpp",
+   "implemented": [
+    "moe",
+    "qk-norm",
+    "router-bias"
+   ],
+   "verdict": "unclassified"
+  },
+  {
+   "arch": "minimax-m3",
+   "blocking": [
+    "C-DSA-INDEXER"
+   ],
+   "capability": "C-DSA-INDEXER",
+   "explained": {},
+   "file": "minimax-m3.cpp",
+   "implemented": [
+    "moe",
+    "qk-norm",
+    "router-bias",
+    "shared-expert"
+   ],
+   "verdict": "blocked"
+  },
+  {
+   "arch": "mistral-large4",
+   "blocking": [
+    "C-DSA-INDEXER"
+   ],
+   "capability": "C-DSA-INDEXER",
+   "explained": {},
+   "file": "mistral-large4.cpp",
+   "implemented": [
+    "fused-gate-up",
+    "mla",
+    "moe",
+    "partial-rotary",
+    "shared-expert"
+   ],
+   "verdict": "blocked"
+  },
+  {
+   "arch": "mistral3",
+   "blocking": [],
+   "capability": "",
+   "explained": {},
+   "file": "mistral3.cpp",
+   "implemented": [
+    "attn-temperature",
+    "moe"
+   ],
+   "verdict": "mapped"
+  },
+  {
+   "arch": "mistral4",
+   "blocking": [],
+   "capability": "",
+   "explained": {},
+   "file": "mistral4.cpp",
+   "implemented": [],
+   "verdict": "unclassified"
+  },
+  {
+   "arch": "modern-bert",
+   "blocking": [],
+   "capability": "",
+   "explained": {},
+   "file": "modern-bert.cpp",
+   "implemented": [],
+   "verdict": "unclassified"
+  },
+  {
+   "arch": "mpt",
+   "blocking": [],
+   "capability": "",
+   "explained": {},
+   "file": "mpt.cpp",
+   "implemented": [
+    "qk-norm"
+   ],
+   "verdict": "mapped"
+  },
+  {
+   "arch": "muse-glimmer",
+   "blocking": [],
+   "capability": "",
+   "explained": {},
+   "file": "muse-glimmer.cpp",
+   "implemented": [
+    "qk-norm"
+   ],
+   "verdict": "unclassified"
+  },
+  {
+   "arch": "muse-spark",
+   "blocking": [],
+   "capability": "",
+   "explained": {},
+   "file": "muse-spark.cpp",
+   "implemented": [
+    "moe",
+    "qk-norm",
+    "router-bias"
+   ],
+   "verdict": "unclassified"
+  },
+  {
+   "arch": "nanbeige",
+   "blocking": [],
+   "capability": "",
+   "explained": {},
+   "file": "nanbeige.cpp",
+   "implemented": [],
+   "verdict": "mapped"
+  },
+  {
+   "arch": "nemotron-h-moe",
+   "blocking": [
+    "C-MTP-HEAD"
+   ],
+   "capability": "C-MTP-HEAD",
+   "explained": {},
+   "file": "nemotron-h-moe.cpp",
+   "implemented": [
+    "moe",
+    "router-bias",
+    "shared-expert"
+   ],
+   "verdict": "blocked"
+  },
+  {
+   "arch": "nemotron-h",
+   "blocking": [],
+   "capability": "",
+   "explained": {},
+   "file": "nemotron-h.cpp",
+   "implemented": [
+    "moe",
+    "router-bias",
+    "shared-expert",
+    "ssm-mamba"
+   ],
+   "verdict": "unclassified"
+  },
+  {
+   "arch": "nemotron",
+   "blocking": [],
+   "capability": "",
+   "explained": {},
+   "file": "nemotron.cpp",
+   "implemented": [],
+   "verdict": "mapped"
+  },
+  {
+   "arch": "neo-bert",
+   "blocking": [],
+   "capability": "",
+   "explained": {},
+   "file": "neo-bert.cpp",
+   "implemented": [],
+   "verdict": "unclassified"
+  },
+  {
+   "arch": "nomic-bert-moe",
+   "blocking": [],
+   "capability": "",
+   "explained": {},
+   "file": "nomic-bert-moe.cpp",
+   "implemented": [],
+   "verdict": "unclassified"
+  },
+  {
+   "arch": "nomic-bert",
+   "blocking": [],
+   "capability": "",
+   "explained": {},
+   "file": "nomic-bert.cpp",
+   "implemented": [],
+   "verdict": "unclassified"
+  },
+  {
+   "arch": "olmo",
+   "blocking": [],
+   "capability": "",
+   "explained": {},
+   "file": "olmo.cpp",
+   "implemented": [
+    "weightless-norm"
+   ],
+   "verdict": "mapped"
+  },
+  {
+   "arch": "olmo2",
+   "blocking": [],
+   "capability": "",
+   "explained": {},
+   "file": "olmo2.cpp",
+   "implemented": [
+    "qk-norm"
+   ],
+   "verdict": "mapped"
+  },
+  {
+   "arch": "olmoe",
+   "blocking": [],
+   "capability": "",
+   "explained": {},
+   "file": "olmoe.cpp",
+   "implemented": [
+    "moe",
+    "qk-norm"
+   ],
+   "verdict": "mapped"
+  },
+  {
+   "arch": "openai-moe",
+   "blocking": [],
+   "capability": "",
+   "explained": {},
+   "file": "openai-moe.cpp",
+   "implemented": [
+    "moe",
+    "sinks"
+   ],
+   "verdict": "mapped"
+  },
+  {
+   "arch": "openelm",
+   "blocking": [],
+   "capability": "",
+   "explained": {},
+   "file": "openelm.cpp",
+   "implemented": [
+    "qk-norm"
+   ],
+   "verdict": "unclassified"
+  },
+  {
+   "arch": "orion",
+   "blocking": [],
+   "capability": "",
+   "explained": {},
+   "file": "orion.cpp",
+   "implemented": [],
+   "verdict": "mapped"
+  },
+  {
+   "arch": "paddleocr",
+   "blocking": [],
+   "capability": "",
+   "explained": {},
+   "file": "paddleocr.cpp",
+   "implemented": [
+    "mrope"
+   ],
+   "verdict": "mapped"
+  },
+  {
+   "arch": "pangu-embed",
+   "blocking": [],
+   "capability": "",
+   "explained": {},
+   "file": "pangu-embed.cpp",
+   "implemented": [],
+   "verdict": "unclassified"
+  },
+  {
+   "arch": "phi2",
+   "blocking": [],
+   "capability": "",
+   "explained": {},
+   "file": "phi2.cpp",
+   "implemented": [],
+   "verdict": "mapped"
+  },
+  {
+   "arch": "phi3",
+   "blocking": [],
+   "capability": "",
+   "explained": {},
+   "file": "phi3.cpp",
+   "implemented": [
+    "moe"
+   ],
+   "verdict": "mapped"
+  },
+  {
+   "arch": "phimoe",
+   "blocking": [],
+   "capability": "",
+   "explained": {},
+   "file": "phimoe.cpp",
+   "implemented": [
+    "tied-output"
+   ],
+   "verdict": "mapped"
+  },
+  {
+   "arch": "plamo",
+   "blocking": [],
+   "capability": "",
+   "explained": {},
+   "file": "plamo.cpp",
+   "implemented": [],
+   "verdict": "mapped"
+  },
+  {
+   "arch": "plamo2",
+   "blocking": [
+    "C-SHORTCONV",
+    "C-LINEAR-ATTN"
+   ],
+   "capability": "C-SHORTCONV",
+   "explained": {},
+   "file": "plamo2.cpp",
+   "implemented": [
+    "qk-norm",
+    "ssm-mamba"
+   ],
+   "verdict": "blocked"
+  },
+  {
+   "arch": "plamo3",
+   "blocking": [],
+   "capability": "",
+   "explained": {},
+   "file": "plamo3.cpp",
+   "implemented": [
+    "qk-norm"
+   ],
+   "verdict": "unclassified"
+  },
+  {
+   "arch": "plm",
+   "blocking": [],
+   "capability": "",
+   "explained": {},
+   "file": "plm.cpp",
+   "implemented": [
+    "mla"
+   ],
+   "verdict": "mapped"
+  },
+  {
+   "arch": "pockettts",
+   "blocking": [],
+   "capability": "",
+   "explained": {},
+   "file": "pockettts.cpp",
+   "implemented": [],
+   "verdict": "mapped"
+  },
+  {
+   "arch": "qwen",
+   "blocking": [],
+   "capability": "",
+   "explained": {},
+   "file": "qwen.cpp",
+   "implemented": [],
+   "verdict": "mapped"
+  },
+  {
+   "arch": "qwen2",
+   "blocking": [],
+   "capability": "",
+   "explained": {},
+   "file": "qwen2.cpp",
+   "implemented": [],
+   "verdict": "mapped"
+  },
+  {
+   "arch": "qwen2moe",
+   "blocking": [],
+   "capability": "",
+   "explained": {},
+   "file": "qwen2moe.cpp",
+   "implemented": [
+    "moe",
+    "shared-expert"
+   ],
+   "verdict": "mapped"
+  },
+  {
+   "arch": "qwen2vl",
+   "blocking": [],
+   "capability": "",
+   "explained": {},
+   "file": "qwen2vl.cpp",
+   "implemented": [
+    "mrope"
+   ],
+   "verdict": "unclassified"
+  },
+  {
+   "arch": "qwen3",
+   "blocking": [],
+   "capability": "",
+   "explained": {},
+   "file": "qwen3.cpp",
+   "implemented": [
+    "qk-norm"
+   ],
+   "verdict": "mapped"
+  },
+  {
+   "arch": "qwen35",
+   "blocking": [
+    "C-MTP-HEAD",
+    "C-SHORTCONV",
+    "C-LINEAR-ATTN",
+    "C-DELTA-NET"
+   ],
+   "capability": "C-MTP-HEAD",
+   "explained": {},
+   "file": "qwen35.cpp",
+   "implemented": [
+    "mrope",
+    "qk-norm",
+    "ssm-mamba"
+   ],
+   "verdict": "blocked"
+  },
+  {
+   "arch": "qwen35moe",
+   "blocking": [
+    "C-MTP-HEAD",
+    "C-SHORTCONV",
+    "C-LINEAR-ATTN",
+    "C-DELTA-NET"
+   ],
+   "capability": "C-MTP-HEAD",
+   "explained": {},
+   "file": "qwen35moe.cpp",
+   "implemented": [
+    "fused-gate-up",
+    "moe",
+    "mrope",
+    "qk-norm",
+    "shared-expert",
+    "ssm-mamba"
+   ],
+   "verdict": "blocked"
+  },
+  {
+   "arch": "qwen3moe",
+   "blocking": [],
+   "capability": "",
+   "explained": {},
+   "file": "qwen3moe.cpp",
+   "implemented": [
+    "moe",
+    "qk-norm"
+   ],
+   "verdict": "mapped"
+  },
+  {
+   "arch": "qwen3next",
+   "blocking": [
+    "C-MTP-HEAD",
+    "C-SHORTCONV",
+    "C-LINEAR-ATTN",
+    "C-DELTA-NET"
+   ],
+   "capability": "C-MTP-HEAD",
+   "explained": {},
+   "file": "qwen3next.cpp",
+   "implemented": [
+    "fused-gate-up",
+    "moe",
+    "qk-norm",
+    "shared-expert",
+    "ssm-mamba"
+   ],
+   "verdict": "blocked"
+  },
+  {
+   "arch": "qwen3tts",
+   "blocking": [],
+   "capability": "",
+   "explained": {},
+   "file": "qwen3tts.cpp",
+   "implemented": [],
+   "verdict": "unclassified"
+  },
+  {
+   "arch": "qwen3vl",
+   "blocking": [],
+   "capability": "",
+   "explained": {},
+   "file": "qwen3vl.cpp",
+   "implemented": [
+    "mrope",
+    "qk-norm"
+   ],
+   "verdict": "mapped"
+  },
+  {
+   "arch": "qwen3vlmoe",
+   "blocking": [],
+   "capability": "",
+   "explained": {},
+   "file": "qwen3vlmoe.cpp",
+   "implemented": [
+    "moe",
+    "mrope",
+    "qk-norm"
+   ],
+   "verdict": "mapped"
+  },
+  {
+   "arch": "qwen4exp",
+   "blocking": [
+    "C-MTP-HEAD",
+    "C-SHORTCONV",
+    "C-LINEAR-ATTN",
+    "C-DELTA-NET",
+    "C-DSA-INDEXER",
+    "C-HYPERCONN",
+    "C-MULTIMODAL"
+   ],
+   "capability": "C-MTP-HEAD",
+   "explained": {},
+   "file": "qwen4exp.cpp",
+   "implemented": [
+    "fused-gate-up",
+    "moe",
+    "mrope",
+    "qk-norm",
+    "shared-expert",
+    "ssm-mamba"
+   ],
+   "verdict": "blocked"
+  },
+  {
+   "arch": "refact",
+   "blocking": [],
+   "capability": "",
+   "explained": {},
+   "file": "refact.cpp",
+   "implemented": [],
+   "verdict": "unclassified"
+  },
+  {
+   "arch": "rnd1",
+   "blocking": [],
+   "capability": "",
+   "explained": {},
+   "file": "rnd1.cpp",
+   "implemented": [
+    "moe",
+    "qk-norm"
+   ],
+   "verdict": "unclassified"
+  },
+  {
+   "arch": "rwkv6-base",
+   "blocking": [
+    "C-LINEAR-ATTN",
+    "C-RWKV"
+   ],
+   "capability": "C-LINEAR-ATTN",
+   "explained": {},
+   "file": "rwkv6-base.cpp",
+   "implemented": [],
+   "verdict": "blocked"
+  },
+  {
+   "arch": "rwkv6",
+   "blocking": [
+    "C-RWKV"
+   ],
+   "capability": "C-RWKV",
+   "explained": {},
+   "file": "rwkv6.cpp",
+   "implemented": [],
+   "verdict": "blocked"
+  },
+  {
+   "arch": "rwkv6qwen2",
+   "blocking": [
+    "C-RWKV"
+   ],
+   "capability": "C-RWKV",
+   "explained": {},
+   "file": "rwkv6qwen2.cpp",
+   "implemented": [],
+   "verdict": "blocked"
+  },
+  {
+   "arch": "rwkv7-base",
+   "blocking": [
+    "C-RWKV"
+   ],
+   "capability": "C-RWKV",
+   "explained": {},
+   "file": "rwkv7-base.cpp",
+   "implemented": [],
+   "verdict": "blocked"
+  },
+  {
+   "arch": "rwkv7",
+   "blocking": [
+    "C-RWKV"
+   ],
+   "capability": "C-RWKV",
+   "explained": {},
+   "file": "rwkv7.cpp",
+   "implemented": [],
+   "verdict": "blocked"
+  },
+  {
+   "arch": "seed-oss",
+   "blocking": [],
+   "capability": "",
+   "explained": {},
+   "file": "seed-oss.cpp",
+   "implemented": [],
+   "verdict": "mapped"
+  },
+  {
+   "arch": "sensenova-u1",
+   "blocking": [],
+   "capability": "",
+   "explained": {},
+   "file": "sensenova-u1.cpp",
+   "implemented": [
+    "qk-norm"
+   ],
+   "verdict": "unclassified"
+  },
+  {
+   "arch": "smallthinker",
+   "blocking": [],
+   "capability": "",
+   "explained": {},
+   "file": "smallthinker.cpp",
+   "implemented": [
+    "moe"
+   ],
+   "verdict": "mapped"
+  },
+  {
+   "arch": "smollm3",
+   "blocking": [],
+   "capability": "",
+   "explained": {},
+   "file": "smollm3.cpp",
+   "implemented": [],
+   "verdict": "mapped"
+  },
+  {
+   "arch": "spark2-5",
+   "blocking": [],
+   "capability": "",
+   "explained": {},
+   "file": "spark2-5.cpp",
+   "implemented": [],
+   "verdict": "unclassified"
+  },
+  {
+   "arch": "stablelm",
+   "blocking": [],
+   "capability": "",
+   "explained": {},
+   "file": "stablelm.cpp",
+   "implemented": [
+    "qk-norm"
+   ],
+   "verdict": "mapped"
+  },
+  {
+   "arch": "starcoder",
+   "blocking": [],
+   "capability": "",
+   "explained": {},
+   "file": "starcoder.cpp",
+   "implemented": [],
+   "verdict": "mapped"
+  },
+  {
+   "arch": "starcoder2",
+   "blocking": [],
+   "capability": "",
+   "explained": {},
+   "file": "starcoder2.cpp",
+   "implemented": [],
+   "verdict": "mapped"
+  },
+  {
+   "arch": "step35",
+   "blocking": [
+    "C-MTP-HEAD"
+   ],
+   "capability": "C-MTP-HEAD",
+   "explained": {},
+   "file": "step35.cpp",
+   "implemented": [
+    "moe",
+    "qk-norm",
+    "router-bias",
+    "shared-expert"
+   ],
+   "verdict": "blocked"
+  },
+  {
+   "arch": "t5",
+   "blocking": [],
+   "capability": "",
+   "explained": {},
+   "file": "t5.cpp",
+   "implemented": [],
+   "verdict": "unclassified"
+  },
+  {
+   "arch": "t5encoder",
+   "blocking": [
+    "C-ENC-DEC"
+   ],
+   "capability": "C-ENC-DEC",
+   "explained": {},
+   "file": "t5encoder.cpp",
+   "implemented": [
+    "tied-output"
+   ],
+   "verdict": "blocked"
+  },
+  {
+   "arch": "talkie",
+   "blocking": [],
+   "capability": "",
+   "explained": {},
+   "file": "talkie.cpp",
+   "implemented": [
+    "qk-norm"
+   ],
+   "verdict": "unclassified"
+  },
+  {
+   "arch": "vllm-decision2",
+   "blocking": [],
+   "capability": "",
+   "explained": {},
+   "file": "vllm-decision2.cpp",
+   "implemented": [],
+   "verdict": "unclassified"
+  },
+  {
+   "arch": "wavtokenizer-dec",
+   "blocking": [
+    "C-SHORTCONV",
+    "C-MULTIMODAL"
+   ],
+   "capability": "C-SHORTCONV",
+   "explained": {},
+   "file": "wavtokenizer-dec.cpp",
+   "implemented": [],
+   "verdict": "blocked"
+  },
+  {
+   "arch": "xverse",
+   "blocking": [],
+   "capability": "",
+   "explained": {},
+   "file": "xverse.cpp",
+   "implemented": [],
+   "verdict": "mapped"
+  }
+ ],
+ "schema": "freemoe.arch-census.v1",
+ "upstream": {
+  "pin": "0ec4027a2a0183de87c007069adddc06e665f7de",
+  "repo": "ggml-org/llama.cpp"
+ }
+}

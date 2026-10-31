@@ -42,7 +42,7 @@ FUZZ_SECONDS ?= 72
 DEPS := $(OUR_OBJS:.o=.d) $(MAIN_OBJ:.o=.d) $(TEST_OBJ:.o=.d) \
         $(VNPU_OBJS:.o=.d) $(SELFTEST_OBJS:.o=.d)
 
-.PHONY: all test zen3-fallback fuzz soak bench benchmark fixtures clean distclean help inspect-goldens
+.PHONY: all test zen3-fallback fuzz soak bench benchmark fixtures census clean distclean help inspect-goldens
 
 all: $(BUILD)/freemoe
 
@@ -108,6 +108,7 @@ test: all $(BUILD)/tests $(BUILD)/vnpu-selftest $(BUILD)/fuzz_gguf
 	python3 tools/make_arch_fixtures.py --check
 	python3 tools/gen_quant_tables.py --check
 	python3 scripts/kernels_table.py --check
+	python3 scripts/check_arch_census.py
 	python3 tools/quant_reference.py --check
 	python3 tools/make_quant_fixtures.py --check
 
@@ -137,6 +138,11 @@ bench: all
 
 benchmark: all
 	bash benchmarks/run_repeats.sh configs/benchmark.env
+
+census:
+	@test -n "$(LLAMA_DIR)" || { echo "usage: make census LLAMA_DIR=/path/to/llama.cpp" >&2; exit 2; }
+	python3 tools/triage_upstream_archs.py --llama-dir $(LLAMA_DIR) --write
+	python3 scripts/check_arch_census.py
 
 fixtures:
 	python3 tools/make_fixtures.py --all
