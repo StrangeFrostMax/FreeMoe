@@ -978,7 +978,12 @@ std::vector<float> Engine::forward_token(int32_t token, uint64_t position,
 
     for (uint32_t layer = 0; layer < c.layers; ++layer) {
         const std::string prefix = "blk." + std::to_string(layer) + ".";
-        std::vector<float> h = norm(x, prefix + "attn_norm", "attn_norm.L" + std::to_string(layer));
+        // olmo2 has no pre-norms: attention and the feed-forward read the residual
+        // stream, and only their *outputs* are normalised (that is `post_norms`).
+        std::vector<float> h = c.no_branch_norms
+                                   ? x
+                                   : norm(x, prefix + "attn_norm",
+                                          "attn_norm.L" + std::to_string(layer));
         if (c.layer_is_recurrent(layer)) {
             residual_add(x, ssm_block(layer, prefix, h),
                          "residual.ssm.L" + std::to_string(layer));
@@ -1185,7 +1190,26 @@ std::vector<float> Engine::forward_token(int32_t token, uint64_t position,
             backend_->record_control(name, vec.size() * sizeof(float) * 2,
                                      vec.size() * sizeof(float));
         };
+        // olmoe normalises the concatenated heads as one vector, with a scale as
+        // wide as the whole projection. It is not a per-head norm: the RMS is
+        // taken over every element, so one head's magnitude affects another's.
+        auto whole_vector_norm = [&](std::vector<float> &vec, const std::string &prefix,
+                                     const std::string &name) {
+            const float *w = norm_weights(qk_prefix + prefix + ".weight");
+            double ss = 0.0;
+            for (float v : vec) ss += static_cast<double>(v) * v;
+            const double s = 1.0 / std::sqrt(ss / static_cast<double>(vec.size()) + c.qk_norm_eps);
+            for (size_t i = 0; i < vec.size(); ++i)
+                vec[i] = static_cast<float>(vec[i] * s * w[i]);
+            backend_->record_control(name, vec.size() * sizeof(float) * 2,
+                                     vec.size() * sizeof(float));
+        };
         auto apply_qk_norm = [&]() {
+            if (c.qk_norm_whole_vector) {
+                whole_vector_norm(q, "attn_q_norm", "qk_norm.q.L" + std::to_string(layer));
+                whole_vector_norm(k, "attn_k_norm", "qk_norm.k.L" + std::to_string(layer));
+                return;
+            }
             head_norm(q, c.heads, norm_weights(qk_prefix + "attn_q_norm.weight"),
                       "qk_norm.q.L" + std::to_string(layer));
             head_norm(k, c.kv_heads, norm_weights(qk_prefix + "attn_k_norm.weight"),
@@ -1227,7 +1251,9 @@ std::vector<float> Engine::forward_token(int32_t token, uint64_t position,
         std::memcpy(kv_ + current_base + kv_dim, v.data(), static_cast<size_t>(v_dim) * sizeof(float));
 
         std::vector<float> attention(attn_out_dim, 0.0f);
-        double scale = 1.0 / std::sqrt(static_cast<double>(c.head_dim));
+        double scale = c.attention_scale > 0.0
+                           ? c.attention_scale
+                           : 1.0 / std::sqrt(static_cast<double>(c.head_dim));
         for (uint32_t head = 0; head < c.heads; ++head) {
             const size_t hb = static_cast<size_t>(head) * c.head_dim;
             const size_t kvb = static_cast<size_t>(head / group) * c.head_dim;
@@ -1311,6 +1337,15 @@ std::vector<float> Engine::forward_token(int32_t token, uint64_t position,
         if (c.post_norms)
             attn_out = rmsnorm(attn_out, norm_weights(prefix + "attn_post_norm.weight"),
                                "rmsnorm.attn_post.L" + std::to_string(layer));
+        if (c.residual_scale_applied) {
+            // granite multiplies each branch output by `*.residual_scale` before
+            // the add (models/granite.cpp `build_layer_ffn`), which changes the
+            // residual stream itself rather than one projection.
+            const float s = static_cast<float>(c.residual_scale);
+            for (float &v : attn_out) v *= s;
+            backend_->record_control("residual_scale.attn.L" + std::to_string(layer),
+                                     attn_out.size() * sizeof(float), attn_out.size() * sizeof(float));
+        }
         residual_add(x, attn_out, "residual.attn.L" + std::to_string(layer));
 
         if (c.parallel_residual) {
@@ -1318,8 +1353,10 @@ std::vector<float> Engine::forward_token(int32_t token, uint64_t position,
         } else {
             // gpt-oss normalises after the attention residual and calls that
             // tensor attn_post_norm; the block arithmetic is unchanged.
-            h = norm(x, prefix + (c.ffn_norm_is_post ? "attn_post_norm" : "ffn_norm"),
-                     "ffn_norm.L" + std::to_string(layer));
+            h = c.no_branch_norms
+                    ? x
+                    : norm(x, prefix + (c.ffn_norm_is_post ? "attn_post_norm" : "ffn_norm"),
+                           "ffn_norm.L" + std::to_string(layer));
         }
         if (c.ffn_norm_ada) {
             // mistral3's adaptive RMSNorm: the normalised input is scaled by
@@ -1670,6 +1707,12 @@ std::vector<float> Engine::forward_token(int32_t token, uint64_t position,
         if (c.post_norms)
             ffn = rmsnorm(ffn, norm_weights(prefix + "ffn_post_norm.weight"),
                           "rmsnorm.ffn_post.L" + std::to_string(layer));
+        if (c.residual_scale_applied) {
+            const float s = static_cast<float>(c.residual_scale);
+            for (float &v : ffn) v *= s;
+            backend_->record_control("residual_scale.ffn.L" + std::to_string(layer),
+                                     ffn.size() * sizeof(float), ffn.size() * sizeof(float));
+        }
         residual_add(x, ffn, "residual.ffn.L" + std::to_string(layer));
     }
 
@@ -1680,6 +1723,14 @@ std::vector<float> Engine::forward_token(int32_t token, uint64_t position,
         const float *b = bias_weights("output.bias");
         for (uint32_t i = 0; i < c.vocab; ++i) logits[i] += b[i];
         backend_->record_control("output_bias", logits.size() * sizeof(float), 0);
+    }
+    if (c.logit_scale_inverse) {
+        // granite: `ggml_scale(ctx0, cur, 1.0f / hparams.f_logit_scale)` after the
+        // head. Dividing is not multiplying, so it cannot share command-r's flag.
+        const float s = static_cast<float>(1.0 / c.logit_scale);
+        for (float &v : logits) v *= s;
+        backend_->record_control("logit_scale_inverse", logits.size() * sizeof(float),
+                                 logits.size() * sizeof(float));
     }
     if (c.logit_scale_applied) {
         // command-r multiplies the output logits by `*.logit_scale`; granite
@@ -1715,6 +1766,7 @@ bool Engine::supports_batched_prefill() const {
     if (c.parallel_residual) return false;
     if (c.ffn_norm_is_post) return false;
     if (c.ffn_norm_ada) return false;
+    if (c.no_branch_norms) return false;
     // command-r and talkie normalize q/k with their own layout, norm type and
     // position; the batch path only knows qwen3's shared pre-rope RMSNorm.
     if (c.qk_norm_matrix || c.qk_norm_layernorm || c.qk_norm_after_rope)
@@ -2015,7 +2067,9 @@ std::vector<float> Engine::prefill_batch(const std::vector<int32_t> &tokens,
             const uint64_t first_visible =
                 !windowed || position < c.sliding_window ? 0 : position + 1 - c.sliding_window;
             std::vector<float> attn_row(attn_out_dim, 0.0f);
-            double scale = 1.0 / std::sqrt(static_cast<double>(c.head_dim));
+            double scale = c.attention_scale > 0.0
+                           ? c.attention_scale
+                           : 1.0 / std::sqrt(static_cast<double>(c.head_dim));
             for (uint32_t head = 0; head < c.heads; ++head) {
                 const size_t hb = static_cast<size_t>(head) * c.head_dim;
                 const size_t kvb = static_cast<size_t>(head / group) * c.head_dim;
@@ -2072,6 +2126,14 @@ std::vector<float> Engine::prefill_batch(const std::vector<int32_t> &tokens,
                 norm_row(row.data(), H, prefix + "attn_post_norm", normed.data(),
                          "rmsnorm.attn_post." + lp, batch);
                 row.swap(normed);
+            }
+            if (c.residual_scale_applied) {
+                // granite, same rule as the sequential path: the branch output is
+                // scaled before it joins the residual stream.
+                const float s = static_cast<float>(c.residual_scale);
+                for (float &v : row) v *= s;
+                backend_->record_control("residual_scale.attn." + lp, H * sizeof(float),
+                                         H * sizeof(float));
             }
             float *xt = x.data() + static_cast<size_t>(t) * H;
             for (uint32_t i = 0; i < H; ++i) xt[i] += row[i];
@@ -2161,6 +2223,12 @@ std::vector<float> Engine::prefill_batch(const std::vector<int32_t> &tokens,
                          "rmsnorm.ffn_post." + lp, batch);
                 std::memcpy(row, normed.data(), static_cast<size_t>(H) * sizeof(float));
             }
+            if (c.residual_scale_applied) {
+                const float s = static_cast<float>(c.residual_scale);
+                for (uint32_t i = 0; i < H; ++i) row[i] *= s;
+                backend_->record_control("residual_scale.ffn." + lp, H * sizeof(float),
+                                         H * sizeof(float));
+            }
             float *xt = x.data() + static_cast<size_t>(t) * H;
             for (uint32_t i = 0; i < H; ++i) xt[i] += row[i];
         }
@@ -2176,6 +2244,20 @@ std::vector<float> Engine::prefill_batch(const std::vector<int32_t> &tokens,
     if (c.logit_bias) {
         const float *b = bias_weights("output.bias");
         for (uint32_t i = 0; i < c.vocab; ++i) logits[i] += b[i];
+    }
+    if (c.logit_scale_inverse) {
+        // granite divides the logits by `*.logit_scale` after the head.
+        const float s = static_cast<float>(1.0 / c.logit_scale);
+        for (float &value : logits) value *= s;
+        backend_->record_control("logit_scale_inverse", logits.size() * sizeof(float),
+                                 logits.size() * sizeof(float));
+    }
+    if (c.logit_scale_applied) {
+        // command-r multiplies them instead; the two flags never share a file.
+        const float s = static_cast<float>(c.logit_scale);
+        for (float &value : logits) value *= s;
+        backend_->record_control("logit_scale", logits.size() * sizeof(float),
+                                 logits.size() * sizeof(float));
     }
     if (c.final_logit_softcap > 0.0) {
         for (float &value : logits)

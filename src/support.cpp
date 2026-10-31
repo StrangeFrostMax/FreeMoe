@@ -123,6 +123,10 @@ const std::map<std::string, ArchFacts> &known_architectures() {
         {"command-r", {true, false}},
         {"olmo", {true, false}},
         {"phimoe", {true, false}},
+        {"olmo2", {true, false}},
+        {"olmoe", {true, false}},
+        {"granite", {true, false}},
+        {"granitemoe", {true, false}},
         {"bloom", {true, false}},
         {"jais", {true, false}},
         {"codeshell", {true, false}},
@@ -158,6 +162,27 @@ const MetadataValue *find(const GGUFDocument &doc, const std::string &key) {
 
 // Reads an integer hyperparameter, following the `<arch>.<name>` convention that
 // GGUF uses and falling back to the unprefixed key some converters emit.
+// Reads a real-valued hyperparameter, for keys stored as F32/F64
+// (`hyper_connection.count` is one). Integers are accepted too, because a
+// converter that writes 2 instead of 2.0 means the same thing.
+bool read_double(const GGUFDocument &doc, const std::string &arch, const std::string &name,
+                 double *out) {
+    for (const std::string &key : {arch + "." + name, "freemoe." + name, name}) {
+        const MetadataValue *value = find(doc, key);
+        if (value == nullptr) continue;
+        if (value->type == GGUFValueType::FLOAT32 || value->type == GGUFValueType::FLOAT64) {
+            *out = value->as_double();
+            return true;
+        }
+        if (value->type == GGUFValueType::UINT32 || value->type == GGUFValueType::UINT64 ||
+            value->type == GGUFValueType::INT32 || value->type == GGUFValueType::INT64) {
+            *out = static_cast<double>(value->as_i64());
+            return true;
+        }
+    }
+    return false;
+}
+
 bool read_u64(const GGUFDocument &doc, const std::string &arch, const std::string &name,
               uint64_t *out) {
     // Architecture-prefixed keys are the GGUF convention. `freemoe.` and the
@@ -334,6 +359,41 @@ Json probe_model(const GGUFDocument &doc, const std::string &source_path) {
         block("MISSING_ADAPTER",
               "architecture '" + arch + "' is recognised but its forward pass is not "
               "implemented; only the llama-family block structure is understood today");
+    }
+    // Structures the loader refuses, reported here for the same reason: `probe` is
+    // only useful if it gives the answer a run would give. Both change the forward
+    // pass without changing the tensor set, so no missing-tensor check catches
+    // them.
+    {
+        double hc_count = 0.0;
+        if (read_double(doc, arch, "hyper_connection.count", &hc_count) && hc_count > 1.0) {
+            block("HYPER_CONNECTIONS_UNMODELLED",
+                  "hyper_connection.count = " + std::to_string(static_cast<int>(hc_count)) +
+                      ": hyper-connections widen the residual stream and are a block this "
+                      "build does not have");
+        }
+        const MetadataValue *deepstack = find(doc, arch + ".deepstack_mapping");
+        if (deepstack != nullptr && deepstack->is_array()) {
+            for (const MetadataValue &entry : deepstack->array) {
+                if (entry.as_i64() >= 0) {
+                    block("DEEPSTACK_UNMODELLED",
+                          "granite deepstack_mapping injects a projector stream into the layers "
+                          "it names, and that stream is not modelled here");
+                    break;
+                }
+            }
+        }
+        for (const char *indexer_key : {"attention.indexer.head_count",
+                                        "attention.indexer.key_length",
+                                        "attention.indexer.top_k"}) {
+            if (find(doc, arch + "." + indexer_key) != nullptr ||
+                find(doc, std::string("freemoe.") + indexer_key) != nullptr) {
+                block("INDEXER_UNMODELLED",
+                      "the DSA indexer (" + arch + "." + indexer_key +
+                          ") selects which positions attention reads and is not modelled here");
+                break;
+            }
+        }
     }
     for (uint32_t type_id : unsupported_types) {
         block("UNSUPPORTED_TENSOR_TYPE",

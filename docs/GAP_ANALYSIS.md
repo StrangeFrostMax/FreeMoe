@@ -76,10 +76,10 @@ Every claim below is either a result produced in this tree or a citation into
 
 | Measurement | Value |
 | --- | --- |
-| Unit / parity / fuzz checks | **1338, 0 failures** (`./build/tests`) |
-| Architecture parity fixtures | **17** architectures, 30 `.gguf` fixtures (9.3 MB) |
-| Model adapters | **22** entries = 21 real architectures + native `freemoe-tiny` (`src/support.cpp`) |
-| Upstream architectures with an adapter | **18 of 169** model files |
+| Unit / parity / fuzz checks | **3644, 0 failures** (`./build/tests`) |
+| Architecture parity fixtures | **68** slugs in `architecture_parity`, 89 `.gguf` fixtures (29 MB) — compared against `tools/llama_oracle.py` goldens, not against this engine |
+| Model adapters | **65** entries = 64 real architectures + native `freemoe-tiny` (`src/support.cpp`, `freemoe adapters`) |
+| Upstream architectures with an adapter | **59 of the 171** files in upstream `src/models/` match an adapter row by name, plus five that upstream spells differently (`gpt-oss`→`openai-moe`, `granitemoe`→`granite-moe`, `smollm`, `smollm2`, `tinyllama`→the `llama` block) |
 | Quantisation types decodable | **26** (`src/quant.cpp`) |
 | Error codes | **28** non-OK codes (`include/fm/common.hpp:27`) |
 | Benchmark vs declared targets | **pass** — but on the synthetic fixture, and on the wrong ISA (below) |
@@ -161,9 +161,9 @@ intersected with what this engine implements.
 
 | Bucket | Count | Meaning |
 | --- | --- | --- |
-| Adapter today | **60** | `freemoe adapters` is the authoritative list; `docs/MODEL_COVERAGE_STATUS.md` groups them by capability. This census row is from the original audit and its named subset (`llama qwen2 qwen3 gemma gemma2 gemma3 phi3 minicpm qwen3moe glm4 qwen2moe phi2 internlm2 orion exaone gptneox stablelm deepseek2`) is where the table started |
+| Adapter today | **64** | `freemoe adapters` is the authoritative list; `docs/MODEL_COVERAGE_STATUS.md` groups them by capability. This census row is from the original audit and its named subset (`llama qwen2 qwen3 gemma gemma2 gemma3 phi3 minicpm qwen3moe glm4 qwen2moe phi2 internlm2 orion exaone gptneox stablelm deepseek2`) is where the table started |
 | Not a causal text decoder | **24** | BERT/Nomic/Jina/EuroBERT/ModernBERT/NeoBERT encoders, `llama-embed`, `gemma-embedding*`, `t5`/`t5encoder`, `clip`, `pockettts`, `qwen3tts`, `wavtokenizer-dec`, `paddleocr`, `llada`, `llada-moe`, `rnd1`, `dream`, `dflash`, `vllm-decision2` — no-causal-mask attention and pooling, or diffusion/audio/vision |
-| **Needs only an adapter row** | **41** | Every primitive already exists: stacked-expert MoE, shared experts with/without a scalar gate, group-limited routing, per-head q/k norm, post-norms, sliding window, partial RoPE, fused q/k/v, LayerNorm, silu/gelu/relu/relu², MLA. `baichuan bloom chatglm starcoder2 olmoe phimoe dbrx arctic grok minimax-01 minimax-m2 qwen mistral4 command-r cohere2 …` (`gpt2`, `starcoder`, `falcon` and `mpt` moved to mapped in this change) |
+| **Needs only an adapter row** | **40** | Every primitive already exists: stacked-expert MoE, shared experts with/without a scalar gate, group-limited routing, per-head q/k norm, post-norms, sliding window, partial RoPE, fused q/k/v, LayerNorm, silu/gelu/relu/relu², MLA. `baichuan bloom chatglm starcoder2 phimoe dbrx arctic grok minimax-01 minimax-m2 qwen mistral4 cohere2 …` (`gpt2`, `starcoder`, `falcon`, `mpt`, `olmo2`, `olmoe`, `granite` and `granitemoe` moved to mapped, the last four in the batch that added the no-pre-norm block, the whole-vector q/k norm and the scaled residual/logit branches) |
 | Needs one more primitive | 71 | below |
 
 ### What one capability unlocks

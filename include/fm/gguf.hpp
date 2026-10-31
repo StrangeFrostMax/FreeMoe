@@ -311,6 +311,25 @@ struct ModelConfig {
     bool qk_norm_layernorm = false;
     // talkie normalises q and k *after* the rotation, not before.
     bool qk_norm_after_rope = false;
+    // The norm spans the whole projection rather than one head: olmoe writes a
+    // {hidden}-wide scale for q and for k and normalises the concatenated heads
+    // as one vector.
+    bool qk_norm_whole_vector = false;
+    // granite reads `*.attention.scale` (upstream `load_arch_hparams`) and uses
+    // it in place of 1/sqrt(head_dim) when it is non-zero. Only the granite
+    // family declares that key upstream; every other arch ignores it, so this is
+    // applied per architecture rather than per key.
+    double attention_scale = 0.0;
+    // No pre-norms at all: attention and the feed-forward read the residual
+    // stream directly and only the branch *outputs* are normalised (olmo2).
+    // This is not the same as a weightless norm, which still normalises.
+    bool no_branch_norms = false;
+    // Branch outputs are multiplied by `*.residual_scale` before the residual
+    // add. granite applies it; gemma records the same key and never applies it.
+    bool residual_scale_applied = false;
+    // granite divides the logits by `*.logit_scale` *after* the head, where
+    // command-r multiplies them; the two are opposite operations on the same key.
+    bool logit_scale_inverse = false;
     float qk_norm_eps = 1e-5f;
     // `*.logit_scale` is *recorded only* for granite (llama.cpp reads it and
     // never applies it) and *applied* for command-r, whose graph multiplies the

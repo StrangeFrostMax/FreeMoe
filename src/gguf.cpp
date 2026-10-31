@@ -885,6 +885,10 @@ bool is_llama_family(const std::string &arch) {
         "command-r",
         "olmo",
         "phimoe",
+        "olmo2",
+        "olmoe",
+        "granite",
+        "granitemoe",
         "cohere2",
         "deci",
         "hunyuan-dense",
@@ -1389,6 +1393,20 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
         if (opt_double(doc, keys("residual_scale"), &number)) cfg.residual_scale = number;
         if (opt_double(doc, keys("logit_scale"), &number)) cfg.logit_scale = number;
     }
+    // `*.residual_scale` is applied per architecture, not per key: granite
+    // multiplies each branch output by it before the residual add
+    // (`build_layer_ffn`), while minicpm/gemma read the same key and never use it
+    // in the graph. Applying it everywhere would move every logit of those files.
+    if ((arch == "granite" || arch == "granitemoe") &&
+        opt_double(doc, keys("residual_scale"), &number) && number != 0.0) {
+        cfg.residual_scale = number;
+        cfg.residual_scale_applied = true;
+    }
+    // `*.attention.scale`, when present, replaces 1/sqrt(head_dim) in the softmax
+    // (`models/granite.cpp`: `kq_scale = f_attention_scale == 0 ? 1/sqrt(hd) : ...`).
+    if ((arch == "granite" || arch == "granitemoe") &&
+        opt_double(doc, keys("attention.scale"), &number) && number > 0.0)
+        cfg.attention_scale = number;
 
     if (arch == "gemma2" || arch == "gemma3") {
         cfg.post_norms = true;
@@ -1450,6 +1468,14 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
         cfg.logit_scale = number;
         cfg.logit_scale_applied = true;
     }
+    // granite divides the logits by the same key after the head
+    // (`ggml_scale(ctx0, cur, 1.0f / hparams.f_logit_scale)`), which is the
+    // opposite operation, so the two cannot share one flag.
+    if ((arch == "granite" || arch == "granitemoe") &&
+        opt_double(doc, keys("logit_scale"), &number) && number != 0.0) {
+        cfg.logit_scale = number;
+        cfg.logit_scale_inverse = true;
+    }
     if (opt_double(doc, keys("attention.layer_norm_rms_epsilon"), &number)) cfg.rms_eps = number;
     else cfg.rms_eps = 1e-5;
 
@@ -1477,15 +1503,22 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
         const bool attn_nw = doc.tensor_by_name.count(layer_name(probe, "attn_norm.weight")) != 0;
         const bool out_nw = doc.tensor_by_name.count("output_norm.weight") != 0;
         const bool ffn_nw = doc.tensor_by_name.count(layer_name(probe, "ffn_norm.weight")) != 0;
+        // A file with post-norms and no pre-norms at all is olmo2's block: both
+        // branch inputs are the raw residual stream. A weightless block still
+        // normalises, so the two are told apart by the post-norm tensors.
+        const bool post_attn = doc.tensor_by_name.count(layer_name(probe, "attn_post_norm.weight")) != 0;
+        const bool post_ffn = doc.tensor_by_name.count(layer_name(probe, "ffn_post_norm.weight")) != 0;
+        cfg.no_branch_norms = !attn_nw && post_attn && post_ffn;
         // A weightless block scales nothing, so a file that carries the scale on
         // the feed-forward norm alone is inconsistent and refused. (A *present*
         // scale on the entry norm says nothing about the FFN: phi2 shares it and
         // gpt-oss calls the second one attn_post_norm, so both are checked
-        // further down by their own rules.)
-        if (attn_nw != out_nw || (!attn_nw && ffn_nw))
+        // further down by their own rules. A block with no pre-norms has no entry
+        // norm to compare against at all.)
+        if (!cfg.no_branch_norms && (attn_nw != out_nw || (!attn_nw && ffn_nw)))
             fail(ErrorCode::MISSING_REQUIRED_TENSOR,
                  "norm scales must be present on every norm, or on none");
-        cfg.weightless_norm = !attn_nw;
+        cfg.weightless_norm = !attn_nw && !cfg.no_branch_norms;
     }
     {
         const bool attn_nb = doc.tensor_by_name.count(layer_name(probe, "attn_norm.bias")) != 0;
@@ -1543,7 +1576,8 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
         // ffn_norm there is not phi2's shared residual.
         // A weightless block scales no norm, so its missing ffn_norm tensor is not
         // phi2's shared residual.
-        if (!cfg.weightless_norm && !ffn_present && !attn_post_present && has_attn) {
+        if (!cfg.weightless_norm && !cfg.no_branch_norms && !ffn_present && !attn_post_present &&
+            has_attn) {
             if (!cfg.weightless_norm &&
                 doc.tensor_by_name.count(layer_name(probe, "attn_norm.weight")) == 0)
                 fail(ErrorCode::MISSING_REQUIRED_TENSOR,
@@ -1768,6 +1802,44 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
              "unsupported activation " + cfg.activation + " for architecture " + arch);
     if (opt_double(doc, keys("hyper_connection.count"), &number))
         cfg.hyper_connection_count = number;
+    // Structures that change the forward pass without changing the tensor set are
+    // refused here, before any arithmetic, because no missing tensor would catch
+    // them:
+    //   * hyper-connections widen the residual stream to hc_mult * n_embd and
+    //     apply an affine map per layer (models/deepseek4.cpp);
+    //   * the DSA indexer chooses which positions attention reads, so a file that
+    //     carries its keys expects attention to see a subset of the context.
+    // `hc_mult == 1` is the ordinary residual stream and is accepted.
+    if (cfg.hyper_connection_count > 1.0)
+        fail(ErrorCode::NOT_IMPLEMENTED,
+             "hyper-connections (hyper_connection.count = " +
+                 std::to_string(static_cast<int>(cfg.hyper_connection_count)) +
+                 ") are a block this build does not have: they change the residual stream, "
+                 "not one projection");
+    // granite's vision variant injects a projector stream into selected layers
+    // (`deepstack_mapping`). A non-negative entry means the graph consumes a
+    // second stream this build does not have; an absent or empty array is the
+    // text-only file and is accepted.
+    {
+        auto it = doc.metadata.find(arch + ".deepstack_mapping");
+        if (it != doc.metadata.end() && it->second.is_array()) {
+            for (const MetadataValue &entry : it->second.array) {
+                if (entry.as_i64() >= 0)
+                    fail(ErrorCode::NOT_IMPLEMENTED,
+                         "granite deepstack_mapping selects layers that read a projector stream "
+                         "from the vision tower: a block this build does not have");
+            }
+        }
+    }
+    for (const char *indexer_key : {"attention.indexer.head_count",
+                                    "attention.indexer.key_length",
+                                    "attention.indexer.top_k"}) {
+        if (doc.metadata.find(arch + "." + indexer_key) != doc.metadata.end())
+            fail(ErrorCode::NOT_IMPLEMENTED,
+                 "the DSA indexer (" + arch + "." + indexer_key +
+                     ") is a block this build does not have; attention would read every "
+                     "position instead of the indexed subset");
+    }
     if (opt_double(doc, keys("rope.freq_base"), &number)) cfg.rope_theta = number;
     else if (opt_double(doc, keys("rope_theta"), &number)) cfg.rope_theta = number;
     else cfg.rope_theta = 10000.0;
@@ -1946,6 +2018,11 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
             // single shared vector of head_dim entries is qwen3's layout.
             const TensorInfo *qn = m.tensor(layer_name(probe, "attn_q_norm.weight"));
             cfg.qk_norm_matrix = qn != nullptr && qn->dims.size() == 2;
+            // A one-dimensional scale as wide as the whole q projection is
+            // olmoe's whole-vector norm; one head's worth is qwen3's per-head
+            // norm. The width is the evidence, so neither is chosen by name.
+            cfg.qk_norm_whole_vector =
+                qn != nullptr && qn->dims.size() == 1 && qn->dims[0] == cfg.heads * cfg.head_dim;
         }
 
     // The q/k norm's *mode* is not representable in GGUF metadata: a file says
@@ -2032,7 +2109,8 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
     for (uint32_t l = 0; l < cfg.layers; ++l) {
         // Every layer opens with the block's entry norm, whatever kind of mixer
         // follows it, so this is claimed before the two mixer branches split.
-        if (!cfg.weightless_norm) expect(layer_name(l, "attn_norm.weight"));
+        if (!cfg.weightless_norm && !cfg.no_branch_norms)
+            expect(layer_name(l, "attn_norm.weight"));
         if (cfg.norm_bias) expect(layer_name(l, "attn_norm.bias"));
         // falcon-40b's second pre-attention norm, when the file carries one.
         if (cfg.attn_norm_2) {
@@ -2110,7 +2188,8 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
         if (!cfg.layer_has_ffn(l)) continue;
         if (!cfg.parallel_residual && cfg.ffn_norm_is_post)
             expect(layer_name(l, "attn_post_norm.weight"));
-        else if (!cfg.parallel_residual && !cfg.weightless_norm) expect(layer_name(l, "ffn_norm.weight"));
+        else if (!cfg.parallel_residual && !cfg.weightless_norm && !cfg.no_branch_norms)
+            expect(layer_name(l, "ffn_norm.weight"));
         if (cfg.norm_bias && !cfg.parallel_residual) expect(layer_name(l, "ffn_norm.bias"));
         if (cfg.ffn_bias) {
             expect(layer_name(l, "ffn_up.bias"));
@@ -2221,7 +2300,7 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
     if (cfg.norm_bias) expect_dims(*m.tensor("output_norm.bias"), {cfg.hidden});
     if (cfg.logit_bias) expect_dims(*m.tensor("output.bias"), {cfg.vocab});
     for (uint32_t l = 0; l < cfg.layers; ++l) {
-        if (!cfg.weightless_norm)
+        if (!cfg.weightless_norm && !cfg.no_branch_norms)
             expect_dims(*m.tensor(layer_name(l, "attn_norm.weight")), {cfg.hidden});
         if (cfg.layer_is_recurrent(l)) {
             // The shapes the state layout and both scans are derived from. Each
@@ -2319,6 +2398,8 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
             auto expect_qk = [&](const char *suffix, uint32_t heads) {
                 const TensorInfo &t = *m.tensor(layer_name(l, suffix));
                 if (cfg.qk_norm_matrix) expect_dims(t, {cfg.head_dim, heads});
+                else if (cfg.qk_norm_whole_vector)
+                    expect_dims(t, {static_cast<uint64_t>(heads) * cfg.head_dim});
                 else expect_dims(t, {cfg.head_dim});
             };
             expect_qk("attn_q_norm.weight", cfg.heads);
@@ -2348,7 +2429,7 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
         // on the layers that carry one (all of them, except in a pure mamba file).
         if (cfg.norm_bias) expect_dims(*m.tensor(layer_name(l, "attn_norm.bias")), {cfg.hidden});
         if (!cfg.layer_has_ffn(l)) continue;
-        if (!cfg.parallel_residual && !cfg.weightless_norm)
+        if (!cfg.parallel_residual && !cfg.weightless_norm && !cfg.no_branch_norms)
             expect_dims(*m.tensor(layer_name(l, cfg.ffn_norm_is_post ? "attn_post_norm.weight"
                                                                    : "ffn_norm.weight")),
                         {cfg.hidden});
