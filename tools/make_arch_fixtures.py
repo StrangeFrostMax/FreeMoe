@@ -593,6 +593,8 @@ def arch_metadata(spec: dict[str, Any]) -> dict[str, tuple[Any, ...]]:
         # demanding one entry per trunk layer.
         md[f"{arch}.attention.head_count_kv"] = (
             "array_i32", [spec["kv_heads"]] * blocks)
+    for name, entry in (spec.get("arch_metadata") or {}).items():
+        md[f"{arch}.{name}"] = entry
     md.update(md_extra)
     return md
 
@@ -868,6 +870,60 @@ SPECS: list[dict[str, Any]] = [
         "experts": 4,
         "expert_top_k": 2,
         "shared_expert": True,
+    },
+    {
+        # bailingmoe (llama.cpp src/models/bailingmoe.cpp): the llama block with
+        # routed experts, a softmax router whose weights may be renormalised and
+        # rescaled, and a shared expert that is *added* rather than gated -- there
+        # is no `ffn_gate_inp_shexp` tensor at all, which is the one thing that
+        # separates it from qwen2moe's shared expert. The three feed-forward
+        # widths differ (64 dense, 40 per expert, 24 shared) so a runtime that
+        # reuses one for another cannot match the golden, and the router knobs are
+        # in the file rather than assumed.
+        "slug": "bailingmoe",
+        "arch": "bailingmoe",
+        "name": "FreeMoe synthetic bailingmoe with an ungated shared expert",
+        "kv_heads": 2,
+        "experts": 4,
+        "expert_used": 2,
+        "expert_width": 40,
+        "shared_expert": True,
+        "shared_gate": False,
+        "shared_width": 24,
+        "arch_metadata": {
+            "expert_weights_norm": ("bool", True),
+            "expert_weights_scale": ("f32", 1.5),
+        },
+    },
+    {
+        # bailingmoe2 (llama.cpp src/models/bailingmoe2.cpp): the same feed-forward
+        # with four attention differences at once -- one fused q/k/v projection,
+        # a per-head RMSNorm on q and k *before* the rotary, one dense leading
+        # block, and an optional selection bias on the router (`ffn_exp_probs_b`,
+        # added to the logits before the gating function, which is sigmoid here).
+        # A head block rides along so the MTP rule is exercised on a family whose
+        # block is not qwen3moe's.
+        "slug": "bailingmoe2",
+        "arch": "bailingmoe2",
+        "name": "FreeMoe synthetic bailingmoe2: fused qkv, q/k norm, dense lead, MTP",
+        "kv_heads": 2,
+        "fused_qkv": True,
+        "qk_norm": True,
+        "dense_lead": 1,
+        "gating": 2,
+        "experts": 4,
+        "expert_used": 2,
+        "expert_width": 40,
+        "expert_bias": True,
+        "shared_expert": True,
+        "shared_gate": False,
+        "shared_width": 24,
+        "mtp_layers": 1,
+        "mtp_tensors": True,
+        "arch_metadata": {
+            "expert_weights_norm": ("bool", True),
+            "expert_weights_scale": ("f32", 1.5),
+        },
     },
     {
         # baichuan 13B (llama.cpp src/models/baichuan.cpp): the block is chosen by

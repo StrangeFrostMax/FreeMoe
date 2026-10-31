@@ -943,6 +943,12 @@ bool is_llama_family(const std::string &arch) {
         "chatglm",
         "olmo2",
         "olmoe",
+        // bailingmoe/bailingmoe2: the llama block with a softmax router, a shared
+        // expert that is added rather than gated, and (v2) a fused qkv with a
+        // per-head q/k norm, dense leading blocks and an optional selection bias.
+        // Every one of those is a flag the adapter already reads, so no code path
+        // is added for them.
+        "bailingmoe", "bailingmoe2",
         "granite",
         "granitemoe",
         "cohere2",

@@ -432,6 +432,12 @@ activation, norm biases and FFN biases, and their fixtures pin the logits.
 6. ~~Architecture variants: `gemma`, `phi3`, `qwen2`, `qwen3`, `glm4`,
    `minicpm`, `qwen3moe`, `qwen2moe`, `phi2`.~~ **DONE**
    ~~MLA (`deepseek2`)~~ **DONE** — see the section above.
+   ~~`bailingmoe` / `bailingmoe2`~~ **DONE** — the softmax router's weight
+   renormalisation and scale are metadata, the shared expert is *added* rather
+   than gated (there is no gate tensor to read), and v2's fused qkv, per-head q/k
+   norm before the rope, dense leading blocks and router selection bias were all
+   flags this build already read. Two fixtures, two oracle goldens, three
+   mutations (below).
    Still open: `glm4-moe`, `minicpm3`, `olmo2` (its q/k norm is *not* per head,
    so it needs a second norm placement), `olmoe`/`mixtral` (MoE variants of the
    same block), and the rest of llama.cpp's `src/models/` tree.
@@ -449,6 +455,11 @@ activation, norm biases and FFN biases, and their fixtures pin the logits.
 8. **Multimodal** (#8) is out of scope for this engine: the text decoder can be
    supported, the vision tower cannot, and pretending otherwise would be the
    exact kind of fake capability this project refuses.
+
+The census in `docs/GAP_ANALYSIS.md` §C11 is the durable version of this list:
+171 families at the pinned upstream commit, each mapped, blocked by a named
+capability, or queued for a graph read in a stated order. This page stays the
+narrative; that one is generated and gated.
 
 ## Acceptance rule
 

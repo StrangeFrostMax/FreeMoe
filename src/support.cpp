@@ -143,6 +143,10 @@ const std::map<std::string, ArchFacts> &known_architectures() {
         {"qwen", {true, false}},
         {"starcoder2", {true, false}},
         {"xverse", {true, false}},
+        // bailingmoe: softmax routing, an ungated shared expert, and (v2) a fused
+        // qkv, a per-head q/k norm and dense leading blocks.
+        {"bailingmoe", {true, false}},
+        {"bailingmoe2", {true, false}},
         {"glm4moe", {false, true}},
         {"multimodal", {false, true}},
     };
