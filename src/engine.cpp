@@ -1347,8 +1347,17 @@ std::vector<float> Engine::forward_token(int32_t token, uint64_t position,
 
         // Only attention layers own a slot in the per-position cache, so a hybrid
         // indexes it by the layer's position among them.
-        const size_t cache_slot = static_cast<size_t>(c.attention_slot(layer));
-        size_t current_base = (cache_slot * c.context + position) * kv_stride;
+        // A windowed layer keeps a ring of `sliding_window` positions instead of
+        // the whole context, so the address is the position modulo the capacity
+        // -- the same number the budget reserves. The live set at any token is
+        // [first_visible, position], which is at most one window wide, so no two
+        // live positions can collide.
+        auto cache_index = [&](uint32_t l, uint64_t pos) -> size_t {
+            return static_cast<size_t>(c.cache_index(l, pos, c.context) * sizeof(float) / sizeof(float));
+        };
+        (void)cache_index;
+        const size_t current_base =
+            static_cast<size_t>(c.cache_index(layer, position, c.context));
         std::memcpy(kv_ + current_base, k.data(), static_cast<size_t>(kv_dim) * sizeof(float));
         std::memcpy(kv_ + current_base + kv_dim, v.data(), static_cast<size_t>(v_dim) * sizeof(float));
 
@@ -1369,7 +1378,7 @@ std::vector<float> Engine::forward_token(int32_t token, uint64_t position,
                     : position + 1 - c.sliding_window;
             std::vector<double> scores(position + 1);
             for (uint64_t t = first_visible; t <= position; ++t) {
-                size_t base = (cache_slot * c.context + t) * kv_stride;
+                const size_t base = static_cast<size_t>(c.cache_index(layer, t, c.context));
                 const float *kt = kv_ + base + kvb;
                 double dot = 0.0;
                 for (uint32_t j = 0; j < c.head_dim; ++j)
@@ -1406,7 +1415,7 @@ std::vector<float> Engine::forward_token(int32_t token, uint64_t position,
             std::vector<double> acc(c.head_v_dim(), 0.0);
             const size_t vb = static_cast<size_t>(head / group) * c.head_v_dim();
             for (uint64_t t = first_visible; t <= position; ++t) {
-                size_t base = (cache_slot * c.context + t) * kv_stride;
+                const size_t base = static_cast<size_t>(c.cache_index(layer, t, c.context));
                 const float *vt = kv_ + base + kv_dim + vb;
                 double p = probs[t - first_visible];
                 for (uint32_t j = 0; j < c.head_v_dim(); ++j) acc[j] += p * vt[j];
@@ -1706,31 +1715,27 @@ std::vector<float> Engine::forward_token(int32_t token, uint64_t position,
                 uint32_t expert = ids[i];
                 // Expert payloads keep their stored block type; each projection
                 // is a contiguous slice inside the expert record.
-                // Fused checkpoints store gate and up in one tensor; the record's
-                // two extents already point at its halves, so only the type ids
-                // come from the tensor info and one named tensor serves both.
-                const TensorInfo *gate_info = manifest_.tensor(prefix + "ffn_gate_exps.weight");
-                const TensorInfo *up_info = manifest_.tensor(prefix + "ffn_up_exps.weight");
-                if (!gate_info && !up_info) {
-                    gate_info = manifest_.tensor(prefix + "ffn_gate_up_exps.weight");
-                    up_info = gate_info;
-                }
-                const TensorInfo *down_info = manifest_.tensor(prefix + "ffn_down_exps.weight");
-                if (!gate_info || !up_info || !down_info)
-                    fail(ErrorCode::MISSING_REQUIRED_TENSOR, "expert tensors are missing");
-                // Per-projection strides differ when the projections use
-                // different quantisation types, so the offsets come from the
-                // manifest's extents rather than from one shared stride.
+                // The manifest's record is the only description of an expert's
+                // bytes: it carries one extent per projection with the projection's
+                // own offset, length and stored type. That is what lets a stacked
+                // file (one tensor, an expert axis, possibly mixed quantisation)
+                // and a per-expert file (one tensor per projection) be read by the
+                // same code — and why no tensor name is looked up here.
                 const ExpertRecord *record = manifest_.expert(layer, expert);
-                const uint64_t gate_bytes =
-                    record ? record->extents[0].bytes : gate_info->byte_size / c.expert_count;
-                const uint64_t up_bytes =
-                    record ? record->extents[1].bytes : up_info->byte_size / c.expert_count;
+                if (!record)
+                    fail(ErrorCode::MISSING_REQUIRED_TENSOR,
+                         "no expert record for layer " + std::to_string(layer) + " expert " +
+                             std::to_string(expert));
+                const uint64_t gate_bytes = record->extents[0].bytes;
+                const uint64_t up_bytes = record->extents[1].bytes;
+                const uint32_t gate_type = record->extents[0].type_id;
+                const uint32_t up_type = record->extents[1].type_id;
+                const uint32_t down_type = record->extents[2].type_id;
                 residency_->with_expert(layer, expert, position, [&](const float *expert_data) {
                     const uint8_t *base = reinterpret_cast<const uint8_t *>(expert_data);
-                    TensorView gate_view{base, gate_info->type_id};
-                    TensorView up_view{base + gate_bytes, up_info->type_id};
-                    TensorView down_view{base + gate_bytes + up_bytes, down_info->type_id};
+                    TensorView gate_view{base, gate_type};
+                    TensorView up_view{base + gate_bytes, up_type};
+                    TensorView down_view{base + gate_bytes + up_bytes, down_type};
                     std::vector<float> gate = matvec_view(
                         gate_view, h, ewidth, c.hidden,
                         "expert_gate.L" + std::to_string(layer) + ".E" + std::to_string(expert));
@@ -2116,12 +2121,33 @@ std::vector<float> Engine::prefill_batch(const std::vector<int32_t> &tokens,
         }
         const uint64_t position0 = start_position;
         // Rotary, then the per-position temperature, then the cache write: the
-        // same order `forward_token` uses, and the cache is complete before any
-        // attention is read so a token sees its own key.
+        // same order `forward_token` uses.
         const bool rotate = !c.rope_disabled &&
                             (c.no_rope_layer_step == 0 ||
                              (layer + 1) % c.no_rope_layer_step != 0);
-        const size_t cache_slot = static_cast<size_t>(c.attention_slot(layer));
+        std::vector<double> alibi_slopes;
+        if (c.alibi_max_bias > 0.0 && c.heads > 0) {
+            uint32_t n_head_log2 = 1;
+            while (n_head_log2 * 2 <= c.heads) n_head_log2 *= 2;
+            const double m0 = std::pow(2.0, -(c.alibi_max_bias) / n_head_log2);
+            const double m1 = std::pow(2.0, -(c.alibi_max_bias / 2.0) / n_head_log2);
+            alibi_slopes.resize(c.heads);
+            for (uint32_t hh = 0; hh < c.heads; ++hh)
+                alibi_slopes[hh] =
+                    hh < n_head_log2
+                        ? std::pow(m0, static_cast<double>(hh) + 1.0)
+                        : std::pow(m1, 2.0 * static_cast<double>(hh - n_head_log2) + 1.0);
+        }
+        std::vector<float> attention(static_cast<size_t>(batch) * attn_out_dim, 0.0f);
+        const bool windowed = c.layer_uses_window(layer);
+        double scale = c.attention_scale > 0.0
+                           ? c.attention_scale
+                           : 1.0 / std::sqrt(static_cast<double>(c.head_dim));
+        // Each token's key and value is written and then attended to before the
+        // next token is written. A windowed layer keeps a ring of only
+        // `sliding_window` positions, so writing the whole batch up front would
+        // evict history that the batch's earlier tokens still have to read; this
+        // order makes the ring safe for any batch length.
         for (uint32_t t = 0; t < batch; ++t) {
             std::vector<float> q(qflat.begin() + static_cast<size_t>(t) * attn_out_dim,
                                  qflat.begin() + static_cast<size_t>(t + 1) * attn_out_dim);
@@ -2140,49 +2166,27 @@ std::vector<float> Engine::prefill_batch(const std::vector<int32_t> &tokens,
                         q.size() * sizeof(float));
             std::memcpy(kflat.data() + static_cast<size_t>(t) * kv_dim, k.data(),
                         k.size() * sizeof(float));
-            const size_t base =
-                (cache_slot * c.context + position) * kv_stride;
+            const size_t base = static_cast<size_t>(c.cache_index(layer, position, c.context));
             std::memcpy(kv_ + base, k.data(), static_cast<size_t>(kv_dim) * sizeof(float));
             std::memcpy(kv_ + base + kv_dim,
                         vflat.data() + static_cast<size_t>(t) * kv_dim,
                         static_cast<size_t>(v_dim) * sizeof(float));
-        }
-        // Attention per token, against the cache that now holds the whole batch.
-        std::vector<float> attention(static_cast<size_t>(batch) * attn_out_dim, 0.0f);
-        std::vector<double> alibi_slopes;
-        if (c.alibi_max_bias > 0.0 && c.heads > 0) {
-            uint32_t n_head_log2 = 1;
-            while (n_head_log2 * 2 <= c.heads) n_head_log2 *= 2;
-            const double m0 = std::pow(2.0, -(c.alibi_max_bias) / n_head_log2);
-            const double m1 = std::pow(2.0, -(c.alibi_max_bias / 2.0) / n_head_log2);
-            alibi_slopes.resize(c.heads);
-            for (uint32_t hh = 0; hh < c.heads; ++hh)
-                alibi_slopes[hh] =
-                    hh < n_head_log2
-                        ? std::pow(m0, static_cast<double>(hh) + 1.0)
-                        : std::pow(m1, 2.0 * static_cast<double>(hh - n_head_log2) + 1.0);
-        }
-        for (uint32_t t = 0; t < batch; ++t) {
-            const uint64_t position = position0 + t;
-            const float *q = qflat.data() + static_cast<size_t>(t) * attn_out_dim;
-            const bool windowed = c.layer_uses_window(layer);
+            // --- attention for this token ------------------------------------
             const uint64_t first_visible =
                 !windowed || position < c.sliding_window ? 0 : position + 1 - c.sliding_window;
+            const float *qp = q.data();
             std::vector<float> attn_row(attn_out_dim, 0.0f);
-            double scale = c.attention_scale > 0.0
-                           ? c.attention_scale
-                           : 1.0 / std::sqrt(static_cast<double>(c.head_dim));
             for (uint32_t head = 0; head < c.heads; ++head) {
                 const size_t hb = static_cast<size_t>(head) * c.head_dim;
                 const size_t kvb = static_cast<size_t>(head / group) * c.head_dim;
                 std::vector<float> score_floats;
                 score_floats.reserve(position + 1 - first_visible);
                 for (uint64_t tt = first_visible; tt <= position; ++tt) {
-                    const size_t sbase = (cache_slot * c.context + tt) * kv_stride;
+                    const size_t sbase = static_cast<size_t>(c.cache_index(layer, tt, c.context));
                     const float *kt = kv_ + sbase + kvb;
                     double dot = 0.0;
                     for (uint32_t j = 0; j < c.head_dim; ++j)
-                        dot += static_cast<double>(q[hb + j]) * kt[j];
+                        dot += static_cast<double>(qp[hb + j]) * kt[j];
                     double value = dot * scale;
                     if (c.attn_logit_softcap > 0.0)
                         value = c.attn_logit_softcap * std::tanh(value / c.attn_logit_softcap);
@@ -2198,7 +2202,7 @@ std::vector<float> Engine::prefill_batch(const std::vector<int32_t> &tokens,
                 std::vector<double> acc(c.head_v_dim(), 0.0);
                 const size_t vb = static_cast<size_t>(head / group) * c.head_v_dim();
                 for (uint64_t tt = first_visible; tt <= position; ++tt) {
-                    const size_t sbase = (cache_slot * c.context + tt) * kv_stride;
+                    const size_t sbase = static_cast<size_t>(c.cache_index(layer, tt, c.context));
                     const float *vt = kv_ + sbase + kv_dim + vb;
                     const double p = probs[tt - first_visible];
                     for (uint32_t j = 0; j < c.head_v_dim(); ++j) acc[j] += p * vt[j];

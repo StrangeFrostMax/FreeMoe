@@ -54,14 +54,22 @@ IDs are hard errors, not guesses.
 ## Expert records
 
 For `freemoe-tiny-v1` MoE, gate/up/down expert weights are stacked F32 tensors.
-Each expert record is the concatenation of three independently validated byte
-ranges:
+Standard-adapter files may store the same numbers either way: stacked
+(`blk.N.ffn_gate_exps.weight`, shape `[hidden, width, experts]`) or one tensor per
+expert (`blk.N.ffn_gate.E.weight`, shape `[hidden, width]`). The layout is a
+storage fact, so it is decided per layer from the names and anything mixed or
+incomplete is refused. Each expert record is the concatenation of three
+independently validated byte ranges, whatever the layout:
 
 ```text
 gate[expert] || up[expert] || down[expert]
 ```
 
-The per-expert stride is computed from `ne[0] * ne[1] * bytes_per_element`;
+For a stacked tensor the per-expert stride is computed from
+`ne[0] * ne[1] * bytes_per_element`; a per-expert tensor's extent is the whole
+tensor, so no stride arithmetic runs at all. Each extent carries its own stored
+type, which is what lets one record describe a quantised stacked slice and a
+whole F32 matrix without a tensor-name lookup at read time.
 naive `expert_index * logical_float_bytes` is not used for quantised types.
 Each record's FNV-1a 64-bit checksum is stored in the GGUF metadata key
 `freemoe.expert_checksums`. The runtime validates the freshly read record and

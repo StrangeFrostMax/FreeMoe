@@ -239,6 +239,26 @@ std::string read_string(const GGUFDocument &doc, const std::string &key) {
 
 } // namespace
 
+// `blk.L.ffn_gate.E.weight`: one tensor per routed expert. The probe cannot use
+// the adapter's records (it runs before the manifest exists), so it settles the
+// layout from the names, the same evidence the loader uses.
+bool has_per_expert_tensors(const GGUFDocument &doc) {
+    const std::string marker = ".ffn_gate.";
+    for (const auto &tensor : doc.tensors) {
+        const size_t pos = tensor.name.find(marker);
+        if (pos == std::string::npos) continue;
+        const std::string tail = tensor.name.substr(pos + marker.size());
+        const std::string suffix = ".weight";
+        if (tail.size() <= suffix.size()) continue;
+        if (tail.compare(tail.size() - suffix.size(), suffix.size(), suffix) != 0) continue;
+        bool digits = true;
+        for (size_t i = 0; i + suffix.size() < tail.size(); ++i)
+            if (tail[i] < '0' || tail[i] > '9') digits = false;
+        if (digits) return true;
+    }
+    return false;
+}
+
 Json probe_model(const GGUFDocument &doc, const std::string &source_path) {
     Json out = Json::object();
     out.set("schema", "freemoe.model-probe.v1");
@@ -682,7 +702,14 @@ Json probe_model(const GGUFDocument &doc, const std::string &source_path) {
             tags.push(Json::string("qk_norm=per-head"));
         if (has_attn_sub_norm && has_ffn_sub_norm) tags.push(Json::string("subln=yes"));
         if (has_projection_scale) tags.push(Json::string("proj_scale=yes"));
-        if (doc.tensor_by_name.count("blk.0.ffn_gate_exps.weight") != 0) tags.push(Json::string("moe=stacked"));
+        if (doc.tensor_by_name.count("blk.0.ffn_gate_exps.weight") != 0) {
+            tags.push(Json::string("moe=stacked"));
+        } else if (has_per_expert_tensors(doc)) {
+            // The layout is a storage fact the probe can settle before any
+            // adapter runs: the expert index is in the name instead of in an
+            // axis, which is the only difference a reader has to know about.
+            tags.push(Json::string("moe=per-expert"));
+        }
         adapter.set("tags", std::move(tags));
         out.set("adapter", std::move(adapter));
     }

@@ -395,6 +395,45 @@ bool parse_layer_suffix(const std::string &name, const std::string &suffix, uint
     return true;
 }
 
+// `blk.{L}.{stem}.{E}.weight`: one tensor per routed expert. `parse_layer_suffix`
+// cannot express it, because the expert index sits between the stem and the
+// suffix. Recognising the name is what makes a per-expert file readable at all;
+// whether it is legal is decided by the layer's declared layout, not here.
+bool parse_expert_member(const std::string &name, const std::string &stem,
+                         uint32_t &layer, uint32_t &expert) {
+    const std::string prefix = "blk.";
+    if (name.rfind(prefix, 0) != 0) return false;
+    size_t dot = name.find('.', prefix.size());
+    if (dot == std::string::npos) return false;
+    const std::string layer_digits = name.substr(prefix.size(), dot - prefix.size());
+    if (layer_digits.empty() || layer_digits.size() > 9) return false;
+    for (char ch : layer_digits) if (ch < '0' || ch > '9') return false;
+    // `stem.E.weight` has to be the whole remainder.
+    const std::string rest = name.substr(dot + 1);
+    if (rest.rfind(stem + ".", 0) != 0) return false;
+    const std::string tail = rest.substr(stem.size() + 1);
+    const std::string suffix = ".weight";
+    if (tail.size() <= suffix.size()) return false;
+    if (tail.compare(tail.size() - suffix.size(), suffix.size(), suffix) != 0) return false;
+    const std::string expert_digits = tail.substr(0, tail.size() - suffix.size());
+    if (expert_digits.empty() || expert_digits.size() > 9) return false;
+    for (char ch : expert_digits) if (ch < '0' || ch > '9') return false;
+    layer = static_cast<uint32_t>(std::stoul(layer_digits));
+    expert = static_cast<uint32_t>(std::stoul(expert_digits));
+    return true;
+}
+
+// The three projections a routed expert has, and the role each maps to.
+const std::array<const char *, 3> &expert_projection_stems() {
+    static const std::array<const char *, 3> stems = {"ffn_gate", "ffn_up", "ffn_down"};
+    return stems;
+}
+const std::array<TensorRole, 3> &expert_projection_roles() {
+    static const std::array<TensorRole, 3> roles = {
+        TensorRole::FFN_GATE_EXPS, TensorRole::FFN_UP_EXPS, TensorRole::FFN_DOWN_EXPS};
+    return roles;
+}
+
 // A tensor the file may legally carry that the main forward pass does not use.
 // Returning a reason (rather than true/false) is deliberate: the probe prints
 // it, so "supported" never quietly means "part of this was skipped".
@@ -1089,14 +1128,42 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
     // layer. The tensors are the evidence in every case.
     cfg.ffn_layers.assign(cfg.layers, 0);
     cfg.moe_layers.assign(cfg.layers, 0);
+    // Expert tensor layout, per layer: a stacked file keeps one tensor per
+    // (layer, projection); a per-expert file keeps one per (layer, expert,
+    // projection) and no stacked tensor at all. Both are storage layouts for the
+    // same numbers, so the only thing that must not happen is a layer silently
+    // carrying both.
+    cfg.per_expert_layers.assign(cfg.layers, 0);
     for (uint32_t l = 0; l < cfg.layers; ++l) {
         const bool dense_ffn = doc.tensor_by_name.count(layer_name(l, "ffn_up.weight")) != 0 ||
                                doc.tensor_by_name.count(layer_name(l, "ffn_gate_up.weight")) != 0;
-        const bool routed =
+        const bool stacked =
             doc.tensor_by_name.count(layer_name(l, "ffn_up_exps.weight")) != 0 ||
             doc.tensor_by_name.count(layer_name(l, "ffn_gate_exps.weight")) != 0 ||
             doc.tensor_by_name.count(layer_name(l, "ffn_gate_up_exps.weight")) != 0 ||
             doc.tensor_by_name.count(layer_name(l, "ffn_down_exps.weight")) != 0;
+        // Per-expert presence is evidence in the same way: the tensor names carry
+        // the expert index, so one member of each projection is enough to
+        // classify the layer. Completeness is checked later with the expert
+        // count, because that is where the count is known.
+        bool per_expert = false;
+        uint32_t members = 0;
+        for (const char *stem : expert_projection_stems())
+            if (doc.tensor_by_name.count(layer_name(l, std::string(stem) + ".0.weight")) != 0) {
+                ++members;
+                per_expert = true;
+            }
+        if (per_expert && members != 3)
+            fail(ErrorCode::MISSING_REQUIRED_TENSOR,
+                 "blk." + std::to_string(l) +
+                     " carries only some per-expert projections; gate, up and down are all required");
+        if (per_expert && stacked)
+            fail(ErrorCode::METADATA_MISMATCH,
+                 "blk." + std::to_string(l) +
+                     " carries both stacked and per-expert routed experts; the layout is ambiguous");
+        cfg.per_expert_layers[l] = per_expert ? 1 : 0;
+        if (per_expert) cfg.expert_layout = "per-expert-f32";
+        const bool routed = stacked || per_expert;
         // The router has two spellings in the adapter's own table: llama.cpp's
         // `ffn_gate_inp` and the reference adapter's `ffn_router`, which the
         // loader renames to the same role. Both mean the same thing here.
@@ -2056,6 +2123,12 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
         cfg.vocab > (1u << 20) || cfg.context > (1u << 20) || cfg.expert_count > 4096 ||
         (cfg.expert_count && cfg.expert_top_k > cfg.expert_count))
         fail(ErrorCode::SHAPE_MISMATCH, "model dimension exceeds adapter safety bounds");
+    // A zero context is not a small model, it is a broken file: the cache address
+    // is a modulus of the per-layer capacity, so a zero would divide by it. Fail
+    // closed with the key named rather than relying on the file being sane.
+    if (cfg.context == 0)
+        fail(ErrorCode::SHAPE_MISMATCH,
+             "context length must be positive (" + arch + ".context_length is 0)");
 
     // glm4 keeps the FFN gate and up halves in a single tensor. Detected from
     // the shapes rather than the architecture name, because the same adapter
@@ -2210,7 +2283,14 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
             for (const char *suffix : {"ffn_norm_ada_down.weight", "ffn_norm_ada_up.weight"})
                 expect(layer_name(l, suffix));
         if (cfg.layer_is_moe(l)) {
-            if (cfg.fused_gate_up_exps) {
+            if (cfg.layer_is_per_expert(l)) {
+                // One tensor per (expert, projection). `ffn_gate_inp` is still the
+                // router, because routing is per token rather than per expert.
+                expect(layer_name(l, "ffn_gate_inp.weight"));
+                for (const char *stem : expert_projection_stems())
+                    for (uint32_t e = 0; e < cfg.expert_count; ++e)
+                        expect(layer_name(l, std::string(stem) + "." + std::to_string(e) + ".weight"));
+            } else if (cfg.fused_gate_up_exps) {
                 for (const char *suffix : {"ffn_gate_inp.weight", "ffn_gate_up_exps.weight",
                                            "ffn_down_exps.weight"})
                     expect(layer_name(l, suffix));
@@ -2269,6 +2349,28 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
         TensorRole role = role_from_name(tensor.name, layer);
         if (role == TensorRole::UNKNOWN && parse_layer_suffix(tensor.name, "ffn_gate_inp.weight", layer))
             role = TensorRole::FFN_ROUTER;
+        if (role == TensorRole::UNKNOWN) {
+            // `blk.L.ffn_gate.E.weight`: a per-expert projection. The role is the
+            // same one a stacked slice has, so the reader does not branch on the
+            // layout, only the manifest does.
+            for (int r = 0; r < 3 && role == TensorRole::UNKNOWN; ++r) {
+                uint32_t member_layer = 0;
+                uint32_t member_expert = 0;
+                if (!parse_expert_member(tensor.name, expert_projection_stems()[r], member_layer,
+                                         member_expert))
+                    continue;
+                if (!cfg.layer_is_per_expert(member_layer))
+                    fail(ErrorCode::UNKNOWN_TENSOR,
+                         "tensor " + tensor.name + " names an expert but blk." +
+                             std::to_string(member_layer) + " does not use per-expert tensors");
+                if (member_expert >= cfg.expert_count)
+                    fail(ErrorCode::SHAPE_MISMATCH,
+                         "tensor " + tensor.name + " names expert " + std::to_string(member_expert) +
+                             " of " + std::to_string(cfg.expert_count));
+                role = expert_projection_roles()[r];
+                layer = member_layer;
+            }
+        }
         if (role == TensorRole::UNKNOWN)
             fail(ErrorCode::UNKNOWN_TENSOR, "cannot map tensor role for " + tensor.name);
         tensor.role = role;
@@ -2476,7 +2578,18 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
                 expect_dims(*m.tensor(layer_name(l, "ffn_down_exps.bias")),
                             {cfg.hidden, cfg.expert_count});
             }
-            if (cfg.fused_gate_up_exps) {
+            if (cfg.layer_is_per_expert(l)) {
+                // One two-dimensional matrix per (expert, projection): the expert
+                // index is in the name, so there is no expert axis left to size.
+                for (uint32_t e = 0; e < cfg.expert_count; ++e) {
+                    for (const char *stem : {"ffn_gate", "ffn_up"})
+                        expect_dims(*m.tensor(layer_name(l, std::string(stem) + "." +
+                                                              std::to_string(e) + ".weight")),
+                                    {cfg.hidden, ewidth});
+                    expect_dims(*m.tensor(layer_name(l, "ffn_down." + std::to_string(e) + ".weight")),
+                                {ewidth, cfg.hidden});
+                }
+            } else if (cfg.fused_gate_up_exps) {
                 // [hidden, 2*width, experts]: gate block then up block per expert.
                 expect_dims(*m.tensor(layer_name(l, "ffn_gate_up_exps.weight")),
                             {cfg.hidden, static_cast<uint64_t>(ewidth) * 2, cfg.expert_count});
@@ -2485,8 +2598,9 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
                     expect_dims(*m.tensor(layer_name(l, suffix)),
                                 {cfg.hidden, ewidth, cfg.expert_count});
             }
-            expect_dims(*m.tensor(layer_name(l, "ffn_down_exps.weight")),
-                        {ewidth, cfg.hidden, cfg.expert_count});
+            if (!cfg.layer_is_per_expert(l))
+                expect_dims(*m.tensor(layer_name(l, "ffn_down_exps.weight")),
+                            {ewidth, cfg.hidden, cfg.expert_count});
             if (cfg.shared_expert) {
                 const uint32_t swidth = cfg.shared_expert_intermediate;
                 // One scalar per token, so the gate is a hidden-vector.
@@ -2552,6 +2666,33 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
         // experts on one kind of layer only.
         for (uint32_t l = 0; l < cfg.layers; ++l) {
             if (!cfg.layer_is_moe(l)) continue;
+            if (cfg.layer_is_per_expert(l)) {
+                // The layout is already per expert: each record's three extents
+                // are three whole tensors, so there is no stride arithmetic and
+                // nothing to divide. The projection types may still differ.
+                for (uint32_t e = 0; e < expert_count; ++e) {
+                    ExpertRecord rec;
+                    rec.layer = l;
+                    rec.expert = e;
+                    rec.checksum_known = false;  // vendor files publish no checksums
+                    uint64_t payload = 0;
+                    for (int r = 0; r < 3; ++r) {
+                        const TensorInfo &tensor = *m.tensor(
+                            layer_name(l, std::string(expert_projection_stems()[r]) + "." +
+                                              std::to_string(e) + ".weight"));
+                        if (tensor.byte_size == 0)
+                            fail(ErrorCode::SHAPE_MISMATCH, "per-expert tensor is empty");
+                        rec.extents[r] = {roles[r], tensor.absolute_offset, tensor.byte_size,
+                                          tensor.type_id};
+                        payload = checked_add(payload, tensor.byte_size, "expert payload");
+                    }
+                    rec.payload_bytes = payload;
+                    m.expert_index.emplace(ModelManifest::expert_key(l, e), m.experts.size());
+                    m.experts.push_back(rec);
+                    m.slot_bytes = std::max(m.slot_bytes, rec.payload_bytes);
+                }
+                continue;
+            }
             // Each projection may use a different quantisation type (Q4_K gate
             // and up, Q6_K down is common), so their per-expert strides differ
             // legitimately. The record carries three independent extents and the
@@ -2586,21 +2727,24 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
                                                           ? strides[0] * 2
                                                           : strides[r]);
                     const uint64_t offset = r == 1 && cfg.fused_gate_up_exps ? base + strides[0] : base;
-                    rec.extents[r] = {roles[r], offset, strides[r]};
+                    rec.extents[r] = {roles[r], offset, strides[r], tensor.type_id};
                 }
                 m.expert_index.emplace(ModelManifest::expert_key(l, e), m.experts.size());
                 m.experts.push_back(rec);
                 m.slot_bytes = std::max(m.slot_bytes, rec.payload_bytes);
             }
         }
+        // An expert tensor is one the expert records read from: any projection
+        // that lives inside a routed expert's payload, stacked or per expert. The
+        // role already says so, which is what keeps this correct for both
+        // layouts without a second name list.
         for (auto &tensor : m.doc.tensors) {
-            bool expert = false;
-            for (uint32_t l = 0; l < cfg.layers && !expert; ++l) {
-                if (!cfg.layer_is_moe(l)) continue;
-                for (const auto &suffix : suffixes)
-                    if (tensor.name == layer_name(l, suffix)) expert = true;
-            }
-            tensor.expert_tensor = expert;
+            const bool expert_role = tensor.role == TensorRole::FFN_GATE_EXPS ||
+                                     tensor.role == TensorRole::FFN_UP_EXPS ||
+                                     tensor.role == TensorRole::FFN_DOWN_EXPS ||
+                                     tensor.role == TensorRole::FFN_GATE_UP_EXPS;
+            tensor.expert_tensor = expert_role && tensor.layer >= 0 &&
+                                   cfg.layer_is_moe(static_cast<uint32_t>(tensor.layer));
         }
         uint64_t expert_bytes = 0;
         for (const auto &tensor : m.doc.tensors)
@@ -2827,7 +2971,8 @@ ModelManifest build_manifest(const GGUFDocument &doc, const std::string &source_
                     uint64_t end = checked_add(rel, expert_stride, "expert extent end");
                     if (end > tensor.byte_size)
                         fail(ErrorCode::SHAPE_MISMATCH, "expert extent exceeds stacked tensor");
-                    rec.extents[r] = {extent_roles[r], tensor.absolute_offset + rel, expert_stride};
+                    rec.extents[r] = {extent_roles[r], tensor.absolute_offset + rel, expert_stride,
+                                      tensor.type_id};
                 }
                 m.expert_index.emplace(ModelManifest::expert_key(l, e), m.experts.size());
                 m.experts.push_back(rec);
@@ -3035,6 +3180,7 @@ Json inspect_json(const ModelManifest &manifest, const std::string &source_path)
             x.set("role", tensor_role_name(extent.role));
             x.set("offset", extent.offset);
             x.set("bytes", extent.bytes);
+            x.set("type", Json::integer(extent.type_id));
             extents.push(std::move(x));
         }
         e.set("extents", std::move(extents));

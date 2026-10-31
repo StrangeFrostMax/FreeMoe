@@ -422,6 +422,12 @@ struct ModelConfig {
     // (jamba does). Empty means "follow model_kind and dense_lead", which is what
     // a uniform file says.
     std::vector<uint8_t> moe_layers;
+    // Per-layer expert tensor *layout*. A stacked file keeps one tensor per
+    // (layer, projection) with an expert axis; a per-expert file keeps one tensor
+    // per (layer, expert, projection). Both carry the same numbers, so the layout
+    // is a storage fact and the expert records below are the only consumer.
+    // Empty means every routed layer is stacked.
+    std::vector<uint8_t> per_expert_layers;
     // jamba's attention layers carry no rotary position at all; upstream says so
     // by not calling the rope in its block, and the file says so by carrying no
     // `rope.dimension_count`.
@@ -436,6 +442,16 @@ struct ModelConfig {
         if (!has_ffn) return false;
         if (ffn_layers.empty()) return true;
         return layer < ffn_layers.size() && ffn_layers[layer] != 0;
+    }
+    // One tensor per (layer, expert, projection) instead of one stacked tensor
+    // per (layer, projection).
+    bool layer_is_per_expert(uint32_t layer) const {
+        return layer < per_expert_layers.size() && per_expert_layers[layer] != 0;
+    }
+    bool any_per_expert_layout() const {
+        for (uint8_t flag : per_expert_layers)
+            if (flag != 0) return true;
+        return false;
     }
     bool layer_is_moe(uint32_t layer) const {
         // A file with no per-layer mask (the native reference family) uses the
@@ -470,12 +486,54 @@ struct ModelConfig {
             if (layer_is_recurrent(l)) ++slot;
         return slot;
     }
+    // How many positions an attention layer has to keep. A windowed layer can
+    // never read further back than its window, so it stores a ring of
+    // `sliding_window` entries instead of the whole context; a full-attention
+    // layer stores every position. This is the number the budget reserves *and*
+    // the modulus the cache address uses, so the two cannot disagree.
+    uint64_t cache_positions(uint32_t layer, uint64_t context) const {
+        if (!layer_uses_window(layer)) return context;
+        return std::min<uint64_t>(context, sliding_window);
+    }
+    uint64_t cache_stride() const {
+        return static_cast<uint64_t>(kv_heads) * head_dim + v_dim();
+    }
+    // Float index of `position` inside `layer`'s cache region, and the start of
+    // that region. A windowed layer wraps: position p lives at p % capacity, and
+    // because at most `capacity` positions are ever live (the window is at most
+    // the capacity), two live positions can never share a slot.
+    uint64_t attention_cache_offset(uint32_t layer, uint64_t context) const {
+        uint64_t offset = 0;
+        for (uint32_t l = 0; l < layer && l < layers; ++l) {
+            if (layer_is_recurrent(l)) continue;
+            offset += cache_positions(l, context) * cache_stride();
+        }
+        return offset;
+    }
+    uint64_t cache_index(uint32_t layer, uint64_t position, uint64_t context) const {
+        const uint64_t capacity = cache_positions(layer, context);
+        return attention_cache_offset(layer, context) + (position % capacity) * cache_stride();
+    }
+    // The longest batch a single pass may write into a windowed layer's ring
+    // without overwriting a position the same pass still has to read.
+    uint64_t max_batch_positions(uint64_t context) const {
+        uint64_t limit = context;
+        for (uint32_t l = 0; l < layers; ++l) {
+            if (layer_is_recurrent(l)) continue;
+            limit = std::min<uint64_t>(limit, cache_positions(l, context));
+        }
+        return limit == 0 ? context : limit;
+    }
     // Floats of per-position cache the attention layers need, at `context`
     // positions: one (key, value) pair per kv head per layer. The recurrent
     // layers contribute nothing here; their rolling state is fixed size.
     uint64_t attention_cache_floats(uint64_t context) const {
-        const uint64_t kv_dim = static_cast<uint64_t>(kv_heads) * head_dim;
-        return static_cast<uint64_t>(attention_layer_count()) * context * (kv_dim + v_dim());
+        uint64_t total = 0;
+        for (uint32_t l = 0; l < layers; ++l) {
+            if (layer_is_recurrent(l)) continue;
+            total += cache_positions(l, context) * cache_stride();
+        }
+        return total;
     }
     uint64_t recurrent_state_floats() const {
         return static_cast<uint64_t>(recurrent_layer_count()) * ssm_state_floats();
@@ -642,6 +700,11 @@ struct ExpertExtent {
     TensorRole role = TensorRole::UNKNOWN;
     uint64_t offset = 0;
     uint64_t bytes = 0;
+    // The stored type of this projection. A per-expert layout has one tensor per
+    // projection with its own type, and a stacked file may also mix them (Q4_K
+    // gate/up with Q6_K down), so the type belongs to the extent rather than
+    // being looked up by tensor name at read time.
+    uint32_t type_id = 0;
 };
 
 struct ExpertRecord {

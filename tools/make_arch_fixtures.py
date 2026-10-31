@@ -315,16 +315,40 @@ def arch_tensors(spec: dict[str, Any]) -> list[TensorSpec]:
             # narrower than the dense FFN, so the width is its own setting.
             experts = spec["experts"]
             ew = spec.get("expert_width", i)
-            out += [
-                tensor(p + "ffn_gate_inp.weight", [h, experts], 0.12),
+            out += [tensor(p + "ffn_gate_inp.weight", [h, experts], 0.12)]
+            if spec.get("per_expert_tensors"):
+                # Per-expert layout: one two-dimensional tensor per (expert,
+                # projection) and no expert axis anywhere. The values are the
+                # slices of the stacked tensors the same spec would have written,
+                # so a per-expert fixture and its stacked twin are the same model
+                # stored two ways and must produce identical logits.
+                gate_all = values_for(p + "ffn_gate_exps.weight", h * ew * experts, 0.16)
+                up_all = values_for(p + "ffn_up_exps.weight", h * ew * experts, 0.16)
+                down_all = values_for(p + "ffn_down_exps.weight", ew * h * experts, 0.16)
+                for e in range(experts):
+                    gu = e * h * ew
+                    dn = e * ew * h
+                    out += [
+                        tensor(p + f"ffn_gate.{e}.weight", [h, ew], 0.0,
+                               values=gate_all[gu:gu + h * ew]),
+                        tensor(p + f"ffn_up.{e}.weight", [h, ew], 0.0,
+                               values=up_all[gu:gu + h * ew]),
+                        tensor(p + f"ffn_down.{e}.weight", [ew, h], 0.0,
+                               values=down_all[dn:dn + ew * h]),
+                    ]
+            elif spec.get("fused_exps"):
                 # Fused layout: gate and up in one tensor, gate block first, which
                 # is the order ggml_swiglu splits in.
-                *([tensor(p + "ffn_gate_up_exps.weight", [h, 2 * ew, experts], 0.16)]
-                  if spec.get("fused_exps") else
-                  [tensor(p + "ffn_gate_exps.weight", [h, ew, experts], 0.16),
-                   tensor(p + "ffn_up_exps.weight", [h, ew, experts], 0.16)]),
-                tensor(p + "ffn_down_exps.weight", [ew, h, experts], 0.16),
-            ]
+                out += [
+                    tensor(p + "ffn_gate_up_exps.weight", [h, 2 * ew, experts], 0.16),
+                    tensor(p + "ffn_down_exps.weight", [ew, h, experts], 0.16),
+                ]
+            else:
+                out += [
+                    tensor(p + "ffn_gate_exps.weight", [h, ew, experts], 0.16),
+                    tensor(p + "ffn_up_exps.weight", [h, ew, experts], 0.16),
+                    tensor(p + "ffn_down_exps.weight", [ew, h, experts], 0.16),
+                ]
             if spec.get("expert_bias"):
                 out += [tensor(p + "ffn_exp_probs_b.bias", [experts], 0.10)]
             if spec.get("router_bias"):
@@ -1124,6 +1148,20 @@ SPECS: list[dict[str, Any]] = [
         "qk_norm": True,
         "experts": 4,
         "expert_used": 2,
+    },
+    {
+        # Per-expert storage: the `qwen3moe` block with one tensor per (expert,
+        # projection) instead of one stacked tensor with an expert axis. Same
+        # weights, different bytes on disk, so the two goldens must agree.
+        "slug": "qwen3moe-per-expert",
+        "arch": "qwen3moe",
+        "name": "FreeMoe synthetic qwen3moe with one tensor per routed expert",
+        "kv_heads": 2,
+        "rope_dim": SHAPE["head_dim"],
+        "qk_norm": True,
+        "experts": 4,
+        "expert_used": 2,
+        "per_expert_tensors": True,
     },
     {
         # deepseek2: multi-head latent attention — q through a low-rank

@@ -188,8 +188,13 @@ BudgetResult compute_budget(const ModelManifest &manifest, const BudgetConfig &c
             checked_mul(cfg.recurrent_state_floats(), sizeof(float), "recurrent state");
         b.kv_bytes = attention_bytes + state_bytes;
     } else {
-        b.kv_bytes = checked_mul(static_cast<uint64_t>(cfg.layers) * cfg.context,
-                                 (kv_dim + v_dim) * sizeof(float), "KV cache");
+        // A windowed layer keeps only `sliding_window` positions, so its share of
+        // the cache is a ring, not the whole context. The same function the
+        // engine uses for its addresses produces this number, so the reservation
+        // and the addressing cannot drift apart.
+        (void)kv_dim;
+        (void)v_dim;
+        b.kv_bytes = checked_mul(cfg.attention_cache_floats(cfg.context), sizeof(float), "KV cache");
     }
     b.workspace_bytes = config.workspace_bytes;
     b.staging_bytes = config.staging_bytes;

@@ -112,7 +112,8 @@ def load_model(path: Path) -> dict[str, Any]:
 
     def ffn_layer(layer: int) -> bool:
         for suffix in ("ffn_up.weight", "ffn_gate_up.weight", "ffn_up_exps.weight",
-                       "ffn_gate_up_exps.weight", "ffn_down_exps.weight"):
+                       "ffn_gate_up_exps.weight", "ffn_down_exps.weight",
+                       "ffn_up.0.weight", "ffn_down.0.weight"):
             if f"blk.{layer}.{suffix}" in tensors:
                 return True
         return False
@@ -604,7 +605,13 @@ def expert_output(cfg: dict[str, Any], layer: int, expert: int,
     """
     H, I = cfg["H"], cfg["I_exp"]
     tensors = cfg["tensors"]
-    if prefix + "ffn_gate_up_exps.weight" in tensors:
+    if prefix + "ffn_gate.0.weight" in tensors:
+        # Per-expert layout: one two-dimensional tensor per (expert, projection),
+        # so the expert index selects the tensor rather than a slice of it. The
+        # numbers are the same ones a stacked file of the same model holds.
+        gate_vals = matvec(tensors[prefix + f"ffn_gate.{expert}.weight"][1], x, I, H)
+        up_vals = matvec(tensors[prefix + f"ffn_up.{expert}.weight"][1], x, I, H)
+    elif prefix + "ffn_gate_up_exps.weight" in tensors:
         # Fused layout: one tensor per layer of shape [H, 2*I, experts], gate
         # block first. Each expert owns a contiguous 2*I*H slice, so the halves
         # are a slice of that slice rather than of the whole tensor.
@@ -632,6 +639,8 @@ def expert_output(cfg: dict[str, Any], layer: int, expert: int,
             for i in range(I):
                 values[i] += bias[expert * I + i]
     act = [gated(cfg, gate_vals[i], up_vals[i], layer) for i in range(I)]
+    if prefix + "ffn_down.0.weight" in tensors:
+        return matvec(tensors[prefix + f"ffn_down.{expert}.weight"][1], act, H, I)
     dims, data = tensors[prefix + "ffn_down_exps.weight"]
     per_expert = H * I
     base = expert * per_expert
