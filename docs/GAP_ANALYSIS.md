@@ -122,14 +122,26 @@ The record is `docs/evidence/benchmark_zen3.json`, written by
 table above is rendered from that file (`scripts/benchmark_table.py`, `--check`
 in `make test`), so no figure in it is retyped.
 
-Two records of the *identical* configuration now exist on this host: the one at
-`31288ab` (in git history) reported 3692 tok/s prefill and p95 0.351 ms; the
-current one is the table above, and both were taken with the same engine and the
-same kernels. No engine or kernel code changed between them, and the second
-record is materially slower, so the difference is this guest's measurement
-noise, not a regression — which is why the record carries its commit, and why
-the tables in `docs/KERNELS.md` are generated from their archive rather than
-retyped.
+Three records of the *identical* configuration now exist on this host, all with
+`--kernels zen3` and no engine or kernel change between them:
+
+| Record | Prefill (median) | p95 inter-token | First token |
+| --- | --- | --- | --- |
+| `31288ab` (git history) | 3692 tok/s | 0.351 ms | 70.7 ms |
+| `11339a4` (git history) | 3144 tok/s | 0.414 ms | 83.0 ms |
+| `8384bff` — the table above | 4329 tok/s | 0.312 ms | 60.3 ms |
+
+That is a 38% spread between the fastest and slowest record of the same binary on
+the same 2-vCPU guest, in both directions. None of it is a regression and none of
+it is an improvement: between `31288ab` and `8384bff` the engine gained an adapter
+rule for MTP heads and nothing the MoE fixture's path executes. The committed
+archive described the `11339a4` run until this batch, so the table above and the
+evidence file disagreed about which run they were describing; both now name
+`8384bff`, the commit the record was actually taken at. The absolute number is a
+property of the *record*, which is why each one carries its commit, why the table
+above is rendered from the archive rather than retyped, and why
+`docs/KERNELS.md` refuses to compare numbers across records. The declared targets
+pass in all three; that is the part the spread does not change.
 
 Three things this does **not** establish, all noted in
 `docs/BENCHMARK_PROTOCOL.md`:
@@ -783,11 +795,10 @@ The **measurement** was the part owed, and it is now recorded:
   did not dispatch, so "the numbers describe the target" is now enforced at
   archive time rather than asserted in prose.
 * The re-run replaces the AVX-512 record in the baseline section above, and the
-  two are close enough (the table there is the AVX2 one; the AVX-512 one was
-  3051 tok/s, p95 0.41 ms, first token 85.5 ms) that this fixture **cannot**
-  separate the two ISAs — a 2-layer model spends its time outside the GEMV
-  kernels — so this is a
-  record of the path the target executes, not a measurement of what the ISA
+  two are too close to separate (the AVX-512 record was 3051 tok/s, p95 0.41 ms,
+  first token 85.5 ms, all inside the spread the same configuration shows across
+  sessions) — a 2-layer model spends its time outside the GEMV kernels — so this
+  is a record of the path the target executes, not a measurement of what the ISA
   costs. The kernel-level comparison is a block generated in `docs/KERNELS.md`
   from its own archive, and it does not show a consistent AVX-512 win: at these
   widths each path is the faster one on some shapes, so no percentage is quoted

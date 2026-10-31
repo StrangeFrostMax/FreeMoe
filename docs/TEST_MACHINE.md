@@ -79,6 +79,7 @@ implemented"`. This is not a successful physical GPU query.
 | Profile | `--kernels zen3` (AVX2 + FMA3), recorded in the run's `protocol.txt` |
 | Dispatch observed | 637,100 `cpu-avx2_fma` compute operations, 0 `cpu-avx512` |
 | Record | `docs/evidence/benchmark_zen3.json` (`scripts/archive_benchmark.py`) |
+| Records taken here | three, all with the same configuration: `31288ab`, `11339a4`, `8384bff`. They differ by up to 38% in prefill throughput with no code change between them — the spread is this guest, not the binary, and it is tabulated in `docs/GAP_ANALYSIS.md` §B |
 
 The host *has* AVX-512 (see the `lscpu` flags above); the run pinned it off, so
 the numbers describe the code path the Zen 3 target executes. They are still not
