@@ -3455,6 +3455,8 @@ void test_architecture_parity() {
                                            "seed-oss", "plamo", "smallthinker", "command-r", "olmo", "phimoe",
                                            "olmo2", "olmoe", "granite", "granitemoe",
                                            "bailingmoe", "bailingmoe2",
+                                           "dbrx", "deepseek", "dots1", "ernie4-5-moe",
+                                           "glm4-moe", "minimax-m2",
                                            "baichuan", "chatglm"};
     for (const std::string &slug : slugs) {
         const std::string model = "tests/fixtures/" + slug + "-shape.gguf";

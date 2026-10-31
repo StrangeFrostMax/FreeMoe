@@ -438,9 +438,16 @@ activation, norm biases and FFN biases, and their fixtures pin the logits.
    norm before the rope, dense leading blocks and router selection bias were all
    flags this build already read. Two fixtures, two oracle goldens, three
    mutations (below).
-   Still open: `glm4-moe`, `minicpm3`, `olmo2` (its q/k norm is *not* per head,
-   so it needs a second norm placement), `olmoe`/`mixtral` (MoE variants of the
-   same block), and the rest of llama.cpp's `src/models/` tree.
+   ~~`dbrx`, `deepseek`, `dots1`, `ernie4-5-moe`, `glm4-moe`, `minimax-m2`~~
+   **DONE** — LayerNorm with a fused qkv and dbrx's `attn_out_norm` slot, dense
+   leads, interleaved MoE layers, sigmoid routing as glm4-moe's default, router
+   selection biases, and the three families whose `norm_w` is a constant in the
+   graph rather than a key.
+   Still open: `minicpm3`, `olmo2` (its q/k norm is *not* per head, so it needs a
+   second norm placement), `olmoe`/`mixtral` (MoE variants of the same block),
+   `flint`/`exaone-moe`/`maple` (per-layer rotary bases), `grovemoe`,
+   `hunyuan-moe`, `maion-coder` (each needs a block, not a flag), and the rest of
+   llama.cpp's `src/models/` tree.
    ~~MTP/`nextn` heads~~ **DONE** — a checkpoint's head is ignored in both of the
    places upstream puts it: the loader subtracts `*.nextn_predict_layers` from
    `block_count` (upstream's `n_layer_all`) and maps the head layers' ordinary

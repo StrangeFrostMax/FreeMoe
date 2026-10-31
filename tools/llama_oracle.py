@@ -61,6 +61,29 @@ def _window_layers(md: dict[str, Any], arch: str, n_layer: int, window: int) -> 
     return [(layer % period) != 0 for layer in range(n_layer)]
 
 
+# The names llama.cpp has used for the two sandwich-normalisation tensors, plus
+# dbrx's `attn_out_norm`, which is the same slot: the norm written after the
+# attention residual that normalises the feed-forward input. The rename is applied
+# when the checkpoint is read, exactly as the loader does, so every
+# tensor-presence test below sees one spelling. Renaming only at lookup time is a
+# real bug: a dbrx block then looks like phi2's parallel residual, because it has
+# no tensor called `ffn_norm`.
+RENAMED_TENSORS = (
+    ("post_attention_norm", "attn_post_norm"),
+    ("post_ffw_norm", "ffn_post_norm"),
+    ("attn_out_norm", "attn_post_norm"),
+)
+
+
+def canonical_name(name: str) -> str:
+    """Normalise a post-norm tensor name to this module's spelling."""
+    stem, _, suffix = name.rpartition(".")
+    for new, old in RENAMED_TENSORS:
+        if stem.endswith("." + new):
+            return stem[: -len(new)] + old + "." + suffix
+    return name
+
+
 def load_model(path: Path) -> dict[str, Any]:
     """Reads a standard llama.cpp-style checkpoint (architecture-prefixed keys)."""
     doc = parse_gguf(Path(path).read_bytes())
@@ -81,7 +104,7 @@ def load_model(path: Path) -> dict[str, Any]:
     for t in doc["tensors"]:
         if t["type"] != 0:
             raise ReferenceError(f"this reference reads F32 only, got {t['type']}")
-        tensors[t["name"]] = (list(t["dims"]), _f32_values(t["data"]))
+        tensors[canonical_name(t["name"])] = (list(t["dims"]), _f32_values(t["data"]))
 
     hidden = int(key("embedding_length"))
     # A NextN / MTP head appends its layers to `block_count`: llama.cpp reads that
@@ -345,14 +368,22 @@ def load_model(path: Path) -> dict[str, Any]:
         # group-limited routing all change which experts run.
         "gating": ("softmax-weight" if arch == "gpt-oss" else
                    {1: "softmax", 2: "sigmoid", 3: "softmax-weight",
-                    4: "sqrt-softplus"}.get(int(key("expert_gating_func", 1)), "softmax")),
+                    4: "sqrt-softplus"}.get(
+                        int(key("expert_gating_func", 2 if arch == "glm4-moe" else 1)),
+                        "softmax")),
         "selection_bias": any(f"blk.{l}.ffn_exp_probs_b.bias" in tensors
                               for l in range(n_layer)),
         "expert_groups": int(key("expert_group_count", 0)),
         "groups_used": int(key("expert_group_used_count", 0)),
         # smallthinker passes both as constants to build_moe_ffn(..., LLM_FFN_RELU,
         # /*norm_w=*/true, ...), so neither is in the file.
-        "expert_norm": bool(key("expert_weights_norm", False)) or arch == "smallthinker",
+        # dbrx, ernie4-5-moe and minimax-m2 pass `norm_w = true` as a constant to
+        # build_moe_ffn, and deepseek passes `false`, so for those four the file
+        # carries no key and the architecture is the evidence -- the same rule the
+        # engine applies.
+        "expert_norm": (False if arch == "deepseek" else
+                        bool(key("expert_weights_norm", False)) or
+                        arch in ("smallthinker", "dbrx", "ernie4-5-moe", "minimax-m2")),
         "expert_scale": float(key("expert_weights_scale", 1.0)),
     }
     # A block with up/down but no gate has no gated activation. GGUF cannot say
@@ -755,12 +786,7 @@ class Session:
         `ffn_post_norm` -> `post_ffw_norm`. The tensors did not move, so a file
         of either vintage describes the same block.
         """
-        stem, _, suffix = name.rpartition(".")
-        for new, old in (("post_attention_norm", "attn_post_norm"),
-                         ("post_ffw_norm", "ffn_post_norm")):
-            if stem.endswith("." + new):
-                return stem[: -len(new)] + old + "." + suffix
-        return name
+        return canonical_name(name)
 
     def tensor(self, name: str) -> list[float]:
         name = self.canonical(name)
@@ -1260,7 +1286,10 @@ class Session:
                 if cfg["proj_scales"]:
                     sd = self.tensor(p + "ffn_down.scale")[0]
                     down = [v * sd for v in down]
-            if cfg["shared_expert"] and layer >= cfg["dense_lead"]:
+            # The shared expert rides with the routed experts, and which layers
+            # have those is per layer (`ffn_gate_inp` is optional upstream), not
+            # `layer >= dense_lead`: ernie4-5-moe interleaves them.
+            if cfg["shared_expert"] and cfg["moe_layers"][layer]:
                 # qwen2moe's shared expert: a dense FFN beside the routed ones,
                 # scaled by sigmoid(dot(gate_inp, h)). The reference writes that
                 # gate as silu(s)/s, which is the same number except at s == 0

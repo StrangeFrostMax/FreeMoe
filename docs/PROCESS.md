@@ -279,7 +279,50 @@ reading of the same two files, so it proves the engine matches *that reading*,
 not that the reading is right; and the fixtures are two trunk layers, so nothing
 here tests a 20B file's memory behaviour.
 
-The other twelve rows of batch 1 — `deepseek`, `dots1`, `dbrx`, `ernie4-5-moe`,
-`exaone-moe`, `flint`, `glm4-moe`, `grovemoe`, `hunyuan-moe`, `maion-coder`,
-`maple`, `minimax-m2` — are still `unclassified`. They are the next slice, in
-that order.
+The other twelve rows of batch 1 were still `unclassified` at that point. Six of
+them — `dbrx`, `deepseek`, `dots1`, `ernie4-5-moe`, `glm4-moe` and `minimax-m2` —
+landed in slice B, below; the remaining six are named at the end of it.
+
+## Evidence for census batch 1, slice B: six MoE trunks
+
+`dbrx`, `deepseek`, `dots1`, `ernie4-5-moe`, `glm4-moe`, `minimax-m2`, each read
+from its own file at the pinned commit. Five are flags; one is a real defect
+fixed.
+
+| Family | What the file does | What had to change here |
+|---|---|---|
+| `dbrx` | LayerNorm, one fused qkv, and a single post-attention norm **named `attn_out_norm`** that feeds the MoE | the loader aliased `attn_out_norm` to `attn_post_norm`, which is the slot gpt-oss calls by that name; without the alias the tensor had no role at all |
+| `deepseek` | dense lead, softmax router with `norm_w = false` passed as a constant, a scale, ungated shared expert | one architecture rule: the file's `expert_weights_norm` must not switch the renormalisation on |
+| `dots1` | per-head q/k norm before the rope, dense lead, selection bias, metadata gating, ungated shared expert | nothing beyond the flags already read |
+| `ernie4-5-moe` | MoE layers **interleaved** (`(il+1) % n_moe_layer_step`), `norm_w = true` as a constant, optional ungated shared expert | one rule for the constant norm; the interleaving is read from which layers carry `ffn_gate_inp` |
+| `glm4-moe` | post-attention norm as the FFN input norm, **sigmoid** when `expert_gating_func` is absent, selection bias, ungated shared expert | one rule for the sigmoid default (upstream turns NONE into SIGMOID) |
+| `minimax-m2` | per-head q/k norm, selection bias, `norm_w = true` as a constant, no shared expert | the same constant-norm rule |
+
+Gate: `./build/tests` → **3976 checks, 0 failures** (3862 before; 19 checks per
+new fixture). Census: **69 mapped / 2 caveat / 36 blocked / 64 unclassified**
+(63 / 2 / 36 / 70 before).
+
+The dbrx row also found a bug in the **reference**, not just in the engine: the
+oracle renamed `attn_out_norm` only at lookup time, so its own tensor-presence
+tests saw a block with no `ffn_norm` and no `attn_post_norm` and ran it as phi2's
+parallel residual. The pre-norm twin of the same weights agreed with the engine
+to 4e-7 while the post-norm file disagreed by 0.86, which is what localised it;
+the rename now happens when the checkpoint is read, in both implementations.
+`dbrx` was previously reverted for exactly this disagreement and it is now a row.
+
+| Mutation | Turns red |
+|---|---|
+| drop the `attn_out_norm` alias | `architecture_parity` fails with "tensor blk.0.attn_out_norm.weight has no mapping in the dbrx adapter" |
+| drop the glm4-moe sigmoid default | `glm4-moe` logits (worst abs 0.28) |
+| drop `ernie4-5-moe` and `minimax-m2` from the constant-norm set | their logits and greedy ids (4 failures, worst abs 0.24 / 0.22) |
+| drop deepseek's constant `norm_w = false` | `deepseek` logits (0.21) |
+
+Not verified: no checkpoint of any of the six exists here, so every fixture is
+shaped from its loader's own rules; `flint` and `exaone-moe` were read but not
+landed, because both give *some* layers a different rotary base or none at all
+(`hparams.has_rope(il)`, `rope_freq_base_swa`) and this build has one rotary
+configuration per file — landing them would have meant silently rotating layers
+the reference does not; `grovemoe` scales the whole MoE output by
+`expert_group_scale`, `hunyuan-moe` sums a dense MLP with the MoE in one layer,
+and `maion-coder` puts a low-rank latent between the router and the experts.
+Those three need a feature, not a flag.

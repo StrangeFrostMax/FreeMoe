@@ -93,6 +93,33 @@ const AdapterRow kRows[] = {
     // leading blocks, an optional selection bias on the router and a real MTP head.
     {"bailingmoe2", "LLM_ARCH_BAILINGMOE2", "llama_model_bailingmoe2::build_arch_graph",
      "fused qkv, per-head q/k norm, dense lead, selection bias, MTP head"},
+    // dbrx (src/models/dbrx.cpp): LayerNorm instead of RMSNorm, a fused q/k/v
+    // projection, and *one* post-attention norm that normalises the feed-forward
+    // input (the file calls it `attn_out_norm`).
+    {"dbrx", "LLM_ARCH_DBRX", "llama_model_dbrx::build_arch_graph",
+     "LayerNorm block, fused qkv, post-attention norm as the FFN norm"},
+    // deepseek (src/models/deepseek.cpp): the pre-norm block with a dense lead, a
+    // softmax router whose weights are *not* renormalised, a scale, and an ungated
+    // shared expert. Tied output is optional.
+    {"deepseek", "LLM_ARCH_DEEPSEEK", "llama_model_deepseek::build_arch_graph",
+     "dense lead, unnormalised softmax router, ungated shared expert"},
+    // dots1 (src/models/dots1.cpp): per-head q/k norm before the rope, dense lead,
+    // router with an optional selection bias and metadata-driven gating, ungated
+    // shared expert.
+    {"dots1", "LLM_ARCH_DOTS1", "llama_model_dots1::build_arch_graph",
+     "per-head q/k norm, dense lead, selection bias, ungated shared expert"},
+    // ernie4-5-moe (src/models/ernie4-5-moe.cpp): every Nth layer is MoE rather
+    // than every layer past a dense lead; the router renormalises as a constant.
+    {"ernie4-5-moe", "LLM_ARCH_ERNIE4_5_MOE", "llama_model_ernie4_5_moe::build_arch_graph",
+     "interleaved MoE layers, constant weight norm, optional shared expert"},
+    // glm4-moe (src/models/glm4-moe.cpp): post-attention norm as the FFN norm,
+    // sigmoid routing by default, optional per-head q/k norm, shared expert.
+    {"glm4-moe", "LLM_ARCH_GLM4_MOE", "llama_model_glm4_moe::build_arch_graph",
+     "sigmoid routing, post-attention FFN norm, shared expert, optional q/k norm"},
+    // minimax-m2 (src/models/minimax-m2.cpp): per-head q/k norm, router selection
+    // bias, constant weight norm, no shared expert.
+    {"minimax-m2", "LLM_ARCH_MINIMAX_M2", "llama_model_minimax_m2::build_arch_graph",
+     "per-head q/k norm, selection bias, constant router weight norm"},
 
     {"bloom", "LLM_ARCH_BLOOM", "llama_model_bloom::build_arch_graph",
      "ALiBi attention, biased LayerNorm, embedding norm"},

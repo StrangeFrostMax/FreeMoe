@@ -282,8 +282,11 @@ def arch_tensors(spec: dict[str, Any]) -> list[TensorSpec]:
             ]
         elif spec.get("ffn_norm_from_post"):
             # gpt-oss normalises after the attention residual and calls that
-            # tensor attn_post_norm; there is no ffn_norm of its own.
-            out += [tensor(p + "attn_post_norm.weight", [h], 0.0, norm=True)]
+            # tensor attn_post_norm; there is no ffn_norm of its own. dbrx writes
+            # the same tensor as `attn_out_norm`, which the loader aliases, so the
+            # name is a fixture knob rather than a code path.
+            out += [tensor(p + spec.get("post_norm_name", "attn_post_norm") + ".weight",
+                           [h], 0.0, norm=True)]
         elif not spec.get("parallel_residual"):
             norm_name = spec.get("ffn_norm_name", "ffn_norm")
             if not weightless:
@@ -922,6 +925,145 @@ SPECS: list[dict[str, Any]] = [
         "mtp_tensors": True,
         "arch_metadata": {
             "expert_weights_norm": ("bool", True),
+            "expert_weights_scale": ("f32", 1.5),
+        },
+    },
+    {
+        # dbrx (llama.cpp src/models/dbrx.cpp): LayerNorm rather than RMSNorm, one
+        # fused q/k/v projection, and a single post-attention norm that feeds the
+        # MoE. The file names that tensor `attn_out_norm` -- not `attn_post_norm`
+        # and not `ffn_norm` -- which is the one fact the previous attempt at this
+        # row got wrong, so the fixture keeps the real name.
+        "slug": "dbrx",
+        "arch": "dbrx",
+        "name": "FreeMoe synthetic dbrx: LayerNorm, fused qkv, attn_out_norm",
+        "kv_heads": 2,
+        "layernorm": True,
+        # dbrx's LayerNorm carries a scale and no bias: upstream creates the
+        # weight only, so a file with biases would describe a different block.
+        "norm_bias": False,
+        "fused_qkv": True,
+        "ffn_norm_from_post": True,
+        "post_norm_name": "attn_out_norm",
+        "experts": 4,
+        "expert_used": 2,
+        "expert_width": 40,
+        "arch_metadata": {
+            "expert_weights_scale": ("f32", 1.5),
+        },
+    },
+    {
+        # deepseek (llama.cpp src/models/deepseek.cpp): one dense leading block,
+        # then a softmax router whose weights are *not* renormalised (`norm_w =
+        # false` is a constant in the graph), a scale, and an ungated shared
+        # expert. `attention.scale` overrides 1/sqrt(head_dim) when the file sets
+        # it, so the fixture sets it.
+        "slug": "deepseek",
+        "arch": "deepseek",
+        "name": "FreeMoe synthetic deepseek with dense lead and ungated shared expert",
+        "kv_heads": 2,
+        "dense_lead": 1,
+        "attention_scale": 0.07,
+        "experts": 4,
+        "expert_used": 2,
+        "expert_width": 40,
+        "shared_expert": True,
+        "shared_gate": False,
+        "shared_width": 24,
+        "arch_metadata": {
+            # deepseek's graph passes `norm_w = false` to build_moe_ffn as a
+            # constant, so a file that carries this key must not switch the
+            # renormalisation on. No real deepseek export writes it; the fixture
+            # does, because a rule that no fixture exercises is a rule nobody has
+            # checked.
+            "expert_weights_norm": ("bool", True),
+            "expert_weights_scale": ("f32", 1.25),
+        },
+    },
+    {
+        # dots1 (llama.cpp src/models/dots1.cpp): per-head q/k norm before the
+        # rope, a dense lead, a router selection bias, metadata-driven gating
+        # (sigmoid here) and an ungated shared expert.
+        "slug": "dots1",
+        "arch": "dots1",
+        "name": "FreeMoe synthetic dots1 with selection bias and sigmoid routing",
+        "kv_heads": 2,
+        "qk_norm": True,
+        "dense_lead": 1,
+        "gating": 2,
+        "experts": 4,
+        "expert_used": 2,
+        "expert_width": 40,
+        "expert_bias": True,
+        "shared_expert": True,
+        "shared_gate": False,
+        "shared_width": 24,
+        "arch_metadata": {
+            "expert_weights_norm": ("bool", True),
+            "expert_weights_scale": ("f32", 1.5),
+        },
+    },
+    {
+        # ernie4-5-moe (llama.cpp src/models/ernie4-5-moe.cpp): the MoE layers are
+        # interleaved (`(il + 1) % n_moe_layer_step == 0`) rather than being
+        # everything past a dense lead, so the fixture's three layers are
+        # dense / MoE / dense. The router renormalises as a constant and carries a
+        # selection bias; the shared expert is optional and ungated.
+        "slug": "ernie4-5-moe",
+        "arch": "ernie4-5-moe",
+        "name": "FreeMoe synthetic ernie4-5-moe with an interleaved MoE layer",
+        "layers": 3,
+        "kv_heads": 2,
+        "moe_layers": [1],
+        "experts": 4,
+        "expert_used": 2,
+        "expert_width": 40,
+        "expert_bias": True,
+        "shared_expert": True,
+        "shared_gate": False,
+        "shared_width": 24,
+        "arch_metadata": {
+            "expert_weights_scale": ("f32", 1.5),
+        },
+    },
+    {
+        # glm4-moe (llama.cpp src/models/glm4-moe.cpp): the post-attention norm is
+        # the feed-forward's input norm, routing is **sigmoid** when the file omits
+        # `expert_gating_func` (upstream turns NONE into SIGMOID), the router has a
+        # selection bias and the shared expert is added ungated. No q/k norm here:
+        # upstream makes it conditional on the tensor being present.
+        "slug": "glm4-moe",
+        "arch": "glm4-moe",
+        "name": "FreeMoe synthetic glm4-moe with sigmoid routing as the default",
+        "kv_heads": 2,
+        "ffn_norm_from_post": True,
+        "dense_lead": 1,
+        "experts": 4,
+        "expert_used": 2,
+        "expert_width": 40,
+        "expert_bias": True,
+        "shared_expert": True,
+        "shared_gate": False,
+        "shared_width": 24,
+        "arch_metadata": {
+            "expert_weights_scale": ("f32", 1.25),
+        },
+    },
+    {
+        # minimax-m2 (llama.cpp src/models/minimax-m2.cpp): per-head q/k norm
+        # before the rope, a router selection bias, a gating function from the file
+        # and a constant `norm_w = true`. No shared expert.
+        "slug": "minimax-m2",
+        "arch": "minimax-m2",
+        "name": "FreeMoe synthetic minimax-m2 with selection bias and no shared expert",
+        "kv_heads": 2,
+        "qk_norm": True,
+        "gating": 2,
+        "experts": 4,
+        "expert_used": 2,
+        "expert_width": 40,
+        "expert_bias": True,
+        "arch_metadata": {
             "expert_weights_scale": ("f32", 1.5),
         },
     },

@@ -1,5 +1,5 @@
 {
- "adapter_rows": 69,
+ "adapter_rows": 75,
  "blocked_by_capability": {
   "C-ALTUP": [
    "gemma3n"
@@ -72,9 +72,9 @@
  },
  "counts": {
   "blocked": 36,
-  "mapped": 63,
+  "mapped": 69,
   "mapped-caveat": 2,
-  "unclassified": 70
+  "unclassified": 64
  },
  "files": 171,
  "method": "graph-marker scan; a verdict is not evidence a family runs",
@@ -422,13 +422,8 @@
    "implemented": [
     "moe"
    ],
-   "nearest": {
-    "arch": "qwen3moe",
-    "extra": [],
-    "similarity": 1.0
-   },
    "tolerated": [],
-   "verdict": "unclassified"
+   "verdict": "mapped"
   },
   {
    "arch": "deci",
@@ -450,13 +445,8 @@
     "moe",
     "shared-expert"
    ],
-   "nearest": {
-    "arch": "bailingmoe2",
-    "extra": [],
-    "similarity": 1.0
-   },
    "tolerated": [],
-   "verdict": "unclassified"
+   "verdict": "mapped"
   },
   {
    "arch": "deepseek2",
@@ -601,13 +591,8 @@
     "router-bias",
     "shared-expert"
    ],
-   "nearest": {
-    "arch": "bailingmoe2",
-    "extra": [],
-    "similarity": 1.0
-   },
    "tolerated": [],
-   "verdict": "unclassified"
+   "verdict": "mapped"
   },
   {
    "arch": "dots3note",
@@ -666,13 +651,8 @@
     "router-bias",
     "shared-expert"
    ],
-   "nearest": {
-    "arch": "bailingmoe2",
-    "extra": [],
-    "similarity": 1.0
-   },
    "tolerated": [],
-   "verdict": "unclassified"
+   "verdict": "mapped"
   },
   {
    "arch": "ernie4-5",
@@ -957,15 +937,10 @@
     "router-bias",
     "shared-expert"
    ],
-   "nearest": {
-    "arch": "glm4",
-    "extra": [],
-    "similarity": 0.933
-   },
    "tolerated": [
     "NextN / MTP head"
    ],
-   "verdict": "unclassified"
+   "verdict": "mapped"
   },
   {
    "arch": "glm4",
@@ -1190,7 +1165,7 @@
     "shared-expert"
    ],
    "nearest": {
-    "arch": "bailingmoe2",
+    "arch": "ernie4-5-moe",
     "extra": [],
     "similarity": 1.0
    },
@@ -1782,13 +1757,8 @@
     "qk-norm",
     "router-bias"
    ],
-   "nearest": {
-    "arch": "olmoe",
-    "extra": [],
-    "similarity": 1.0
-   },
    "tolerated": [],
-   "verdict": "unclassified"
+   "verdict": "mapped"
   },
   {
    "arch": "minimax-m3",
