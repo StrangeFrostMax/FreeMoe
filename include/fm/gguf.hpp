@@ -248,6 +248,12 @@ struct ModelConfig {
     uint32_t hidden = 0;
     uint32_t intermediate = 0;
     uint32_t layers = 0;
+    // NextN / multi-token-prediction layers declared by the file. llama.cpp keeps
+    // `n_layer_all` from `block_count` and runs `n_layer_all - n_layer_nextn`
+    // trunk layers; the head's layers are stored as ordinary `blk.{n}.*` blocks
+    // past the trunk, so the count has to be carried to know which indices to
+    // ignore. 0 means the file has no MTP head.
+    uint32_t mtp_layers = 0;
     uint32_t heads = 0;
     uint32_t kv_heads = 0;
     uint32_t head_dim = 0;

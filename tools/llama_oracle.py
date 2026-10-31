@@ -84,7 +84,12 @@ def load_model(path: Path) -> dict[str, Any]:
         tensors[t["name"]] = (list(t["dims"]), _f32_values(t["data"]))
 
     hidden = int(key("embedding_length"))
-    n_layer = int(key("block_count"))
+    # A NextN / MTP head appends its layers to `block_count`: llama.cpp reads that
+    # key into `n_layer_all` and runs `n_layer_all - n_layer_nextn` trunk layers,
+    # building the head only when the loader asks for it. The reference runs the
+    # trunk for the same reason the engine does, and reads the same key, so a
+    # file with a head cannot be checked by an oracle that counts every block.
+    n_layer = int(key("block_count")) - int(key("nextn_predict_layers", 0))
     # Which layers are recurrent, read from the tensors exactly as the engine
     # does: a layer with `ssm_in` has no attention, and the layers without one
     # are an ordinary attention stack. A pure mamba file is all-recurrent; a
@@ -146,7 +151,8 @@ def load_model(path: Path) -> dict[str, Any]:
         "arch": arch,
         "H": hidden,
         "I": int(key("feed_forward_length")) if has_attn else 0,
-        "L": int(key("block_count")),
+        # The trunk only: a head layer is in `block_count` but never runs.
+        "L": n_layer,
         "heads": heads,
         "kv_heads": int(kv_head_key) if has_attn else 0,
         "hd": hd,

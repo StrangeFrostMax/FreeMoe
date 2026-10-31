@@ -523,17 +523,32 @@ one-row-away because their files name no primitive the engine lacks — their
 difference is structural. A census whose capability list is not derived from the
 engine measures the list, not the engine.
 
-The second drift ran the other way and hid a missing test. `C-MTP-HEAD` was
-listed as a blocker for 17 families, but an MTP head is not something a decoder
-runs: upstream writes its tensors as `blk.{n_layer}.nextn.*` and builds the head
-only when the loader asks for it (`ml.load_mtp`, false in every inference run).
-The engine already mapped those tensors to `IGNORED`, and **nothing in the tree
-proved it** — `docs/MODEL_SUPPORT.md` claimed the tolerance in prose. The batch
-that closed this adds the `qwen3moe-mtp` fixture (the `qwen3moe` weights plus a
-real head) and the `mtp_head_tolerated` test: the file loads, `inspect` reports
-all five head tensors with their reason, and the logits are **bit-identical** to
-the same checkpoint without the head. Deleting the `nextn.` rule turns that test
-into `UNKNOWN_TENSOR`, so the tolerance cannot be dropped silently. Those
+The second drift ran the other way and hid a half-implemented rule. `C-MTP-HEAD`
+was listed as a blocker for 17 families, but a head is not something a decoder
+runs: upstream builds it only when the loader asks for it (`ml.load_mtp`, false
+in every inference run), so a checkpoint carrying one is a checkpoint whose trunk
+runs unchanged. Removing it from the capability list was right; the rule behind
+that claim was then only half true.
+
+Upstream stores the head *inside* the block count. `llama-model.cpp` reads
+`block_count` into `n_layer_all` and runs `n_layer_all - n_layer_nextn` trunk
+layers, so a head layer's weights are ordinary `blk.{n_layer}.*` tensors — the
+same names a trunk layer has — plus the `nextn.*` ones the head owns. A rule that
+ignores names is therefore not enough: a real GLM-4.5-Air-class file would have
+been refused on `blk.31.attn_q.weight`. The fixture now carries both halves
+(`block_count` 3, `nextn_predict_layers` 1, a full head block plus the `nextn.*`
+names, and a per-layer `attention.head_count_kv` array sized by the block count,
+which is how llama.cpp writes per-layer arrays). The engine subtracts the
+declared head layers, ignores exactly those indices, and truncates a per-layer
+array that is sized by the block count instead of the trunk; the reference
+implements the same subtraction independently.
+
+`mtp_head_tolerated` (66 checks) holds all of it: every head tensor is reported
+in `inspect` with its reason, logits and greedy ids are **bit-identical** to the
+same weights without a head, and four counterfactuals keep the rule from growing
+— dropping the key makes the head a runnable third layer, an index past the head
+is `UNKNOWN_TENSOR`, a head larger than the block count is `METADATA_MISMATCH`,
+and a head tensor renamed out of the block namespace is still refused. Those
 families did not become supported: they moved from "blocked by MTP" to
 `unclassified`, where the rest of their block has to be read. The loader also
 tolerates an `mtp.` prefix that no upstream file at this pin writes; it is kept
@@ -640,7 +655,7 @@ The other 13 unclassified rows share no mapped shape above 0.6 and need a read f
 | `C-RWKV` — RWKV scan | 5 | `arwkv7`, `rwkv6`, `rwkv6qwen2`, `rwkv7`, `rwkv7-base` |
 | `C-SHORTCONV` — short convolution / conv1d in the block | 16 | `bailingmoe3`, `clef`, `glm5-next`, `kimi-k3`, `kimi-linear`, `lfm-base`, `lfm2`, `lfm2moe`, `lfm3`, `mamba-base`, `plamo2`, `qwen35`, `qwen35moe`, `qwen3next`, `qwen4exp`, `wavtokenizer-dec` |
 
-**Not blocking:** 17 families carry a NextN / MTP head. Its tensors are named `blk.{n_layer}.nextn.*`, upstream builds the head only when a loader asks for it (`ml.load_mtp`), and this engine maps those tensors to `IGNORED` with the reason recorded in `inspect`. Pinned by the `qwen3moe-mtp` fixture and the `mtp_head_tolerated` test — bit-identical logits against the same file without the head.
+**Not blocking:** 17 families carry a NextN / MTP head. Upstream builds the head only when a loader asks for it (`ml.load_mtp`), and it stores the head inside `block_count`: the trunk is `block_count - nextn_predict_layers` layers, so the head's weights are ordinary `blk.{n_layer}.*` blocks *plus* the `nextn.*` names it owns. This engine subtracts the declared count and maps both halves to `IGNORED` with the reason recorded in `inspect`. Pinned by the `qwen3moe-mtp` fixture and the `mtp_head_tolerated` test: the file loads, every head tensor is reported, and the logits are bit-identical to the same checkpoint without the head. Removing either half (`nextn_predict_layers`, or the index rule) changes what runs, which the test asserts.
 
 Families carrying one: `bailingmoe3`, `cohere2moe`, `deepseek32`, `deepseek4`, `dflash`, `glm-dsa`, `glm4-moe`, `glm5-next`, `hy-v3`, `mellum`, `mimo2`, `nemotron-h-moe`, `qwen35`, `qwen35moe`, `qwen3next`, `qwen4exp`, `step35`.
 

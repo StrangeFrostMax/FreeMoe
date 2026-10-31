@@ -95,11 +95,14 @@ CAPABILITIES = [
 ]
 
 # Blocks that are not blocking, with the reason. The NextN/MTP head is the case
-# this list exists for: upstream writes its tensors as `blk.{n_layer}.nextn.*`
-# and builds the head only when a loader asks for it (`ml.load_mtp`, false in an
-# inference run), so a checkpoint carrying one runs its trunk unchanged. The
-# engine ignores those tensors by rule and says so in `inspect`; the tolerance is
-# pinned by the `qwen3moe-mtp` fixture and the `mtp_head_tolerated` test.
+# this list exists for: upstream builds the head only when a loader asks for it
+# (`ml.load_mtp`, false in an inference run), so a checkpoint carrying one runs
+# its trunk unchanged. There are two halves to the layout and the marker scan
+# only sees one: the head's own names (`blk.{n}.nextn.*`, `nextn.*`) *and* the
+# ordinary block tensors of its layers, because `block_count` is upstream's
+# `n_layer_all` and the trunk is `n_layer_all - n_layer_nextn`
+# (`llama-model.cpp`). Both are ignored by rule and both are pinned by the
+# `qwen3moe-mtp` fixture and the `mtp_head_tolerated` test.
 #
 # Listing it as a capability was wrong in a way that mattered: it made 16
 # families look unbuildable when the only thing standing between them and a row
@@ -311,11 +314,16 @@ def render_table(census: dict) -> str:
     tolerated = [r["arch"] for r in census["rows"] if r.get("tolerated")]
     if tolerated:
         lines.append(f"**Not blocking:** {len(tolerated)} families carry a NextN / MTP head. "
-                     "Its tensors are named `blk.{n_layer}.nextn.*`, upstream builds the head "
-                     "only when a loader asks for it (`ml.load_mtp`), and this engine maps those "
-                     "tensors to `IGNORED` with the reason recorded in `inspect`. Pinned by the "
-                     "`qwen3moe-mtp` fixture and the `mtp_head_tolerated` test — bit-identical "
-                     "logits against the same file without the head.")
+                     "Upstream builds the head only when a loader asks for it (`ml.load_mtp`), "
+                     "and it stores the head inside `block_count`: the trunk is "
+                     "`block_count - nextn_predict_layers` layers, so the head's weights are "
+                     "ordinary `blk.{n_layer}.*` blocks *plus* the `nextn.*` names it owns. This "
+                     "engine subtracts the declared count and maps both halves to `IGNORED` with "
+                     "the reason recorded in `inspect`. Pinned by the `qwen3moe-mtp` fixture and "
+                     "the `mtp_head_tolerated` test: the file loads, every head tensor is "
+                     "reported, and the logits are bit-identical to the same checkpoint without "
+                     "the head. Removing either half (`nextn_predict_layers`, or the index rule) "
+                     "changes what runs, which the test asserts.")
         lines.append("")
         lines.append(f"Families carrying one: {', '.join(f'`{a}`' for a in sorted(tolerated))}.")
         lines.append("")
