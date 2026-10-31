@@ -2936,7 +2936,8 @@ void test_architecture_parity() {
                                            "llama-embed", "gemma2-renamed",
                                            "bloom", "jais",
                                            "gpt2", "starcoder", "falcon", "mpt",
-                                           "seed-oss", "plamo", "smallthinker", "command-r", "olmo", "phimoe"};
+                                           "seed-oss", "plamo", "smallthinker", "command-r", "olmo", "phimoe",
+                                           "olmo2", "olmoe", "granite", "granitemoe"};
     for (const std::string &slug : slugs) {
         const std::string model = "tests/fixtures/" + slug + "-shape.gguf";
         ArchGolden golden = read_arch_golden("tests/golden/" + slug + "_reference.txt");
@@ -3846,6 +3847,140 @@ void test_metadata_array_forms() {
     }
 }
 
+// deepseek4 / deepseek41: the architectures are mapped, but two structures their
+// graph needs are not modelled here, and neither shows up as a missing tensor:
+//
+//   * hyper-connections widen the residual stream (hc_mult * n_embd) and apply an
+//     affine map in every layer (models/deepseek4.cpp);
+//   * the DSA indexer chooses which positions attention reads.
+//
+// Before this test existed, such a file loaded and produced identical ids with
+// and without `hyper_connection.count`, while `probe` called it runnable.
+void test_unmodelled_structures() {
+    const std::string source = "tests/fixtures/deepseek2-mla-shape.gguf";
+    auto as_deepseek4 = [&]() {
+        const GGUFDocument base = parse_gguf_file(source);
+        GGUFDocument doc = base;
+        doc.metadata.clear();
+        for (const auto &[key, value] : base.metadata) {
+            // GGUF keys carry one architecture prefix, so they have to move with
+            // the name or the manifest would read nothing at all.
+            const std::string prefix = "deepseek2.";
+            doc.metadata[key.rfind(prefix, 0) == 0 ? "deepseek4." + key.substr(prefix.size())
+                                                  : key] = value;
+        }
+        // The architecture is a metadata *value*, so it moves separately.
+        MetadataValue arch_value;
+        arch_value.type = GGUFValueType::STRING;
+        arch_value.s = "deepseek4";
+        doc.metadata["general.architecture"] = arch_value;
+        return doc;
+    };
+    auto set_f32 = [](GGUFDocument &doc, const std::string &key, double value) {
+        MetadataValue v;
+        v.type = GGUFValueType::FLOAT32;
+        v.f = value;
+        doc.metadata[key] = v;
+    };
+
+    // The architecture alone is accepted: without the keys below it is the MLA
+    // block this build does model.
+    {
+        GGUFDocument doc = as_deepseek4();
+        const ModelManifest manifest = build_manifest(doc, source);
+        CHECK(manifest.config.architecture == "deepseek4", "deepseek4 is mapped by name");
+        CHECK(manifest.config.hyper_connection_count == 0.0,
+              "a file without hyper-connection metadata reports none");
+    }
+    // hyper_connection.count = 2 widens the residual stream: refused, by name.
+    {
+        GGUFDocument doc = as_deepseek4();
+        set_f32(doc, "deepseek4.hyper_connection.count", 2.0);
+        CHECK(throws_code(ErrorCode::NOT_IMPLEMENTED,
+                          [&]() { (void)build_manifest(doc, source); }),
+              "a file declaring hyper-connections is refused");
+        bool named = false;
+        try {
+            (void)build_manifest(doc, source);
+        } catch (const Error &e) {
+            named = std::string(e.what()).find("hyper_connection.count") != std::string::npos;
+        }
+        CHECK(named, "the refusal names hyper_connection.count");
+        const Json probe = probe_model(doc, "synthetic.gguf");
+        CHECK(probe.dump().find("HYPER_CONNECTIONS_UNMODELLED") != std::string::npos,
+              "the probe reports hyper-connections as a blocker");
+        CHECK(probe.dump().find("\"runnable\":true") == std::string::npos,
+              "the probe does not call a file with hyper-connections runnable");
+    }
+    // hc_mult == 1 is the ordinary residual stream.
+    {
+        GGUFDocument doc = as_deepseek4();
+        set_f32(doc, "deepseek4.hyper_connection.count", 1.0);
+        CHECK(build_manifest(doc, source).config.hyper_connection_count == 1.0,
+              "a single hyper-connection is the plain residual and is accepted");
+    }
+    // The DSA indexer: refused from metadata, before any tensor is mapped.
+    for (const char *key : {"deepseek4.attention.indexer.head_count",
+                            "deepseek4.attention.indexer.key_length",
+                            "deepseek4.attention.indexer.top_k"}) {
+        GGUFDocument doc = as_deepseek4();
+        MetadataValue v;
+        v.type = GGUFValueType::UINT32;
+        v.u = 4;
+        doc.metadata[key] = v;
+        CHECK(throws_code(ErrorCode::NOT_IMPLEMENTED,
+                          [&]() { (void)build_manifest(doc, source); }),
+              std::string("the DSA indexer is refused via ") + key);
+        const Json probe = probe_model(doc, "synthetic.gguf");
+        CHECK(probe.dump().find("INDEXER_UNMODELLED") != std::string::npos,
+              std::string("the probe reports the indexer as a blocker via ") + key);
+    }
+    // granite's deepstack_mapping: a non-negative entry makes a layer read a
+    // projector stream the vision tower would compute. An empty array (or none at
+    // all, which is what the text-only fixtures carry) is accepted.
+    {
+        auto as_granite = [&]() {
+            const std::string path = "tests/fixtures/granite-shape.gguf";
+            const GGUFDocument base = parse_gguf_file(path);
+            GGUFDocument doc = base;
+            doc.metadata.clear();
+            for (const auto &[key, value] : base.metadata) {
+                const std::string prefix = "granite.";
+                doc.metadata[key.rfind(prefix, 0) == 0 ? "granite." + key.substr(prefix.size())
+                                                       : key] = value;
+            }
+            return doc;
+        };
+        auto set_array = [](GGUFDocument &doc, const std::string &key,
+                            const std::vector<int64_t> &values) {
+            MetadataValue v;
+            v.type = GGUFValueType::ARRAY;
+            v.element_type = GGUFValueType::INT32;
+            for (int64_t value : values) {
+                MetadataValue entry;
+                entry.type = GGUFValueType::INT32;
+                entry.i = value;
+                v.array.push_back(entry);
+            }
+            doc.metadata[key] = v;
+        };
+        GGUFDocument plain = as_granite();
+        CHECK(build_manifest(plain, "synthetic.gguf").config.attention_scale > 0.0,
+              "the granite fixture states its own softmax scale");
+        set_array(plain, "granite.deepstack_mapping", {-1, -1});
+        CHECK(build_manifest(plain, "synthetic.gguf").config.hidden > 0,
+              "a text-only deepstack_mapping (-1 entries) is accepted");
+        GGUFDocument deep = as_granite();
+        set_array(deep, "granite.deepstack_mapping", {-1, 2});
+        CHECK(throws_code(ErrorCode::NOT_IMPLEMENTED,
+                          [&]() { (void)build_manifest(deep, "synthetic.gguf"); }),
+              "a deepstack layer that reads a projector stream is refused");
+        const Json probe = probe_model(deep, "synthetic.gguf");
+        CHECK(probe.dump().find("DEEPSTACK_UNMODELLED") != std::string::npos,
+              "the probe reports the deepstack stream as a blocker");
+    }
+}
+
 void test_recurrent_families() {
     struct Expect {
         const char *slug;
@@ -4395,7 +4530,8 @@ void test_soak_sessions() {
 void test_batched_prefill() {
     const std::vector<std::string> batched = {"llama-gqa", "qwen3-qknorm", "qwen2-bias",
                                               "gemma2", "bloom", "cohere2", "jais",
-                                              "gpt2", "starcoder", "falcon", "mpt", "olmo"};
+                                              "gpt2", "starcoder", "falcon", "mpt", "olmo",
+                                              "granite"};
     for (const std::string &slug : batched) {
         const std::string model = "tests/fixtures/" + slug + "-shape.gguf";
         auto run = [&](bool use_batch) {
@@ -4520,6 +4656,7 @@ int main(int argc, char **argv) {
     maybe_run("mistral3_block", test_mistral3_block);
     maybe_run("mrope_families", test_mrope_families);
     maybe_run("metadata_array_forms", test_metadata_array_forms);
+    maybe_run("unmodelled_structures", test_unmodelled_structures);
     maybe_run("recurrent_families", test_recurrent_families);
     maybe_run("chat_template_rendering", test_chat_template_rendering);
     maybe_run("chat_template_constructs", test_chat_template_constructs);

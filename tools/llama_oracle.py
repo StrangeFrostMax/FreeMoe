@@ -171,14 +171,35 @@ def load_model(path: Path) -> dict[str, Any]:
         # (command-r, chameleon), and an optional bias on the same layout.
         "qk_norm_matrix": (has("attn_q_norm.weight") and
                            len(tensors[blk("attn_q_norm.weight")][0]) == 2),
+        # A one-dimensional scale as wide as the whole q projection is olmoe's
+        # whole-vector norm; one head's worth is qwen3's per-head norm.
+        "qk_norm_whole_vector": (has("attn_q_norm.weight") and
+                                 len(tensors[blk("attn_q_norm.weight")][0]) == 1 and
+                                 int(tensors[blk("attn_q_norm.weight")][0][0]) ==
+                                 int(key("attention.head_count")) * hd),
         # The norm's *mode* is not in the file: metadata says a tensor of
         # head_dim entries exists and nothing else. Same three facts the engine
         # reads from the architecture, quoted from llama.cpp's model files.
         "qk_norm_layernorm": arch == "command-r",
+        # olmo2 has post-norms and no pre-norms: both branch inputs are raw.
+        "no_branch_norms": (not has("attn_norm.weight") and has("attn_post_norm.weight")
+                            and has("ffn_post_norm.weight")),
+        # granite scales each branch output by `residual_scale` before the add.
+        "residual_scale_applied": arch in ("granite", "granitemoe") and
+                                  float(key("residual_scale", 0.0)) != 0.0,
+        "residual_scale": float(key("residual_scale", 0.0)),
+        # granite may override the softmax scale outright.
+        "attention_scale": (float(key("attention.scale", 0.0))
+                            if arch in ("granite", "granitemoe") else 0.0),
+        # granite divides the logits by `logit_scale` after the head.
+        "logit_scale_inverse": ((arch in ("granite", "granitemoe")) and
+                                float(key("logit_scale", 0.0)) != 0.0),
+        "logit_scale_inverse_value": float(key("logit_scale", 0.0)),
         "qk_norm_after_rope": arch == "talkie",
         "qk_norm_eps": None,  # None -> the file's own epsilon
         # A block that normalises without scaling carries no norm tensor at all.
-        "weightless_norm": not has("attn_norm.weight"),
+        "weightless_norm": (not has("attn_norm.weight") and
+                            not (has("attn_post_norm.weight") and has("ffn_post_norm.weight"))),
         # `*.logit_scale` is applied only where the graph applies it: command-r
         # multiplies the logits, granite records the key and never uses it.
         "logit_scale": (key("logit_scale", 0.0) if arch == "command-r" else 0.0),
@@ -887,7 +908,8 @@ class Session:
 
         for layer in range(cfg["L"]):
             p = f"blk.{layer}."
-            h = norm_of(x, p + "attn_norm")
+            # olmo2 has no pre-norms: the branch inputs are the residual stream.
+            h = list(x) if cfg["no_branch_norms"] else norm_of(x, p + "attn_norm")
             # falcon-40b normalises the attention input a second time; the FFN
             # and the residual keep reading `attn_norm`.
             attn_h = (norm_of(x, p + "attn_norm_2") if (cfg["attn_norm_2"] and
@@ -976,6 +998,14 @@ class Session:
                         q = [q[i] + bq[i] for i in range(H)]
                         k = [k[i] + bk[i] for i in range(kv_dim)]
                         v = [v[i] + bv[i] for i in range(kv_dim)]
+                def qk_whole_norm(vec: list[float], prefix: str) -> list[float]:
+                    """olmoe: one RMS over the concatenated heads, one wide scale."""
+                    w = self.tensor(prefix + ".weight")
+                    eps = cfg["qk_norm_eps"] or cfg["eps"]
+                    mean_sq = sum(v * v for v in vec) / len(vec)
+                    s = 1.0 / math.sqrt(mean_sq + eps)
+                    return [vec[i] * s * w[i] for i in range(len(vec))]
+
                 def qk_head_norm(vec: list[float], n_heads: int, prefix: str) -> list[float]:
                     """Per-head normalisation: shared or per-head row, RMS or LN."""
                     weight = self.tensor(prefix + ".weight")
@@ -993,8 +1023,12 @@ class Session:
 
                 if not cfg["mla"]:
                     if cfg["qk_norm"] and not cfg["qk_norm_after_rope"]:
-                        q = qk_head_norm(q, heads, p + "attn_q_norm")
-                        k = qk_head_norm(k, kv_heads, p + "attn_k_norm")
+                        if cfg["qk_norm_whole_vector"]:
+                            q = qk_whole_norm(q, p + "attn_q_norm")
+                            k = qk_whole_norm(k, p + "attn_k_norm")
+                        else:
+                            q = qk_head_norm(q, heads, p + "attn_q_norm")
+                            k = qk_head_norm(k, kv_heads, p + "attn_k_norm")
                     step = cfg["no_rope_step"]
                     # jamba rotates nothing at all: upstream's attention layer
                     # never calls the rope.
@@ -1030,7 +1064,8 @@ class Session:
                     slopes = [m0 ** (h + 1) if h < log2_heads
                               else m1 ** (2 * (h - log2_heads) + 1) for h in range(heads)]
                 attention = [0.0] * (heads * head_v)
-                scale = 1.0 / math.sqrt(hd)
+                scale = (cfg["attention_scale"] if cfg["attention_scale"] > 0.0
+                         else 1.0 / math.sqrt(hd))
                 for head in range(heads):
                     qb = head * hd
                     kvb = (head // group) * hd
@@ -1082,13 +1117,18 @@ class Session:
                 if cfg["post_norms"]:
                     attn_out = rmsnorm(attn_out, self.tensor(p + "attn_post_norm.weight"),
                                        cfg["eps"], cfg["norm_add_one"])
+                if cfg["residual_scale_applied"]:
+                    rs = cfg["residual_scale"]
+                    attn_out = [v * rs for v in attn_out]
                 x = [x[i] + attn_out[i] for i in range(H)]
 
                 if TRACE is not None:
                     TRACE[f"attn_out.L{layer}"] = list(attn_out)
                     TRACE[f"xpost.L{layer}"] = list(x)
-                h = attn_normed if cfg["parallel_residual"] else norm_of(
-                    x, p + ("attn_post_norm" if cfg["ffn_norm_is_post"] else "ffn_norm"))
+                h = (attn_normed if cfg["parallel_residual"]
+                     else list(x) if cfg["no_branch_norms"]
+                     else norm_of(x, p + ("attn_post_norm" if cfg["ffn_norm_is_post"]
+                                          else "ffn_norm")))
                 if cfg["ffn_norm_ada"]:
                     # mistral3's adaptive RMSNorm: h *= 1 + up(gelu_erf(down · t)),
                     # with t the sinusoidal embedding of the configured delay -- a
@@ -1220,6 +1260,9 @@ class Session:
             if cfg["post_norms"]:
                 down = rmsnorm(down, self.tensor(p + "ffn_post_norm.weight"),
                                cfg["eps"], cfg["norm_add_one"])
+            if cfg["residual_scale_applied"]:
+                rs = cfg["residual_scale"]
+                down = [v * rs for v in down]
             if TRACE is not None:
                 TRACE[f"ffn.L{layer}"] = list(down)
             x = [x[i] + down[i] for i in range(H)]
@@ -1235,6 +1278,9 @@ class Session:
             logits = [logits[i] + bias[i] for i in range(cfg["V"])]
         if cfg["logit_scale"]:
             logits = [v * cfg["logit_scale"] for v in logits]
+        if cfg["logit_scale_inverse"]:
+            inv = 1.0 / cfg["logit_scale_inverse_value"]
+            logits = [v * inv for v in logits]
         if cfg["final_softcap"] > 0.0:
             cap = cfg["final_softcap"]
             logits = [cap * math.tanh(v / cap) for v in logits]

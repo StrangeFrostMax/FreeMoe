@@ -119,7 +119,7 @@ def arch_tensors(spec: dict[str, Any]) -> list[TensorSpec]:
         p = f"blk.{layer}."
         # olmo and talkie call upstream's build_norm(x, NULL, NULL, ...): the file
         # carries no scale for any norm, so none is written here either.
-        if not weightless:
+        if not weightless and not spec.get("no_branch_norms"):
             out += [tensor(p + "attn_norm.weight", [h], 0.0, norm=True)]
         # A hybrid stack (jamba) interleaves the two block kinds, so the mask
         # decides what this layer carries. A pure file leaves it unset and every
@@ -230,7 +230,15 @@ def arch_tensors(spec: dict[str, Any]) -> list[TensorSpec]:
             # (and the scale itself) would be untestable.
             def qk_values(count: int, slot: int) -> list[float]:
                 return [1.0 + 0.2 * (((i + slot) % 5) - 2) for i in range(count)]
-            if spec.get("qk_norm_matrix"):
+            if spec.get("qk_norm_whole_vector"):
+                # olmoe: one scale as wide as the whole projection.
+                out += [
+                    tensor(p + "attn_q_norm.weight", [heads * hd], 0.0,
+                           values=qk_values(heads * hd, layer)),
+                    tensor(p + "attn_k_norm.weight", [kv_heads * hd], 0.0,
+                           values=qk_values(kv_heads * hd, layer + 1)),
+                ]
+            elif spec.get("qk_norm_matrix"):
                 # command-r: one row per head, first axis fastest.
                 out += [
                     tensor(p + "attn_q_norm.weight", [hd, heads], 0.0,
@@ -266,7 +274,13 @@ def arch_tensors(spec: dict[str, Any]) -> list[TensorSpec]:
                 tensor(p + "ffn_norm_ada_down.weight", [h, ada_width], 0.20),
                 tensor(p + "ffn_norm_ada_up.weight", [ada_width, h], 0.20),
             ]
-        if spec.get("ffn_norm_from_post"):
+        if spec.get("no_branch_norms"):
+            # olmo2: post-norms on both branches, no pre-norm tensors at all.
+            out += [
+                tensor(p + "attn_post_norm.weight", [h], 0.0, norm=True),
+                tensor(p + "ffn_post_norm.weight", [h], 0.0, norm=True),
+            ]
+        elif spec.get("ffn_norm_from_post"):
             # gpt-oss normalises after the attention residual and calls that
             # tensor attn_post_norm; there is no ffn_norm of its own.
             out += [tensor(p + "attn_post_norm.weight", [h], 0.0, norm=True)]
@@ -460,6 +474,8 @@ def arch_metadata(spec: dict[str, Any]) -> dict[str, tuple[Any, ...]]:
         md[f"{arch}.residual_scale"] = ("f32", spec["residual_scale"])
     if spec.get("logit_scale") is not None:
         md[f"{arch}.logit_scale"] = ("f32", spec["logit_scale"])
+    if spec.get("attention_scale") is not None:
+        md[f"{arch}.attention.scale"] = ("f32", spec["attention_scale"])
     if spec.get("rope_scaling"):
         # Exactly the keys llama.cpp reads; the values are what a YaRN-extended
         # checkpoint actually carries (see e.g. DeepSeek-V2-Lite's config).
@@ -733,6 +749,56 @@ SPECS: list[dict[str, Any]] = [
         "logit_bias": True,
         "experts": 4,
         "expert_top_k": 2,
+    },
+    {
+        # olmo2 (llama.cpp src/models/olmo2.cpp): no pre-norms at all - attention
+        # and the feed-forward read the residual stream - and a post-norm on each
+        # branch output. q and k are normalised as one vector, each with a scale as
+        # wide as its projection.
+        "slug": "olmo2",
+        "arch": "olmo2",
+        "name": "FreeMoe synthetic olmo2 with post-norms and no pre-norms",
+        "no_branch_norms": True,
+        "qk_norm": True,
+        "qk_norm_whole_vector": True,
+    },
+    {
+        # olmoe (llama.cpp src/models/olmoe.cpp): an ordinary pre-norm block with
+        # routed experts and the same whole-vector q/k norm.
+        "slug": "olmoe",
+        "arch": "olmoe",
+        "name": "FreeMoe synthetic olmoe with whole-vector q/k norms",
+        "qk_norm": True,
+        "qk_norm_whole_vector": True,
+        "experts": 4,
+        "expert_top_k": 2,
+    },
+    {
+        # granite (llama.cpp src/models/granite.cpp): each branch output is
+        # multiplied by `*.residual_scale` before the residual add, the logits are
+        # divided by `*.logit_scale` after the head, and the attention output
+        # carries a bias.
+        "slug": "granite",
+        "arch": "granite",
+        "name": "FreeMoe synthetic granite with scaled residuals",
+        "attn_output_bias": True,
+        "residual_scale": 0.5,
+        "logit_scale": 8.0,
+        "attention_scale": 0.07,
+    },
+    {
+        # granitemoe: upstream declares `using graph = llama_model_granite::graph`,
+        # so the block is granite's with routed experts and a shared expert.
+        "slug": "granitemoe",
+        "arch": "granitemoe",
+        "name": "FreeMoe synthetic granitemoe: granite's block with routed experts",
+        "attn_output_bias": True,
+        "residual_scale": 0.5,
+        "logit_scale": 8.0,
+        "attention_scale": 0.07,
+        "experts": 4,
+        "expert_top_k": 2,
+        "shared_expert": True,
     },
     {
         # bloom (llama.cpp src/models/bloom.cpp): bias-carrying LayerNorm on the
