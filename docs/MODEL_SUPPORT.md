@@ -38,6 +38,7 @@ each family, the tool records what a specific file contains.
 | `freemoe-tiny-v1` adapter: MHA, RoPE, SwiGLU, top-2 MoE, byte tokenizer | WORKS |
 | Standard llama-family adapter (llama.cpp keys and tensor names) | WORKS |
 | Grouped-query attention (`head_count_kv < head_count`), KV cache sized per kv head | WORKS |
+| Sliding-window cache: a windowed layer reserves and addresses a ring of `min(context, sliding_window)` positions instead of the whole context | WORKS (`sliding_window_cache`, 490-check `architecture_parity`) |
 | SentencePiece and BPE tokenizers, byte fallback, honest coverage report | WORKS |
 | Byte-level BPE with real merge resolution and four pre-tokenizer families (`gpt2`, `gpt2-digits`, `llama3`, `qwen2`) | WORKS — matches llama.cpp's own vectors on 6/6 vocabularies |
 | Other pre-tokenizer families (DeepSeek, Falcon, ChatGLM, Yi, …) | **MISSING**, refused by name; see "Tokenizer" below |
@@ -73,6 +74,7 @@ each family, the tool records what a specific file contains.
 | PrismML rotated weight basis (`prism.hadamard.*`) and Hadamard activation transform | **MISSING**, hard blocker |
 | Linear attention: gated delta-net (`qwen35`, `qwen3next`, `kimi-linear`) | **MISSING**, hard blocker (a different scan: per-head matrix state) |
 | Shared-expert MoE: the tensors are what the forward pass reads, so `expert_shared_count` itself is not gating — a file whose shared-expert tensors the block does not name is refused rather than dropped | WORKS for `qwen2moe`/`deepseek2` |
+| Expert tensor layout: stacked (`ffn_*_exps`, expert axis) or per expert (`ffn_gate.E.weight`); mixed or incomplete layers are refused | WORKS (fixture pair with one golden) |
 | Ternary block formats (`PTQ1_0`, `TQ1_0`, `TQ2_0`) | **MISSING** |
 | Vision towers (MiniCPM-V) | **MISSING**, and out of scope for a text engine |
 
@@ -417,12 +419,14 @@ activation, norm biases and FFN biases, and their fixtures pin the logits.
 1. ~~Standard metadata + tensor-name mapping (`llama` family).~~ **DONE**
 2. ~~BPE / SentencePiece tokenizer.~~ **DONE**
 3. ~~Grouped-query attention.~~ **DONE**
-4. **Standard MoE FFN** — stacked `ffn_*_exps` with `ffn_gate_inp` routing works
-   and runs a real checkpoint (#24). ~~`expert_shared_count`~~ **DONE** for
-   `qwen2moe`: the shared expert runs at its own width and is gated per token.
-   Still missing: layouts where a checkpoint narrows the routed experts below the
-   dense width on architectures other than `qwen2moe`, and the newer per-expert
-   splat naming.
+4. ~~**Standard MoE FFN**~~ — stacked `ffn_*_exps` with `ffn_gate_inp` routing
+   works and runs a real checkpoint (#24), and a per-expert layout
+   (`blk.N.ffn_gate.E.weight`) now loads and runs through the same expert
+   records, pinned by a fixture whose golden is identical to its stacked twin's.
+   ~~`expert_shared_count`~~ **DONE** for `qwen2moe`: the shared expert runs at
+   its own width and is gated per token. Still missing: layouts where a
+   checkpoint narrows the routed experts below the dense width on architectures
+   other than `qwen2moe`.
 5. **Q6_K / Q3_K / Q2_K / Q5_K AVX2 kernels** — correctness is already there via
    the scalar path; this is the throughput step.
 6. ~~Architecture variants: `gemma`, `phi3`, `qwen2`, `qwen3`, `glm4`,

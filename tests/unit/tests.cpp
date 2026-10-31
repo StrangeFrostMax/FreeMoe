@@ -309,6 +309,123 @@ void test_slot_state_machine() {
     CHECK(state == S::IO_QUEUED, "invalid transition leaves state unchanged");
 }
 
+// C3: a windowed layer can never read further back than its window, so the
+// cache reserves (and addresses) a ring of `sliding_window` positions instead of
+// the whole context. The two must agree: the budget's number is the address's
+// modulus, and a model that reserved a ring but addressed a full cache would
+// read another layer's keys.
+void test_sliding_window_cache() {
+    const std::string path = "tests/fixtures/gemma2-shape.gguf";
+    const ModelManifest manifest = build_manifest(parse_gguf_file(path), path);
+    const ModelConfig &cfg = manifest.config;
+    CHECK(cfg.sliding_window > 0, "the gemma2 fixture really is windowed");
+    CHECK(cfg.sliding_window < cfg.context, "and its window is smaller than the context");
+    // Every layer in this fixture is windowed, so each keeps one window.
+    for (uint32_t l = 0; l < cfg.layers; ++l) {
+        CHECK(cfg.layer_uses_window(l), "every layer of the fixture uses the window");
+        CHECK(cfg.cache_positions(l, cfg.context) == cfg.sliding_window,
+              "a windowed layer keeps one window of positions, not the context");
+    }
+    const uint64_t ring = cfg.cache_positions(0, cfg.context);
+    const uint64_t full = static_cast<uint64_t>(cfg.layers) * cfg.context * cfg.cache_stride();
+    CHECK(cfg.attention_cache_floats(cfg.context) ==
+              static_cast<uint64_t>(cfg.layers) * ring * cfg.cache_stride(),
+          "the cache reservation is one ring per layer");
+    CHECK(cfg.attention_cache_floats(cfg.context) < full,
+          "the ring reserves strictly less than a full-context cache");
+    CHECK(cfg.max_batch_positions(cfg.context) == ring,
+          "the batch limit is the smallest ring in the model");
+
+    // Regions do not overlap, and the address wraps inside one layer's region.
+    CHECK(cfg.attention_cache_offset(1, cfg.context) == ring * cfg.cache_stride(),
+          "layer 1's region starts after layer 0's ring and nothing more");
+    CHECK(cfg.cache_index(0, ring, cfg.context) == cfg.cache_index(0, 0, cfg.context),
+          "position `capacity` lands on the same slot as position 0");
+    CHECK(cfg.cache_index(0, ring + 1, cfg.context) == cfg.cache_index(0, 1, cfg.context),
+          "the wrap is a modulus of the capacity, not of the context");
+    // The budget follows the ring, so the reservation the engine allocates and
+    // the addresses it computes come from one number.
+    {
+        BudgetConfig budget;
+        budget.total_hot_bytes = 64ull * 1024 * 1024;
+        DeviceInfo device;
+        device.memory_type = "host";
+        const BudgetResult result = compute_budget(manifest, budget, device);
+        CHECK(result.kv_bytes == cfg.attention_cache_floats(cfg.context) * sizeof(float),
+              "the budget reserves exactly the ring the engine addresses");
+        CHECK(result.kv_bytes < full * sizeof(float),
+              "a windowed model no longer pays for context it cannot read");
+    }
+    // Both attention paths must agree on a windowed model whose prompt is longer
+    // than the window (eight tokens through a four-position ring). The batched
+    // path writes a row and attends to it before the next write, which is what
+    // keeps the ring from evicting history it still has to read; the sequential
+    // path never had that hazard. Equal output is the check that both agree.
+    {
+        auto run = [&](bool batched) {
+            RunConfig config;
+            config.model_path = path;
+            config.trace_path = "";
+            config.budget.total_hot_bytes = 64ull * 1024 * 1024;
+            config.backend.batched_prefill = batched;
+            Engine engine(config);
+            engine.initialize();
+            PromptResult result = engine.run_prompt("the cat", 8);
+            engine.release_runtime();
+            return result;
+        };
+        const PromptResult batched = run(true);
+        const PromptResult sequential = run(false);
+        CHECK(!batched.generated_ids.empty(), "the batched path generated tokens");
+        CHECK(batched.generated_ids == sequential.generated_ids,
+              "batched and sequential prefill agree on a prompt longer than the window");
+        CHECK(batched.prefill_logits.size() == sequential.prefill_logits.size(),
+              "both paths produced one logit per vocabulary entry");
+        double worst = 0.0;
+        for (size_t i = 0; i < batched.prefill_logits.size() &&
+                           i < sequential.prefill_logits.size(); ++i)
+            worst = std::max(worst, std::fabs(static_cast<double>(batched.prefill_logits[i]) -
+                                              static_cast<double>(sequential.prefill_logits[i])));
+        CHECK(worst <= 1e-5, "and the same prefill logits (worst " + std::to_string(worst) + ")");
+    }
+    // A zero context would make the ring's modulus zero. The adapter refuses the
+    // file instead of dividing by it.
+    {
+        GGUFDocument doc = parse_gguf_file(path);
+        MetadataValue zero;
+        zero.type = GGUFValueType::UINT32;
+        zero.u = 0;
+        doc.metadata["gemma2.context_length"] = zero;
+        CHECK(throws_code(ErrorCode::SHAPE_MISMATCH,
+                          [&]() { (void)build_manifest(doc, path); }),
+              "a zero context length is refused rather than used as a modulus");
+    }
+    // A model with a per-layer pattern keeps the full cache on its full-attention
+    // layers: the ring is per layer, not per model.
+    {
+        const std::string swa = "tests/fixtures/gpt-oss-shape.gguf";
+        const ModelManifest mixed = build_manifest(parse_gguf_file(swa), swa);
+        const ModelConfig &m = mixed.config;
+        bool saw_full = false;
+        bool saw_windowed = false;
+        uint64_t expected = 0;
+        for (uint32_t l = 0; l < m.layers; ++l) {
+            const uint64_t positions = m.cache_positions(l, m.context);
+            if (!m.layer_uses_window(l)) {
+                saw_full = true;
+                CHECK(positions == m.context, "a full-attention layer still keeps the context");
+            } else {
+                saw_windowed = true;
+                CHECK(positions == m.sliding_window, "a windowed layer keeps its window");
+            }
+            expected += positions * m.cache_stride();
+        }
+        CHECK(saw_full && saw_windowed, "the fixture mixes windowed and full layers");
+        CHECK(m.attention_cache_floats(m.context) == expected,
+              "the mixed reservation is the sum of each layer's own capacity");
+    }
+}
+
 void test_budget_calculator() {
     auto manifest = manifest_from_path("tests/fixtures/moe-fm.gguf");
     BackendConfig backend_config;
@@ -3032,6 +3149,125 @@ void test_attention_sinks() {
           "the probe reports attention sinks");
 }
 
+// C8: a per-expert layout stores one tensor per (layer, expert, projection)
+// instead of one stacked tensor per (layer, projection). The numbers are the
+// same, so the engine must produce the same logits — and it must do so without
+// looking up a stacked tensor name, because a per-expert file has none.
+void test_per_expert_layout() {
+    const std::string path = "tests/fixtures/qwen3moe-per-expert-shape.gguf";
+    const ModelManifest manifest = build_manifest(parse_gguf_file(path), path);
+    const ModelConfig &cfg = manifest.config;
+    CHECK(cfg.architecture == "qwen3moe", "the per-expert fixture is a qwen3moe file");
+    CHECK(cfg.expert_count == 4, "four routed experts");
+    CHECK(cfg.any_per_expert_layout(), "the per-expert layout is detected");
+    CHECK(cfg.expert_layout == "per-expert-f32", "the layout is named in the config");
+    for (uint32_t l = 0; l < cfg.layers; ++l)
+        CHECK(cfg.layer_is_per_expert(l), "every routed layer of the fixture is per-expert");
+
+    // The names carry the expert index, and they map to the same roles a stacked
+    // slice has, so nothing downstream has to branch on the layout.
+    CHECK(manifest.tensor("blk.0.ffn_gate_exps.weight") == nullptr,
+          "a per-expert file carries no stacked expert tensor");
+    const TensorInfo *member = manifest.tensor("blk.1.ffn_up.2.weight");
+    CHECK(member != nullptr, "the per-expert tensor is mapped by the adapter");
+    if (member) {
+        CHECK(member->role == TensorRole::FFN_UP_EXPS, "it takes the stacked slice's role");
+        CHECK(member->layer == 1, "the layer comes from the name");
+        CHECK(member->expert_tensor, "it is counted as expert bytes, not fixed weights");
+    }
+    CHECK(!manifest.tensor("blk.0.attn_q.weight")->expert_tensor,
+          "a dense tensor is not mistaken for an expert tensor");
+
+    // One record per (layer, expert): three whole tensors, each with its own
+    // offset, length and stored type. Nothing is divided by an expert count,
+    // because there is no expert axis left to divide.
+    CHECK(manifest.experts.size() == static_cast<size_t>(cfg.layers) * cfg.expert_count,
+          "one expert record per layer and expert");
+    const ExpertRecord *rec = manifest.expert(1, 3);
+    CHECK(rec != nullptr, "the last expert of the last layer has a record");
+    if (rec) {
+        uint64_t sum = 0;
+        for (const ExpertExtent &e : rec->extents) sum += e.bytes;
+        CHECK(rec->payload_bytes == sum, "the payload is the sum of the three extents");
+        CHECK(rec->extents[0].role == TensorRole::FFN_GATE_EXPS &&
+                  rec->extents[1].role == TensorRole::FFN_UP_EXPS &&
+                  rec->extents[2].role == TensorRole::FFN_DOWN_EXPS,
+              "the extents keep the projection order the reader concatenates");
+        CHECK(rec->extents[0].offset != rec->extents[1].offset &&
+                  rec->extents[1].offset != rec->extents[2].offset,
+              "each extent points at its own tensor");
+        CHECK(rec->extents[0].type_id == 0 && rec->extents[1].type_id == 0 &&
+                  rec->extents[2].type_id == 0,
+              "the F32 type travels with the extent rather than a tensor lookup");
+        CHECK(rec->extents[0].bytes == 32ull * 64ull * 4ull,
+              "the gate extent is the whole [hidden, width] tensor");
+        CHECK(rec->payload_bytes == 3ull * 32ull * 64ull * 4ull,
+              "the payload is three whole tensors, not three slices of one");
+    }
+    CHECK(manifest.slot_bytes == 3ull * 32ull * 64ull * 4ull,
+          "one slot holds one expert's three projections");
+    CHECK(manifest.expert_tensor_bytes ==
+              static_cast<uint64_t>(cfg.layers) * cfg.expert_count * manifest.slot_bytes,
+          "every expert tensor is accounted for as expert bytes");
+
+    // A file that carries both spellings on one layer is ambiguous: the numbers
+    // would differ depending on which one ran, so it is refused rather than
+    // guessed.
+    {
+        GGUFDocument doc = parse_gguf_file(path);
+        doc.tensor_by_name["blk.0.ffn_gate_exps.weight"] = 0;
+        CHECK(throws_code(ErrorCode::METADATA_MISMATCH,
+                          [&]() { (void)build_manifest(doc, path); }),
+              "stacked and per-expert tensors on one layer are refused");
+    }
+    // A per-expert layer missing one expert's projection would run with an
+    // expert that has no weights; the expected set catches it.
+    {
+        GGUFDocument doc = parse_gguf_file(path);
+        doc.tensor_by_name.erase("blk.0.ffn_up.2.weight");
+        CHECK(throws_code(ErrorCode::MISSING_REQUIRED_TENSOR,
+                          [&]() { (void)build_manifest(doc, path); }),
+              "a missing per-expert projection is refused");
+    }
+
+    // End to end: the fixture is the same model as `qwen3moe` stored the other
+    // way, so it must reproduce that model's golden, not merely produce logits.
+    ArchGolden golden = read_arch_golden("tests/golden/qwen3moe_reference.txt");
+    RunConfig config;
+    config.model_path = path;
+    config.trace_path = "";
+    config.budget.total_hot_bytes = 64ull * 1024 * 1024;
+    Engine engine(config);
+    engine.initialize();
+    PromptResult result = engine.run_prompt(golden.prompt, 8);
+    CHECK(result.input_ids == golden.input_ids, "prompt tokenization matches the reference");
+    CHECK(result.prefill_logits.size() == golden.logits.size(),
+          "prefill produced one logit per vocabulary entry");
+    if (result.prefill_logits.size() == golden.logits.size()) {
+        double magnitude = 0.0;
+        for (float v : golden.logits) magnitude = std::max(magnitude, std::fabs(static_cast<double>(v)));
+        double worst = 0.0;
+        for (size_t i = 0; i < golden.logits.size(); ++i)
+            worst = std::max(worst, std::fabs(static_cast<double>(result.prefill_logits[i]) -
+                                              static_cast<double>(golden.logits[i])));
+        CHECK(worst <= 1e-4 + 1e-4 * magnitude,
+              "per-expert logits match the stacked model's reference (worst " +
+                  std::to_string(worst) + ")");
+    }
+    CHECK(result.generated_ids == golden.greedy,
+          "greedy decoding matches the stacked model's reference");
+    // The tag says which layout ran, so a reader does not have to inspect bytes.
+    CHECK(engine.manifest().config.expert_layout == "per-expert-f32",
+          "the engine reports the layout it loaded");
+    engine.release_runtime();
+
+    const std::string probe = probe_model(parse_gguf_file(path), path).dump();
+    CHECK(probe.find("moe=per-expert") != std::string::npos,
+          "the adapter tag names the per-expert layout");
+    CHECK(probe.find("moe=stacked") == std::string::npos,
+          "and does not also claim the stacked one");
+}
+
 void test_architecture_parity() {
     const std::vector<std::string> slugs = {"llama-gqa", "qwen2-bias", "qwen3-qknorm", "gemma",
                                            "gemma2", "phi3-fused", "minicpm", "qwen3moe",
@@ -4724,6 +4960,7 @@ int main(int argc, char **argv) {
     maybe_run("gguf_parser_and_golden", test_gguf_parser_and_golden);
     maybe_run("malformed_fixtures", test_malformed_fixtures);
     maybe_run("slot_state_machine", test_slot_state_machine);
+    maybe_run("sliding_window_cache", test_sliding_window_cache);
     maybe_run("budget_calculator", test_budget_calculator);
     maybe_run("io_scheduler_and_readers", test_io_scheduler_and_readers);
     maybe_run("backends_and_gpu_placeholder", test_backends_and_gpu_placeholder);
@@ -4741,6 +4978,7 @@ int main(int argc, char **argv) {
     maybe_run("residency_manager", test_residency_manager);
     maybe_run("dense_cpu_reference_and_operation_log", test_dense_cpu_reference_and_operation_log);
     maybe_run("moe_readers_and_cache_sizes", test_moe_readers_and_cache_sizes);
+    maybe_run("per_expert_layout", test_per_expert_layout);
     maybe_run("traces_and_replay_inputs", test_traces_and_replay_inputs);
     maybe_run("vnpu_reference_backend", test_vnpu_reference_backend);
     maybe_run("tokenizer_real_vocabularies", test_tokenizer_real_vocabularies);

@@ -118,7 +118,7 @@ not "some code exists".
 | 0 — repo / dependency audit | clean build on the declared target | **MET** | `make -j2`, `docs/PHASE0_EXIT.md`, `scripts/collect_evidence.py`. |
 | 1 — GGUF inspection + dense CPU correctness | malformed models fail safely, tensor roles validate, output matches reference | **MET** | 1338 checks, 30 fixtures in `tests/malformed_models/`, 17-architecture parity against an independent oracle (`tools/llama_oracle.py`). |
 | 2 — dense GPU baseline | no silent fallback, stable output, bounded allocations | **NOT MET** | `src/backend.cpp:545` is a placeholder raising `GPU_BACKEND_UNIMPLEMENTED`; no CUDA/Vulkan/HIP code exists. It refuses rather than faking it — correct, but the phase is open and every VRAM gate with it. |
-| 3 — one MoE family, resident experts | selected experts never dropped, routing matches reference | **MET for stacked-expert MoE** | `ResidencyManager::assert_selected_executed` (`src/residency.cpp:785`) is called after every MoE layer (`src/engine.cpp:1070`) and fails if a selected expert never ran; `qwen2moe`, `qwen3moe`, `deepseek2` parity; 0 routing mismatches in the benchmark report. **Not** met for per-expert tensor layouts (C8). |
+| 3 — one MoE family, resident experts | selected experts never dropped, routing matches reference | **MET for stacked and per-expert MoE** | `ResidencyManager::assert_selected_executed` (`src/residency.cpp:785`) is called after every MoE layer (`src/engine.cpp:1070`) and fails if a selected expert never ran; `qwen2moe`, `qwen3moe`, `deepseek2` parity; 0 routing mismatches in the benchmark report. Per-expert tensor layouts load and run through the same records (C8). |
 | 4 — VRAM expert slot pool | stress tests with forced eviction, no stale reads | **MET in host RAM, structurally blocked in VRAM** | Slot state machine with generation ids and publish-after-fence (`src/residency.cpp:59–77`), LRU + clock (`src/residency.cpp:385`), checksum verification, stale-completion rejection. All tested. The pool lives in host memory because Phase 2 is unstarted, so the *VRAM* half of the gate cannot be met. |
 | 5 — trace + cache policy | policy beats LRU/clock on decode p95 across repeat runs | **PARTIAL** | Trace events (`RoutingEvent`, `--trace`), both baselines implemented, repeat harness exists — but the committed config runs one slot, so **no replacement happens and no policy can be compared**. The gate needs an eviction-exercising config (`CACHE_SLOTS` < working set). |
 | 6 — NVMe-backed expert delivery | cold-cache correctness, bounded queues, meets target | **PARTIAL** | `pread` / `mmap` / `O_DIRECT` readers (`src/io.cpp:167`), extent coalescing (`coalesce_extents`, `src/io.cpp:46`), prefetch issue/poll/cancel. No cold/warm suite, no working-set instrumentation, and the only measured run is buffered with one slot. |
@@ -140,7 +140,7 @@ non-synthetic model.
 
 | Spec § | Requirement | Gap |
 | --- | --- | --- |
-| §7.2 / §7.3 | stacked **and** per-expert tensor layouts | **Stacked only** (`ffn_*_exps` + `ffn_gate_inp`). Per-expert `ffn_gate.E.weight` naming is refused. |
+| §7.2 / §7.3 | stacked **and** per-expert tensor layouts | **Both.** Stacked (`ffn_*_exps` + `ffn_gate_inp`) and per-expert (`ffn_gate.E.weight`) are accepted per layer; a layer carrying both is refused as ambiguous. |
 | §9.2 | direct I/O usable, fallback explicit | `O_DIRECT` opened on request; alignment handled; buffered-vs-direct never measured on this machine. |
 | §10.2 | prefill measured separately, with per-layer unique-expert counts and cache hit rate during prefill | Metrics exist, but prefill is **token-serial** (`src/engine.cpp:1146`), so prefill expert working set is indistinguishable from decode and the §10.2 prefill rows are uninformative rather than wrong. |
 | §10.3 | prefetch policy comparable | Prefetch implemented; no policy comparison run. |
@@ -272,8 +272,9 @@ test against a real vocabulary.
 
 > **FIXED.** `Engine::prefill_batch` evaluates the whole prompt in one
 > layer-major pass: each projection becomes a `gemm_quant` call over all prompt
-> rows (`include/fm/kernels.hpp`), the KV cache is filled for the batch before
-> attention runs, and logits are computed for the last row only. `run_prompt`
+> rows (`include/fm/kernels.hpp`), each row's key/value is written and attended
+> to before the next row is written (order matters for C3's ring, see below),
+> and logits are computed for the last row only. `run_prompt`
 > takes that path whenever `supports_batched_prefill()` accepts the block, and
 > `--prefill sequential` (`BackendConfig::batched_prefill = false`) keeps the
 > token-at-a-time path for comparison. Both paths are pinned against each other
@@ -294,12 +295,46 @@ test against a real vocabulary.
 > Correct, but it cost N forward passes instead of one GEMM-heavy pass, and it
 > made the §10.2 prefill metrics meaningless (see §A).
 
-### C3. Sliding-window models reserve and keep the full cache
+### C3. ~~Sliding-window models reserve and keep the full cache~~ — **FIXED**
 
-`kv_bytes = layers * context * (kv_dim + v_dim) * 4` (`src/residency.cpp:179`)
-ignores `sliding_window`. The mask is applied correctly per head
-(`first_visible`, `src/engine.cpp:834`), so results are right, but a gemma-2/3 or
-cohere2 checkpoint pays for full-context KV it can never read. No ring buffer.
+> **FIXED.** A windowed layer now reserves and addresses a ring of
+> `min(context, sliding_window)` positions instead of the whole context, from one
+> helper (`ModelConfig::cache_positions`, `cache_index`,
+> `attention_cache_floats` in `include/fm/gguf.hpp`). `compute_budget`
+> (`src/residency.cpp`) multiplies that function by `sizeof(float)`, so the
+> reservation and the address cannot drift apart. Full-attention layers keep the
+> context, so a per-layer pattern (gpt-oss style) pays the window only where the
+> window is used.
+>
+> Both attention paths use the ring. The batched prefill pass used to write the
+> whole batch before reading it; on a 4-position ring that evicted history the
+> same pass still had to attend to, and `architecture_parity` caught it
+> (`gemma2` greedy diverged at the second generated token). The pass now writes
+> each row's key/value and attends to it before moving on, so batch length no
+> longer interacts with ring size.
+>
+> Verified here: `architecture_parity` 490/490, full suite 3722/3722,
+> `./build/freemoe run --model tests/fixtures/gemma2-shape.gguf --prompt "the cat"
+> --tokens 8` → `[57,108,224,195,139,162,191,191]`, the golden line.
+> `sliding_window_cache` (25 checks) pins the arithmetic: reservation is one ring
+> per windowed layer, `cache_index(layer, capacity) == cache_index(layer, 0)`,
+> layer regions do not overlap, the budget equals the reservation, and the mixed
+> pattern keeps context on full-attention layers. Mutations (each rebuilt,
+> each red): capacity ignoring the window → 6 failures; address using the
+> position instead of the ring slot → the wrap checks fail; layer offset using
+> the context → the region check fails; batched write using linear addressing →
+> `architecture_parity` segfaults out of bounds; batched attention ignoring
+> `first_visible` → 2 `gemma2` parity failures; the zero-context refusal removed
+> → the modulus guard fails.
+>
+> Both paths are also pinned against each other on the windowed fixture with a
+> prompt longer than the window: `sliding_window_cache` runs `gemma2-shape` with
+> `batched_prefill` on and off and requires the same eight tokens and the same
+> prefill logits.
+>
+> Not verified: a real gemma-2/gemma-3 checkpoint — the fixtures carry the shape
+> and the metadata, not the weights — and the ring with anything other than an
+> F32 cache, because this build has no quantised kv cache to reserve.
 
 ### C4. ~~No RoPE scaling of any kind~~ — **FIXED; verified at `main`**
 
@@ -371,11 +406,43 @@ IQ4_XS** (the small-MoE quants that make big mixes fit), **MXFP4 / NVFP4**
 (gpt-oss, minimax), **I2_S** (bitnet). Each is refused with a typed error —
 correct behaviour, missing capability.
 
-### C8. Per-expert tensor layouts
+### C8. ~~Per-expert tensor layouts~~ — **FIXED**
 
-Upstream still writes `blk.N.ffn_gate.E.weight` for some converted files; this
-engine requires the stacked layout and fails otherwise. Recorded in
-`docs/MODEL_SUPPORT.md:330`.
+> **FIXED.** A routed layer may now store one tensor per (expert, projection)
+> — `blk.N.ffn_gate.E.weight`, `ffn_up.E.weight`, `ffn_down.E.weight` — as an
+> alternative to one stacked tensor per (layer, projection). The layout is
+> decided per layer from the tensor names; a layer carrying both spellings is
+> refused as ambiguous, a layer carrying only some of the three projections is
+> refused as incomplete, and a per-expert name on a layer that is not
+> per-expert is refused rather than ignored.
+>
+> The reader no longer looks a tensor name up at all. `ExpertExtent` now carries
+> the projection's stored type alongside its offset and length, so one expert
+> record describes a stacked slice and a whole per-expert tensor in exactly the
+> same way and `ResidencyManager` concatenates the three extents in role order
+> for both. That was the property missing before: the engine read gate/up byte
+> counts from the stacked tensor's name, which a per-expert file does not have.
+>
+> Verified here: `qwen3moe-per-expert` is the `qwen3moe` fixture with the same
+> weights stored per expert (the generator slices the stacked tensors, so the
+> two files hold identical numbers). Its oracle golden is identical to
+> `qwen3moe`'s apart from the fixture line, and the engine's prefill logits and
+> eight greedy tokens match that golden through the per-expert file.
+> `per_expert_layout` (31 checks) pins the record arithmetic: one record per
+> (layer, expert), payload = three whole tensors, distinct offsets, the type on
+> the extent, expert bytes excluded from fixed weights, both refusals, the probe
+> tag `moe=per-expert`, and the logits above. Mutations (each rebuilt, each
+> red): layout never detected → the file is refused as an unknown tensor;
+> stacked stride arithmetic applied to a whole tensor → payload and slot
+> assertions plus a reader length error; ambiguity refusal removed → the
+> mixed-layout case loads; expert tensors marked by the stacked name list only
+> → expert bytes charged as fixed weights; payload omitting the down projection
+> → four record assertions.
+>
+> Not verified: a real vendor per-expert checkpoint (the fixture is synthetic and
+> F32), a per-expert file with mixed quantisation types, and per-expert
+> projection **biases** — those stay stacked-only, and a file that carries them
+> with a per-expert layout fails closed on the unexpected name.
 
 ### C9. Activation and attention variants — **FIXED (all but SITU); verified at `main`**
 
@@ -514,7 +581,7 @@ fabricating a capability.
 | 7 | ~~**IQ1–IQ4 / MXFP4 decoders** (C7)~~ **done** | Unlocks quantised checkpoints of MoE families that are already supported | M |
 | 8 | ~~**GEGLU_ERF**~~ **done**; **SITU** (C9 remainder) | `gelu_erf` is reachable through `mistral3`; `SITU` is unimplemented upstream too (`GGML_ABORT`), so no file can be checked against it | S |
 | 9 | ~~**mamba/mamba2**~~ **done**; **gated delta-net** | The mamba scan, its state layout and the `dt_b_c_rms` norms now run with fixtures and goldens. Delta-net is a different scan (per-head matrix state) and is what `qwen35`, `qwen3next` and `kimi-linear` still need | L |
-| 10 | **Sampling** (C6), **SWA cache** (C3), **per-expert tensors** (C8), **deepseek41/clamp rule** (C5) | Completeness of things already claimed | S–M |
+| 10 | ~~**SWA cache** (C3)~~ **done**, ~~**per-expert tensors** (C8)~~ **done**; **deepseek41/clamp rule** (C5) | Completeness of things already claimed | S–M |
 | 11 | **GPU backend** (§A Phase 2) | Required for every VRAM gate; unstarted | XL |
 | 12 | **Serving layer**, speculative decoding, batching | Post-correctness | XL |
 

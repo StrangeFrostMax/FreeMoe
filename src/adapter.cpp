@@ -300,7 +300,10 @@ std::vector<std::string> adapter_config_tags(const ModelConfig &cfg) {
     if (cfg.fused_gate_up) tags.push_back("ffn=fused-gate-up");
     if (cfg.ffn_no_gate) tags.push_back("ffn=no-gate");
     if (cfg.expert_count) {
-        tags.push_back("moe=stacked");
+        // The tag names the storage layout, because it is what a reader has to
+        // know to find an expert's bytes: one stacked tensor with an expert axis,
+        // or one tensor per expert.
+        tags.push_back(cfg.any_per_expert_layout() ? "moe=per-expert" : "moe=stacked");
         // A hybrid can place its experts on one kind of layer only (jamba mixes
         // dense and MoE blocks), so the count of routed layers is a fact about
         // the file that a per-model tag would hide.
