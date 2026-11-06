@@ -3457,6 +3457,7 @@ void test_architecture_parity() {
                                            "bailingmoe", "bailingmoe2",
                                            "dbrx", "deepseek", "dots1", "ernie4-5-moe",
                                            "glm4-moe", "minimax-m2",
+                                           "exaone-moe", "flint", "hunyuan-moe", "maple",
                                            "baichuan", "chatglm"};
     for (const std::string &slug : slugs) {
         const std::string model = "tests/fixtures/" + slug + "-shape.gguf";

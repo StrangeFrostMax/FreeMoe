@@ -158,6 +158,13 @@ const std::map<std::string, ArchFacts> &known_architectures() {
         {"ernie4-5-moe", {true, false}},
         {"glm4-moe", {true, false}},
         {"minimax-m2", {true, false}},
+        // Slice C: per-layer rotary (file pattern, or the window pattern) with an
+        // optional per-layer base, per-layer expert widths, and hunyuan-moe's
+        // dense-plus-MoE layer.
+        {"exaone-moe", {true, false}},
+        {"flint", {true, false}},
+        {"hunyuan-moe", {true, false}},
+        {"maple", {true, false}},
         {"glm4moe", {false, true}},
         {"multimodal", {false, true}},
     };

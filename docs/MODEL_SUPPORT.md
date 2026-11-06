@@ -443,11 +443,17 @@ activation, norm biases and FFN biases, and their fixtures pin the logits.
    leads, interleaved MoE layers, sigmoid routing as glm4-moe's default, router
    selection biases, and the three families whose `norm_w` is a constant in the
    graph rather than a key.
+   ~~`exaone-moe`, `flint`, `maple`~~ **DONE** — the rotary is now decided per
+   layer: `attention.rope_pattern` when the file states it, the window pattern for
+   the families whose graph tests `is_swa(il)`, and a windowed layer may carry its
+   own base (`rope.freq_base_swa`) and its own expert width. ~~`hunyuan-moe`~~
+   **DONE** — a dense MLP read from the `*_shexp` tensors and summed with the
+   routed experts, with q/k normalised *after* the rotary.
    Still open: `minicpm3`, `olmo2` (its q/k norm is *not* per head, so it needs a
    second norm placement), `olmoe`/`mixtral` (MoE variants of the same block),
-   `flint`/`exaone-moe`/`maple` (per-layer rotary bases), `grovemoe`,
-   `hunyuan-moe`, `maion-coder` (each needs a block, not a flag), and the rest of
-   llama.cpp's `src/models/` tree.
+   `grovemoe` and `maion-coder` (a second expert bank with `expert_group_scale`;
+   a low-rank latent between router and experts), and the rest of llama.cpp's
+   `src/models/` tree.
    ~~MTP/`nextn` heads~~ **DONE** — a checkpoint's head is ignored in both of the
    places upstream puts it: the loader subtracts `*.nextn_predict_layers` from
    `block_count` (upstream's `n_layer_all`) and maps the head layers' ordinary

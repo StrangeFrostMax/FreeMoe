@@ -962,7 +962,8 @@ bool is_llama_family(const std::string &arch) {
         // `attn_post_norm` above) and uses LayerNorm; glm4-moe defaults to sigmoid
         // routing; ernie4-5-moe and minimax-m2 normalise the router weights as a
         // constant. Each of those is one rule below, not a new code path.
-        "dbrx", "deepseek", "dots1", "ernie4-5-moe", "glm4-moe", "minimax-m2",
+        "dbrx", "deepseek", "dots1", "ernie4-5-moe", "exaone-moe", "flint", "glm4-moe",
+        "hunyuan-moe", "maple", "minimax-m2",
         "granite",
         "granitemoe",
         "cohere2",
@@ -995,6 +996,26 @@ size_t trunk_entries(const MetadataValue &value, const ModelConfig &cfg, const s
                  " trunk layers" +
                  (cfg.mtp_layers ? " (+" + std::to_string(cfg.mtp_layers) + " MTP)" : ""));
     return trunk;
+}
+
+// A per-layer on/off entry. llama.cpp writes these patterns as a bool array in
+// some files and as 0/1 integers in others (`get_key_or_arr` reads either), so
+// both spellings mean the same thing here.
+bool entry_flag(const MetadataValue &v, const std::string &key) {
+    switch (v.type) {
+        case GGUFValueType::BOOL: return v.b;
+        case GGUFValueType::UINT8:
+        case GGUFValueType::UINT16:
+        case GGUFValueType::UINT32:
+        case GGUFValueType::UINT64: return v.u != 0;
+        case GGUFValueType::INT8:
+        case GGUFValueType::INT16:
+        case GGUFValueType::INT32:
+        case GGUFValueType::INT64: return v.i != 0;
+        default:
+            fail(ErrorCode::METADATA_MISMATCH, key + " entries must be bool or integer flags");
+    }
+    return false;
 }
 
 // Maps a llama.cpp-family checkpoint onto the engine's canonical tensor names.
@@ -1374,6 +1395,20 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
     uint64_t rope_dim = 0;
     if (has_attn && opt_u64(doc, keys("rope.dimension_count"), &rope_dim))
         cfg.rope_dim = static_cast<uint32_t>(rope_dim);
+    // A windowed layer may also be given its own rotary *width*
+    // (`rope.dimension_count_swa`). This build stores one rotary width per file,
+    // so a file that states a different one is refused rather than rotated at the
+    // wrong width on half its layers. Equal values are the same statement twice
+    // and need no code.
+    {
+        uint64_t swa_dim = 0;
+        if (has_attn && opt_u64(doc, keys("rope.dimension_count_swa"), &swa_dim) &&
+            swa_dim != rope_dim)
+            fail(ErrorCode::NOT_IMPLEMENTED,
+                 "rope.dimension_count_swa (" + std::to_string(swa_dim) +
+                     ") differs from rope.dimension_count (" + std::to_string(rope_dim) +
+                     "); this build has one rotary width per file");
+    }
     // jamba's attention layers carry no rotary position: upstream's block never
     // calls the rope, whatever `rope.dimension_count` says (converted files do
     // carry the key, because the converter writes the head width there). So the
@@ -1452,7 +1487,22 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
     // Routed experts and the qwen2moe shared expert each have their own width.
     // Both default to the dense width, which is what every other MoE family
     // does; a checkpoint that narrows either one says so explicitly.
-    if (opt_u64(doc, keys("expert_feed_forward_length"), &value)) {
+    // The width may be one number or one per layer (`get_key_or_arr` upstream:
+    // flint, exaone-moe and maple all read `n_ff_exp_arr`). A per-layer array is
+    // kept as such rather than collapsed to its first entry, because a layer with
+    // a narrower expert bank has differently shaped expert tensors, not merely a
+    // different number in a log line.
+    if (auto width_it = doc.metadata.find(arch + ".expert_feed_forward_length");
+        width_it != doc.metadata.end() && width_it->second.is_array()) {
+        const size_t per_layer =
+            trunk_entries(width_it->second, cfg, "expert_feed_forward_length");
+        for (size_t i = 0; i < per_layer; ++i) {
+            const uint64_t width = width_it->second.array[i].as_u64();
+            if (width == 0)
+                fail(ErrorCode::METADATA_MISMATCH, "expert feed-forward length must be positive");
+            cfg.expert_intermediate_layers.push_back(static_cast<uint32_t>(width));
+        }
+    } else if (opt_u64(doc, keys("expert_feed_forward_length"), &value)) {
         cfg.expert_intermediate = static_cast<uint32_t>(value);
         if (cfg.expert_intermediate == 0)
             fail(ErrorCode::METADATA_MISMATCH, "expert feed-forward length must be positive");
@@ -1596,7 +1646,8 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
                     entries.empty() ? 0 : trunk_entries(it->second, cfg,
                                                         "attention.sliding_window_pattern");
                 for (size_t i = 0; i < per_layer; ++i)
-                    cfg.swa_layers.push_back(entries[i].as_bool() ? 1 : 0);
+                    cfg.swa_layers.push_back(
+                        entry_flag(entries[i], "attention.sliding_window_pattern") ? 1 : 0);
             } else {
                 const uint64_t period = it->second.as_u64();
                 if (period == 0)
@@ -1605,6 +1656,57 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
                 for (uint32_t layer = 0; layer < cfg.layers; ++layer)
                     cfg.swa_layers.push_back((layer % period) != 0 ? 1 : 0);
             }
+        }
+    }
+
+    // flint states which layers rotate at all as an array
+    // (`attention.rope_pattern`) rather than by period. A layer that does not
+    // rotate keeps its keys exactly as the projection produced them, so getting
+    // this wrong is not a rounding difference.
+    if (auto it = doc.metadata.find(arch + ".attention.rope_pattern"); it != doc.metadata.end()) {
+        if (!it->second.is_array() || it->second.array.empty())
+            fail(ErrorCode::METADATA_MISMATCH,
+                 "attention.rope_pattern must be a non-empty per-layer array");
+        const size_t per_layer =
+            trunk_entries(it->second, cfg, "attention.rope_pattern");
+        for (size_t i = 0; i < per_layer; ++i)
+            cfg.rope_layers.push_back(
+                entry_flag(it->second.array[i], "attention.rope_pattern") ? 1 : 0);
+    }
+
+    // Two families rotate only on their windowed layers rather than on every
+    // layer: `exaone-moe` and `maple` both test `is_swa(il)` before calling the
+    // rope, so their rotary pattern is their window pattern. A file that states a
+    // window but leaves `sliding_window_pattern` out gets the architecture's own
+    // period (`load_swa_pattern(ml, 4)`), and a file with no window at all cannot
+    // be run: every layer would rotate nothing.
+    if (arch == "exaone-moe" || arch == "maple") {
+        if (cfg.sliding_window == 0)
+            fail(ErrorCode::METADATA_MISMATCH,
+                 arch + " requires attention.sliding_window: its rotary layers are its "
+                        "windowed ones");
+        if (cfg.swa_layers.empty() && arch == "exaone-moe") {
+            constexpr uint32_t period = 4;   // load_swa_pattern(ml, 4)
+            for (uint32_t layer = 0; layer < cfg.layers; ++layer)
+                cfg.swa_layers.push_back((layer % period) != 0 ? 1 : 0);
+        }
+        if (cfg.rope_layers.empty()) cfg.rope_layers = cfg.swa_layers;
+    }
+
+    // A windowed layer may rotate at its own base (`rope.freq_base_swa`): the
+    // short-context layers were trained with a shorter period. Which layers are
+    // windowed is the file's own sliding-window pattern, so the base is resolved
+    // to one value per layer rather than to one value per period.
+    {
+        double swa_base = 0.0;
+        const double main_base = cfg.rope_theta > 0.0 ? cfg.rope_theta : 10000.0;
+        // Only maple reads it back. `exaone-moe` and `flint` parse the same key
+        // into `rope_freq_base_train_swa` and then rotate with the single global
+        // base, so honouring the key for them would disagree with the reference.
+        if (arch == "maple" && opt_double(doc, keys("rope.freq_base_swa"), &swa_base) &&
+            swa_base > 0.0 && swa_base != main_base) {
+            for (uint32_t layer = 0; layer < cfg.layers; ++layer)
+                cfg.rope_theta_layers.push_back(cfg.layer_uses_window(layer) ? swa_base : main_base);
         }
     }
 
@@ -1950,9 +2052,24 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
     // The key is absent from those four families' files, so the name is the only
     // evidence, and hard-coding the opposite direction would be the same bug in
     // the other direction.
-    static const std::set<std::string> router_norm_w = {"dbrx", "ernie4-5-moe", "minimax-m2"};
+    static const std::set<std::string> router_norm_w = {"dbrx", "ernie4-5-moe", "maple",
+                                                        "minimax-m2"};
     if (router_norm_w.count(arch) != 0) cfg.expert_weights_norm = true;
     if (arch == "deepseek") cfg.expert_weights_norm = false;
+    // maple also passes the scale and the gating function as constants
+    // (`build_moe_ffn(..., true, 1.0f, SOFTMAX, ...)`), so a file that carries
+    // either key must not change the arithmetic.
+    if (arch == "maple") {
+        cfg.expert_weights_scale = 1.0;
+        cfg.expert_gating = "softmax";
+    }
+    // flint and exaone-moe read `expert_gating_func` without a default
+    // (`ml.get_key(...)`), so a file that omits it is refused rather than routed
+    // by this build's softmax.
+    if ((arch == "flint" || arch == "exaone-moe") &&
+        doc.metadata.find(arch + ".expert_gating_func") == doc.metadata.end())
+        fail(ErrorCode::METADATA_MISMATCH,
+             arch + " requires expert_gating_func: the reference reads it without a default");
 
     // The activation drives the arithmetic, so an unknown name is refused rather
     // than silently becoming silu. This runs after every branch that can set it
@@ -2194,8 +2311,9 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
     if (cfg.qk_norm) {
         if (arch == "command-r") {
             cfg.qk_norm_layernorm = true;   // src/models/command-r.cpp: LLM_NORM
-        } else if (arch == "talkie") {
-            // "reference applies qknorm after rope"
+        } else if (arch == "talkie" || arch == "hunyuan-moe") {
+            // "reference applies qknorm after rope". hunyuan-moe rotates first and
+            // then normalises both projections (src/models/hunyuan-moe.cpp).
             cfg.qk_norm_after_rope = true;
         }
     }
@@ -2655,7 +2773,7 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
             expect_dims(*m.tensor(layer_name(l, "ffn_norm.bias")), {cfg.hidden});
         const bool moe_layer = cfg.layer_is_moe(l);
         if (moe_layer) {
-            const uint32_t ewidth = cfg.expert_width();
+            const uint32_t ewidth = cfg.layer_expert_width(l);
             expect_dims(*m.tensor(layer_name(l, "ffn_gate_inp.weight")),
                         {cfg.hidden, cfg.expert_count});
             if (cfg.expert_selection_bias)
@@ -2760,6 +2878,21 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
         // experts on one kind of layer only.
         for (uint32_t l = 0; l < cfg.layers; ++l) {
             if (!cfg.layer_is_moe(l)) continue;
+            // The declared width has to be the width the tensors actually have,
+            // and per layer: a file may narrow one layer's expert bank, and a
+            // reader that applies one width to the whole stack would read past the
+            // end of the narrower layer's slice.
+            const uint32_t ewidth = cfg.layer_expert_width(l);
+            auto check_expert_width = [&](const TensorInfo &t, bool gate_side) {
+                const uint64_t width = gate_side
+                                           ? (cfg.fused_gate_up_exps ? t.dims[1] / 2 : t.dims[1])
+                                           : t.dims[0];
+                if (width != ewidth)
+                    fail(ErrorCode::SHAPE_MISMATCH,
+                         "layer " + std::to_string(l) + " carries " + std::to_string(width) +
+                             "-wide expert projections but expert_feed_forward_length says " +
+                             std::to_string(ewidth));
+            };
             if (cfg.layer_is_per_expert(l)) {
                 // The layout is already per expert: each record's three extents
                 // are three whole tensors, so there is no stride arithmetic and
@@ -2776,6 +2909,7 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
                                               std::to_string(e) + ".weight"));
                         if (tensor.byte_size == 0)
                             fail(ErrorCode::SHAPE_MISMATCH, "per-expert tensor is empty");
+                        check_expert_width(tensor, r < 2);
                         rec.extents[r] = {roles[r], tensor.absolute_offset, tensor.byte_size,
                                           tensor.type_id};
                         payload = checked_add(payload, tensor.byte_size, "expert payload");
@@ -2796,6 +2930,7 @@ ModelManifest build_manifest_llama(const GGUFDocument &doc, const std::string &s
                 const TensorInfo &tensor = *m.tensor(layer_name(l, suffixes[r]));
                 if (tensor.byte_size % expert_count != 0)
                     fail(ErrorCode::SHAPE_MISMATCH, "stacked expert tensor is not evenly divisible");
+                check_expert_width(tensor, r < 2);
                 uint64_t slice = tensor.byte_size / expert_count;
                 if (cfg.fused_gate_up_exps && r < 2) slice /= 2;  // gate half, up half
                 strides[r] = slice;

@@ -421,7 +421,7 @@ uint32_t Engine::greedy(const std::vector<float> &logits) const {
 }
 
 void Engine::rope_half(std::vector<float> &q, uint32_t q_heads, std::vector<float> &k,
-                       uint32_t k_heads, uint64_t position) const {
+                       uint32_t k_heads, uint64_t position, double freq_base) const {
     const ModelConfig &c = manifest_.config;
     // Rotary dimensions come from the file when present, otherwise the whole
     // head. Rotating more than rope_dim would be wrong, not merely slower.
@@ -430,7 +430,7 @@ void Engine::rope_half(std::vector<float> &q, uint32_t q_heads, std::vector<floa
     // Ramp bounds and magnitude scale are position-independent, so they are
     // derived once per call rather than once per pair.
     RopePlan plan;
-    plan.init(c, rotate);
+    plan.init(c, rotate, freq_base);
     // Layer 0 carries the divisors and llama.cpp duplicates them, so one vector
     // describes every layer. Dividing by them stretches those pairs' positions,
     // which is how granite/llama4-style checkpoints extend context without YaRN.
@@ -1324,10 +1324,9 @@ std::vector<float> Engine::forward_token(int32_t token, uint64_t position,
         // jamba's attention layers carry no rotary position at all -- upstream's
         // block simply never calls the rope -- so a file that states none is not
         // rotated at head width by default.
-        const bool rotate = !c.rope_disabled &&
-                            (c.no_rope_layer_step == 0 ||
-                             (layer + 1) % c.no_rope_layer_step != 0);
-        if (!c.mla && rotate) rope_half(q, c.heads, k, c.kv_heads, position);
+        const bool rotate = !c.rope_disabled && c.layer_has_rope(layer);
+        if (!c.mla && rotate)
+            rope_half(q, c.heads, k, c.kv_heads, position, c.layer_rope_theta(layer));
         // talkie's block normalises q and k *after* the rotation.
         if (c.qk_norm && c.qk_norm_after_rope && !c.mla) apply_qk_norm();
         // llama.cpp's per-position attention temperature (mistral3, llama4-style
@@ -1709,7 +1708,7 @@ std::vector<float> Engine::forward_token(int32_t token, uint64_t position,
             for (uint32_t expert : ids)
                 residency_->issue_prefetch(layer, expert, position + 1);
 
-            const uint32_t ewidth = c.expert_width();
+            const uint32_t ewidth = c.layer_expert_width(layer);
             for (uint32_t i = 0; i < ids.size(); ++i) {
                 float weight = selected_weights[i];
                 uint32_t expert = ids[i];
@@ -2122,9 +2121,7 @@ std::vector<float> Engine::prefill_batch(const std::vector<int32_t> &tokens,
         const uint64_t position0 = start_position;
         // Rotary, then the per-position temperature, then the cache write: the
         // same order `forward_token` uses.
-        const bool rotate = !c.rope_disabled &&
-                            (c.no_rope_layer_step == 0 ||
-                             (layer + 1) % c.no_rope_layer_step != 0);
+        const bool rotate = !c.rope_disabled && c.layer_has_rope(layer);
         std::vector<double> alibi_slopes;
         if (c.alibi_max_bias > 0.0 && c.heads > 0) {
             uint32_t n_head_log2 = 1;
@@ -2154,7 +2151,8 @@ std::vector<float> Engine::prefill_batch(const std::vector<int32_t> &tokens,
             std::vector<float> k(kflat.begin() + static_cast<size_t>(t) * kv_dim,
                                  kflat.begin() + static_cast<size_t>(t + 1) * kv_dim);
             const uint64_t position = position0 + t;
-            if (rotate) rope_half(q, c.heads, k, c.kv_heads, position);
+            if (rotate)
+                rope_half(q, c.heads, k, c.kv_heads, position, c.layer_rope_theta(layer));
             if (c.attn_temp_scale != 0.0) {
                 const double temperature =
                     std::log(std::floor(static_cast<double>(position) / c.attn_temp_floor) + 1.0) *

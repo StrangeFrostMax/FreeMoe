@@ -56,7 +56,9 @@ struct RopePlan {
 
     // `n_dims` is the number of rotated dimensions, which for most families is
     // the head width but is smaller when `rope.dimension_count` says so.
-    void init(const ModelConfig &cfg, uint32_t n_dims);
+    // `base_override` is the per-layer base a file can state for its windowed
+    // layers (`rope.freq_base_swa`); 0 means "use the file's single base".
+    void init(const ModelConfig &cfg, uint32_t n_dims, double base_override = 0.0);
 
     // mRoPE sections, in rotary *pairs*, from `{arch}.rope.dimension_sections`:
     // time, height, width, extra. A zero total means plain rotary.

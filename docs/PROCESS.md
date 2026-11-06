@@ -318,11 +318,59 @@ the rename now happens when the checkpoint is read, in both implementations.
 | drop deepseek's constant `norm_w = false` | `deepseek` logits (0.21) |
 
 Not verified: no checkpoint of any of the six exists here, so every fixture is
-shaped from its loader's own rules; `flint` and `exaone-moe` were read but not
-landed, because both give *some* layers a different rotary base or none at all
-(`hparams.has_rope(il)`, `rope_freq_base_swa`) and this build has one rotary
-configuration per file — landing them would have meant silently rotating layers
-the reference does not; `grovemoe` scales the whole MoE output by
-`expert_group_scale`, `hunyuan-moe` sums a dense MLP with the MoE in one layer,
-and `maion-coder` puts a low-rank latent between the router and the experts.
-Those three need a feature, not a flag.
+shaped from its loader's own rules.
+
+## Evidence for census batch 1, slice C (part 1): per-layer rotary
+
+`flint`, `exaone-moe` and `maple` were held back from slice B for one reason:
+the rotary is not one configuration per file. Upstream decides it per layer, in
+three different ways, and the difference is arithmetic, not a log line:
+
+| Family | How it decides | Base |
+|---|---|---|
+| `flint` | `hparams.has_rope(il)`, from the file's `attention.rope_pattern` array | one base for the stack |
+| `exaone-moe` | `is_local_layer = hparams.is_swa(il)` — the rope is called only on windowed layers | one base for the stack (it *reads* `rope.freq_base_swa` and never uses it) |
+| `maple` | the rope is called only on windowed layers | `get_rope_freq_base(cparams, il)`: `rope.freq_base_swa` on a windowed layer, the file's base elsewhere |
+
+The engine now carries `rope_layers` (a per-layer mask, filled from
+`attention.rope_pattern` when the file states one, otherwise from the window
+pattern for the two families whose graph tests `is_swa`) and `rope_theta_layers`
+(one base per layer, filled only for `maple`, because only `maple` reads the key
+back). Both live in `ModelConfig` and are consulted by `layer_has_rope()` and
+`layer_rope_theta()`, so the two rotation sites (`forward_token` and the batched
+prefill) cannot disagree. `RopePlan::init` takes the base as an argument.
+
+The same read turned up a second per-layer fact those files state and the engine
+had collapsed: `expert_feed_forward_length` may be an array
+(`n_ff_exp_arr`), and a layer with a narrower expert bank has differently shaped
+expert tensors. `ModelConfig::layer_expert_width()` is used by the forward pass,
+and the manifest builder now refuses a file whose declared width disagrees with
+the tensors it actually carries (`check_expert_width`, per layer).
+
+`hunyuan-moe` landed with the same batch because its block is one this engine
+already runs: a dense MLP *summed* with the routed experts, read from the
+`*_shexp` tensors, at the shared width. The one ordering fact the read produced
+is that it normalises q and k **after** the rotary, which is the opposite of
+every other family here, so `qk_norm_after_rope` gained a second name.
+
+Four fixtures, four oracle goldens, 19 checks each. Gate: `./build/tests` →
+**4052 checks, 0 failures**. Census: **73 mapped / 2 caveat / 36 blocked / 60
+unclassified** (69 / 2 / 36 / 64 before).
+
+| Mutation | Turns red |
+|---|---|
+| ignore the per-layer rotary mask (`rotate` = `!rope_disabled`) | `exaone-moe`, `flint`, `maple` logits and greedy ids, plus `smollm3-nope` (same helper) |
+| ignore the per-layer base (`rope_half(..., c.rope_theta)`) | `maple` only, which is the family that reads the key |
+| ignore the per-layer expert width (`c.expert_width()`) | `exaone-moe` logits (worst abs 2.88), then the parity loop aborts on a non-finite softmax in `flint` — the read runs past the narrower layer's slice, which is why the loader-side width check exists |
+| force `hunyuan-moe` to normalise q/k before the rotary | `hunyuan-moe` logits and greedy ids |
+| stop summing the ungated shared expert | `hunyuan-moe` and nine other families that share the branch |
+
+Mutating a golden instead (one logit in `maple_reference.txt` moved by 0.5) fails
+`maple` with `worst abs 0.500000`, so the four new slugs are genuinely compared
+rather than skipped.
+
+Not verified: no checkpoint of any of the four exists here; the oracle and the
+engine were written from the same reading of the same upstream files; the
+per-layer width arrays in the fixtures are 40/32/48 elements, not the widths a
+real file carries. `grovemoe` and `maion-coder` remain, and are the two in this
+queue that need a block rather than a flag.

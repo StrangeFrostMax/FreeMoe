@@ -120,6 +120,19 @@ const AdapterRow kRows[] = {
     // bias, constant weight norm, no shared expert.
     {"minimax-m2", "LLM_ARCH_MINIMAX_M2", "llama_model_minimax_m2::build_arch_graph",
      "per-head q/k norm, selection bias, constant router weight norm"},
+    // Census batch 1, slice C. exaone-moe, flint and maple rotate only where the
+    // file says they do (a per-layer pattern, or the window pattern), may give a
+    // windowed layer its own base, and state an expert width per layer.
+    {"exaone-moe", "LLM_ARCH_EXAONE_MOE", "llama_model_exaone_moe::build_arch_graph",
+     "per-layer rotary on the windowed layers, per-layer expert width, shared expert"},
+    {"flint", "LLM_ARCH_FLINT", "llama_model_flint::build_arch_graph",
+     "file-stated rotary pattern, attention sinks, dense lead, shared expert"},
+    {"maple", "LLM_ARCH_MAPLE", "llama_model_maple::build_arch_graph",
+     "rotary only on windowed layers with their own base, constant router norm"},
+    // hunyuan-moe sums a dense MLP with the routed experts in the same layer,
+    // from the `*_shexp` tensors, and normalises q/k after the rotation.
+    {"hunyuan-moe", "LLM_ARCH_HUNYUAN_MOE", "llama_model_hunyuan_moe::build_arch_graph",
+     "dense MLP summed with the experts, q/k norm after the rotary"},
 
     {"bloom", "LLM_ARCH_BLOOM", "llama_model_bloom::build_arch_graph",
      "ALiBi attention, biased LayerNorm, embedding norm"},
